@@ -193,6 +193,23 @@ final class DriveSyncManager: NSObject, ObservableObject, ASWebAuthenticationPre
     @Published var autoSyncEnabled: Bool {
         didSet { UserDefaults.standard.set(autoSyncEnabled, forKey: "omyaru.ios.drive.autoSync") }
     }
+    @Published var backgroundSyncEnabled: Bool {
+        didSet {
+            UserDefaults.standard.set(backgroundSyncEnabled, forKey: "omyaru.ios.drive.backgroundSync")
+            OmyaruBackgroundSyncScheduler.shared.scheduleIfNeeded(enabled: backgroundSyncEnabled, isConnected: isConnected)
+            if !backgroundSyncEnabled {
+                ActiveSyncBackgroundKeepAlive.shared.end()
+            }
+        }
+    }
+    @Published var liveActivityEnabled: Bool {
+        didSet {
+            UserDefaults.standard.set(liveActivityEnabled, forKey: "omyaru.ios.drive.liveActivity")
+            if liveActivityEnabled {
+                OmyaruSyncLiveActivityController.shared.requestFallbackNotificationPermissionIfNeeded()
+            }
+        }
+    }
     @Published var onDemandCloudPhotos: Bool {
         didSet { UserDefaults.standard.set(onDemandCloudPhotos, forKey: "omyaru.ios.drive.onDemand") }
     }
@@ -201,20 +218,53 @@ final class DriveSyncManager: NSObject, ObservableObject, ASWebAuthenticationPre
     @Published var status: String = "Google 계정을 연결하면 Android · PC · iOS가 자동 동기화됩니다."
     @Published var progress: Double? = nil
     @Published var lastSyncedAt: Date? = nil
+    private var cancelRequested: Bool = false
 
     private var accessToken: String = "" {
         didSet {
-            Self.saveKeychainString(accessToken, account: "access_token")
-            isConnected = !accessToken.isEmpty || !refreshToken.isEmpty
+            persistAuthSession()
         }
     }
     private var refreshToken: String = "" {
         didSet {
-            Self.saveKeychainString(refreshToken, account: "refresh_token")
-            isConnected = !accessToken.isEmpty || !refreshToken.isEmpty
+            persistAuthSession()
         }
     }
     private var cachedKeyRing: OmyaruDriveKeyRing? = nil
+
+    private struct PersistedAuthSession: Codable {
+        var accessToken: String
+        var refreshToken: String
+        var email: String
+    }
+
+    private var authSessionFileURL: URL {
+        syncStateDirectory.appendingPathComponent("google-session.json")
+    }
+
+    private func persistAuthSession() {
+        let connected = !accessToken.isEmpty || !refreshToken.isEmpty
+        if isConnected != connected { isConnected = connected }
+        Self.saveKeychainString(accessToken, account: "access_token")
+        Self.saveKeychainString(refreshToken, account: "refresh_token")
+
+        if connected {
+            let payload = PersistedAuthSession(
+                accessToken: accessToken,
+                refreshToken: refreshToken,
+                email: connectedEmail
+            )
+            if let data = try? JSONEncoder().encode(payload) {
+                try? data.write(to: authSessionFileURL, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
+                var res = URLResourceValues()
+                res.isExcludedFromBackup = true
+                var mutableURL = authSessionFileURL
+                try? mutableURL.setResourceValues(res)
+            }
+        } else {
+            try? FileManager.default.removeItem(at: authSessionFileURL)
+        }
+    }
 
     private var resolvedClientID: String {
         if let plist = (Bundle.main.object(forInfoDictionaryKey: "GIDClientID") as? String)?
@@ -246,41 +296,63 @@ final class DriveSyncManager: NSObject, ObservableObject, ASWebAuthenticationPre
         return String(data: data, encoding: .utf8)
     }
 
-    private static func saveKeychainString(_ value: String, account: String) {
+    @discardableResult
+    private static func saveKeychainString(_ value: String, account: String) -> Bool {
         let baseQuery: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: keychainService,
             kSecAttrAccount as String: account
         ]
         SecItemDelete(baseQuery as CFDictionary)
-        guard !value.isEmpty, let data = value.data(using: .utf8) else { return }
+        guard !value.isEmpty, let data = value.data(using: .utf8) else { return true }
         var item = baseQuery
         item[kSecValueData as String] = data
         item[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
-        SecItemAdd(item as CFDictionary, nil)
+        return SecItemAdd(item as CFDictionary, nil) == errSecSuccess
     }
 
     override init() {
         let d = UserDefaults.standard
         connectedEmail = d.string(forKey: "omyaru.ios.drive.email") ?? ""
-        autoSyncEnabled = d.bool(forKey: "omyaru.ios.drive.autoSync")
+        autoSyncEnabled = d.object(forKey: "omyaru.ios.drive.autoSync") == nil ? true : d.bool(forKey: "omyaru.ios.drive.autoSync")
+        backgroundSyncEnabled = d.object(forKey: "omyaru.ios.drive.backgroundSync") == nil ? true : d.bool(forKey: "omyaru.ios.drive.backgroundSync")
+        liveActivityEnabled = d.object(forKey: "omyaru.ios.drive.liveActivity") == nil ? true : d.bool(forKey: "omyaru.ios.drive.liveActivity")
         onDemandCloudPhotos = d.bool(forKey: "omyaru.ios.drive.onDemand")
 
-        let kcAccess = Self.readKeychainString(account: "access_token") ?? d.string(forKey: "omyaru.ios.drive.accessToken") ?? ""
-        let kcRefresh = Self.readKeychainString(account: "refresh_token") ?? d.string(forKey: "omyaru.ios.drive.refreshToken") ?? ""
         let kcPass = Self.readKeychainString(account: "sync_passphrase") ?? d.string(forKey: "omyaru.ios.drive.passphrase") ?? ""
         syncPassphrase = kcPass
         super.init()
 
-        accessToken = kcAccess
-        refreshToken = kcRefresh
-        // Clean up any legacy plaintext token entries in UserDefaults
-        d.removeObject(forKey: "omyaru.ios.drive.clientId")
-        d.removeObject(forKey: "omyaru.ios.drive.accessToken")
-        d.removeObject(forKey: "omyaru.ios.drive.refreshToken")
-        d.removeObject(forKey: "omyaru.ios.drive.passphrase")
+        // Restore session from Keychain first, then Application Support sandboxed file, then legacy UserDefaults.
+        let fileSession: PersistedAuthSession? = (try? Data(contentsOf: authSessionFileURL))
+            .flatMap { try? JSONDecoder().decode(PersistedAuthSession.self, from: $0) }
+        let restoredAccess = Self.readKeychainString(account: "access_token")
+            ?? fileSession?.accessToken
+            ?? d.string(forKey: "omyaru.ios.drive.accessToken")
+            ?? ""
+        let restoredRefresh = Self.readKeychainString(account: "refresh_token")
+            ?? fileSession?.refreshToken
+            ?? d.string(forKey: "omyaru.ios.drive.refreshToken")
+            ?? ""
+        if connectedEmail.isEmpty, let savedEmail = fileSession?.email, !savedEmail.isEmpty {
+            connectedEmail = savedEmail
+        }
+
+        accessToken = restoredAccess
+        refreshToken = restoredRefresh
+        // Swift does NOT trigger `didSet` inside `init()` — explicitly compute `isConnected` and sync storage!
+        isConnected = !restoredAccess.isEmpty || !restoredRefresh.isEmpty
         if isConnected {
+            persistAuthSession()
+            d.removeObject(forKey: "omyaru.ios.drive.clientId")
+            d.removeObject(forKey: "omyaru.ios.drive.accessToken")
+            d.removeObject(forKey: "omyaru.ios.drive.refreshToken")
             status = connectedEmail.isEmpty ? "Google Drive 연결됨" : "\(connectedEmail) 연결됨"
+            if !refreshToken.isEmpty {
+                Task { @MainActor [weak self] in
+                    _ = await self?.refreshAccessTokenIfPossible()
+                }
+            }
         }
     }
 
@@ -375,6 +447,7 @@ final class DriveSyncManager: NSObject, ObservableObject, ASWebAuthenticationPre
             }
             cachedKeyRing = nil
             await fetchConnectedAccountEmail()
+            OmyaruBackgroundSyncScheduler.shared.scheduleIfNeeded(enabled: backgroundSyncEnabled, isConnected: isConnected)
             status = connectedEmail.isEmpty ? "Google Drive 연결 완료" : "\(connectedEmail) 연결 완료"
             return true
         } catch {
@@ -418,12 +491,20 @@ final class DriveSyncManager: NSObject, ObservableObject, ASWebAuthenticationPre
     }
 
     func disconnectGoogle() {
+        cancelActiveSync()
         accessToken = ""
         refreshToken = ""
         connectedEmail = ""
         autoSyncEnabled = false
         cachedKeyRing = nil
+        OmyaruBackgroundSyncScheduler.shared.scheduleIfNeeded(enabled: false, isConnected: false)
         status = "Google Drive 연결이 해제되었습니다."
+    }
+
+    func cancelActiveSync() {
+        cancelRequested = true
+        ActiveSyncBackgroundKeepAlive.shared.end()
+        OmyaruSyncLiveActivityController.shared.finish(phase: "중단됨", detail: "동기화가 중단되었습니다.", isError: true)
     }
 
     private func generateCodeVerifier() -> String {
@@ -443,9 +524,25 @@ final class DriveSyncManager: NSObject, ObservableObject, ASWebAuthenticationPre
             .replacingOccurrences(of: "=", with: "")
     }
 
-    // MARK: - Full Google Drive Sync (Tabs, Profiles, Groups, Resets, Bookmarks, History, Bookshelf + Chunks!)
+    // MARK: - Full Google Drive Sync (Tabs, Profiles, Groups, Resets, Bookmarks, History, Bookshelf + Chunks + Live Activity!)
 
-    func syncWithGoogleDrive(browser: BrowserModel?, shelf: ShelfModel) async {
+    private func reportSyncStep(phase: String, detail: String, progress value: Double, done: Int = 0, total: Int = 0, force: Bool = false) {
+        let clamped = min(1.0, max(0.0, value))
+        progress = clamped
+        status = detail
+        if liveActivityEnabled {
+            OmyaruSyncLiveActivityController.shared.update(
+                phase: phase,
+                detail: detail,
+                progress: clamped,
+                completedItems: done,
+                totalItems: total,
+                force: force
+            )
+        }
+    }
+
+    func syncWithGoogleDrive(browser: BrowserModel?, shelf: ShelfModel, isBackground: Bool = false) async {
         guard !busy else { return }
         if accessToken.isEmpty && !refreshToken.isEmpty {
             _ = await refreshAccessTokenIfPossible()
@@ -454,37 +551,66 @@ final class DriveSyncManager: NSObject, ObservableObject, ASWebAuthenticationPre
             status = "먼저 Google 계정을 연결해 주세요."
             return
         }
+        cancelRequested = false
         busy = true
         progress = 0.05
         status = "Google Drive 계정 키 확인 중..."
+        ActiveSyncBackgroundKeepAlive.shared.begin(allowExtendedKeepAlive: backgroundSyncEnabled)
+        OmyaruSyncLiveActivityController.shared.start(
+            accountLabel: connectedEmail.isEmpty ? "Google Drive" : connectedEmail,
+            isBackground: isBackground,
+            phase: "준비 중",
+            detail: "Google Drive 계정 키 확인 중...",
+            progress: 0.05,
+            enabled: liveActivityEnabled
+        )
         defer {
             busy = false
             progress = nil
+            ActiveSyncBackgroundKeepAlive.shared.end()
+            OmyaruBackgroundSyncScheduler.shared.scheduleIfNeeded(enabled: backgroundSyncEnabled, isConnected: isConnected)
         }
 
         do {
             let keyRing = try await loadOrCreateKeyRing()
+            if cancelRequested || Task.isCancelled { throw CancellationError() }
             cachedKeyRing = keyRing
-            progress = 0.15
+            reportSyncStep(phase: "키 확인", detail: "암호화 키 확인 완료", progress: 0.14, force: true)
 
             if let browser {
-                status = "북마크·방문 기록 동기화 중..."
+                reportSyncStep(phase: "북마크·기록", detail: "북마크·방문 기록 동기화 중...", progress: 0.22, force: true)
                 try await syncUserData(browser: browser, keys: keyRing)
-                progress = 0.35
+                if cancelRequested || Task.isCancelled { throw CancellationError() }
 
-                status = "프로필·탭 그룹·열린 탭 및 초기화 기록 확인 중..."
+                reportSyncStep(phase: "탭·프로필", detail: "프로필·탭 그룹·열린 탭 확인 중...", progress: 0.38, force: true)
                 try await syncTabsAndResets(browser: browser, keys: keyRing)
-                progress = 0.55
+                if cancelRequested || Task.isCancelled { throw CancellationError() }
             }
 
-            status = "책장 폴더·메모·이미지 조각 동기화 중..."
+            reportSyncStep(phase: "책장 동기화", detail: "책장 폴더·메모·이미지 조각 동기화 중...", progress: 0.48, force: true)
             try await syncBookshelfWithChunks(shelf: shelf, keys: keyRing)
+            if cancelRequested || Task.isCancelled { throw CancellationError() }
 
             progress = 1.0
             lastSyncedAt = Date()
             status = "Google Drive 동기화 완료 (프로필·탭·북마크·책장 이미지)"
+            if liveActivityEnabled {
+                OmyaruSyncLiveActivityController.shared.finish(
+                    phase: "완료",
+                    detail: "탭·북마크·책장 동기화 완료",
+                    isError: false
+                )
+            }
+        } catch is CancellationError {
+            status = "동기화가 중단되었습니다."
+            if liveActivityEnabled {
+                OmyaruSyncLiveActivityController.shared.finish(phase: "중단됨", detail: "동기화가 중단되었습니다.", isError: true)
+            }
         } catch {
             status = "동기화 실패: \(error.localizedDescription)"
+            if liveActivityEnabled {
+                OmyaruSyncLiveActivityController.shared.finish(phase: "실패", detail: error.localizedDescription, isError: true)
+            }
         }
     }
 
@@ -863,21 +989,31 @@ final class DriveSyncManager: NSObject, ObservableObject, ASWebAuthenticationPre
     // MARK: - Full Bookshelf Sync With 1MB Encrypted Image Chunks (omyaru-shelf-v1- & omyaru-shelf-chunk-v1-)
 
     private func syncBookshelfWithChunks(shelf: ShelfModel, keys: OmyaruDriveKeyRing) async throws {
-        // 1. Upload local images that don't yet have a cloud manifest
+        // 1. Upload local images that don't yet have a cloud manifest (48% -> 65%)
+        let totalLocal = max(1, shelf.catalog.items.count)
         for i in shelf.catalog.items.indices {
+            if cancelRequested || Task.isCancelled { throw CancellationError() }
             if shelf.catalog.items[i].cloud != nil { continue }
             let item = shelf.catalog.items[i]
             let localURL = shelf.imageURL(for: item)
             guard let imageBytes = try? Data(contentsOf: localURL), !imageBytes.isEmpty else { continue }
-            status = "책장 사진 업로드 중 (\(i + 1)/\(shelf.catalog.items.count))..."
+            let ratio = Double(i + 1) / Double(totalLocal)
+            reportSyncStep(
+                phase: "업로드",
+                detail: "책장 사진 업로드 중 (\(i + 1)/\(shelf.catalog.items.count))...",
+                progress: 0.48 + 0.17 * ratio,
+                done: i + 1,
+                total: shelf.catalog.items.count
+            )
             let manifest = try await uploadChunkedImage(data: imageBytes, keys: keys)
             shelf.catalog.items[i].cloud = manifest
         }
         shelf.save()
 
-        // 2. Pull unseen remote shelf metadata batches
+        // 2. Pull unseen remote shelf metadata batches (65% -> 75%)
         var seenShelf = loadSeenSet(name: "seen-shelf.json")
         let shelfFiles = try await listDriveFiles(prefix: "omyaru-shelf-v1-")
+        let unseenShelfFiles = shelfFiles.filter { !seenShelf.contains($0.id) }
         var folderNames: [String: String] = [:]
         var folderNotes: [String: String] = [:]
         var folderCols: [String: Int] = [:]
@@ -885,8 +1021,16 @@ final class DriveSyncManager: NSObject, ObservableObject, ASWebAuthenticationPre
         var remoteImages: [String: [String: Any]] = [:]
         var deletedImages = Set<String>()
 
-        for (idx, file) in shelfFiles.enumerated() where !seenShelf.contains(file.id) {
-            progress = 0.55 + 0.20 * Double(idx + 1) / Double(max(1, shelfFiles.count))
+        for (idx, file) in unseenShelfFiles.enumerated() {
+            if cancelRequested || Task.isCancelled { throw CancellationError() }
+            let ratio = Double(idx + 1) / Double(max(1, unseenShelfFiles.count))
+            reportSyncStep(
+                phase: "목록 받기",
+                detail: "책장 목록 수신 중 (\(idx + 1)/\(unseenShelfFiles.count))...",
+                progress: 0.65 + 0.10 * ratio,
+                done: idx + 1,
+                total: unseenShelfFiles.count
+            )
             guard let encrypted = try? await readDriveFile(file.id),
                   let plain = try? keys.decrypt(encrypted),
                   let batch = try? JSONSerialization.jsonObject(with: plain) as? [String: Any],
@@ -929,9 +1073,10 @@ final class DriveSyncManager: NSObject, ObservableObject, ASWebAuthenticationPre
             }
         }
 
-        // Apply remote images (download chunks now if !onDemandCloudPhotos, or keep cloud manifest for instant on-demand loading!)
+        // Apply remote images (75% -> 96%)
         let imageIDs = Array(remoteImages.keys)
         for (idx, imageID) in imageIDs.enumerated() where !deletedImages.contains(imageID) {
+            if cancelRequested || Task.isCancelled { throw CancellationError() }
             guard let row = remoteImages[imageID],
                   let folderID = (row["folderId"] as? String)?.lowercased(),
                   let folderPath = folderIDToPath[folderID],
@@ -961,7 +1106,14 @@ final class DriveSyncManager: NSObject, ObservableObject, ASWebAuthenticationPre
                 )
                 shelf.catalog.items.append(newItem)
                 if !onDemandCloudPhotos {
-                    status = "책장 사진 내려받는 중 (\(idx + 1)/\(imageIDs.count))..."
+                    let ratio = Double(idx + 1) / Double(max(1, imageIDs.count))
+                    reportSyncStep(
+                        phase: "다운로드",
+                        detail: "책장 사진 내려받는 중 (\(idx + 1)/\(imageIDs.count))...",
+                        progress: 0.75 + 0.21 * ratio,
+                        done: idx + 1,
+                        total: imageIDs.count
+                    )
                     let localURL = shelf.imageURL(for: newItem)
                     if !FileManager.default.fileExists(atPath: localURL.path),
                        let bytes = try? await downloadChunkedImage(manifest: manifest, keys: keys) {
@@ -1233,7 +1385,30 @@ struct DriveSyncSheet: View {
                         }
                         .disabled(sync.busy)
 
+                        if sync.busy {
+                            Button(role: .destructive) {
+                                sync.cancelActiveSync()
+                            } label: {
+                                Label("동기화 중단", systemImage: "stop.circle")
+                            }
+                        }
+
                         Toggle("앱 활성화 시 자동 동기화", isOn: $sync.autoSyncEnabled)
+
+                        Toggle("백그라운드 동기화", isOn: $sync.backgroundSyncEnabled)
+
+                        Toggle("실시간 현황(Live Activity)으로 진행률 표시", isOn: $sync.liveActivityEnabled)
+
+                        if sync.liveActivityEnabled && !OmyaruSyncLiveActivityController.shared.areLiveActivitiesAvailable {
+                            Button {
+                                if let url = URL(string: UIApplication.openSettingsURLString) {
+                                    UIApplication.shared.open(url)
+                                }
+                            } label: {
+                                Label("iOS 설정에서 실시간 현황 허용 열기", systemImage: "gearshape")
+                                    .font(.caption)
+                            }
+                        }
 
                         Picker("책장 사진 저장 방식", selection: $sync.onDemandCloudPhotos) {
                             Text("기기에 원본 모두 저장").tag(false)

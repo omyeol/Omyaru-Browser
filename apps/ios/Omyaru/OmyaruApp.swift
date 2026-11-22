@@ -6,6 +6,7 @@ import AVFoundation
 
 @main
 struct OmyaruApp: App {
+    @UIApplicationDelegateAdaptor(OmyaruAppDelegate.self) private var appDelegate
     @Environment(\.scenePhase) private var scenePhase
     @StateObject private var browser = BrowserModel()
     @ObservedObject private var appLock = AppLockManager.shared
@@ -35,6 +36,13 @@ struct OmyaruApp: App {
                 }
             }
             .preferredColorScheme(browser.preferences.pageColorScheme.swiftUIColorScheme)
+            .onAppear {
+                OmyaruBackgroundSyncScheduler.shared.browserRef = browser
+                OmyaruBackgroundSyncScheduler.shared.scheduleIfNeeded(
+                    enabled: driveSync.backgroundSyncEnabled,
+                    isConnected: driveSync.isConnected
+                )
+            }
             .onChange(of: scenePhase) { phase in
                 switch phase {
                 case .background:
@@ -43,10 +51,19 @@ struct OmyaruApp: App {
                     if browser.preferences.clearDataOnExit {
                         Task { await browser.clearBrowsingData() }
                     }
+                    if driveSync.backgroundSyncEnabled && driveSync.isConnected {
+                        OmyaruBackgroundSyncScheduler.shared.scheduleIfNeeded(enabled: true, isConnected: true)
+                        if !driveSync.busy {
+                            Task {
+                                await driveSync.syncWithGoogleDrive(browser: browser, shelf: .shared, isBackground: true)
+                            }
+                        }
+                    }
                 case .active:
-                    if driveSync.autoSyncEnabled && driveSync.isConnected {
+                    OmyaruBackgroundSyncScheduler.shared.browserRef = browser
+                    if driveSync.autoSyncEnabled && driveSync.isConnected && !driveSync.busy {
                         Task {
-                            await driveSync.syncWithGoogleDrive(browser: browser, shelf: .shared)
+                            await driveSync.syncWithGoogleDrive(browser: browser, shelf: .shared, isBackground: false)
                         }
                     }
                 default:
@@ -414,7 +431,7 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
     static let defaultProfileID = UUID(uuidString: "00000000-0000-0000-0000-000000000010")!
     static let defaultGroupID = UUID(uuidString: "00000000-0000-0000-0000-000000000002")!
     static let appVersionName = "0.15.18"
-    static let appBuildNumber = 79
+    static let appBuildNumber = 80
 
     @Published var profiles: [BrowserProfile]
     @Published var groups: [BrowserGroup]

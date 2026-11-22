@@ -17,9 +17,26 @@ targets:
     configFiles:
       Debug: DriveSync.xcconfig
       Release: DriveSync.xcconfig
+    dependencies:
+      - target: OmyaruLiveActivity
+        embed: true
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: cuttan.omyaru.app
         INFOPLIST_FILE: Omyaru/Info.plist
         PRODUCT_NAME: Omyaru
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+  OmyaruLiveActivity:
+    type: app-extension
+    platform: iOS
+    deploymentTarget: "16.1"
+    sources:
+      - path: OmyaruLiveActivity
+      - path: Omyaru/OmyaruSyncActivityAttributes.swift
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: cuttan.omyaru.app.live-activity
+        INFOPLIST_FILE: OmyaruLiveActivity/Info.plist
+        PRODUCT_NAME: OmyaruLiveActivity
+        SKIP_INSTALL: YES
+        LD_RUNPATH_SEARCH_PATHS: "$(inherited) @executable_path/Frameworks @executable_path/../../Frameworks"

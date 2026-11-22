@@ -57,10 +57,10 @@ def main() -> None:
                 "buildVersion": build_version,
                 "date": date.today().isoformat(),
                 "localizedDescription": (
-                    f"v{version} (build {build_version}): Built-in One-Tap Google Drive Sync (zero Client ID/token setup, Keychain token storage, "
-                    "automatic account email display & instant sync across Android/PC/iOS) + iOS 26 Safari Liquid Glass UI & Animations "
-                    "(blur-bloom morphing glass popovers, fullscreen hero-zoom Tab Overview, native horizontal swipe group pager & gliding carousel pill, "
-                    "floating 2-row Liquid Glass URL island, FastScrollBar, web element context menu -> Bookshelf, live capture, watermark remover, and hierarchical bookshelf)."
+                    f"v{version} (build {build_version}): Fixed Google Drive sync login persistence across app restarts "
+                    "(dual Keychain + sandboxed session persistence + automatic silent refresh), added Background Sync with ON/OFF toggle "
+                    "(BGAppRefreshTask + BGProcessingTask + background URLSession + active transfer keep-alive), and native iOS Live Activities "
+                    "('실시간 현황' Lock Screen & Dynamic Island live sync progress), plus iOS 26 Safari Liquid Glass UI & full Android parity."
                 ),
                 "downloadURL": download_url,
                 "size": ipa.stat().st_size,
