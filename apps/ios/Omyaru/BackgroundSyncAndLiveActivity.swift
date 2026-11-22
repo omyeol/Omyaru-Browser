@@ -7,19 +7,67 @@ import UIKit
 import ActivityKit
 #endif
 
-// MARK: - Live Activity ("실시간 현황") + Fallback Progress Notification Controller
+// MARK: - Live Activity ("실시간 현황") + LiveContainer Fallback Notification & In-App Live Banner
+
+final class OmyaruSyncNotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
+    static let shared = OmyaruSyncNotificationDelegate()
+
+    func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        willPresent notification: UNNotification,
+        withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
+    ) {
+        if notification.request.identifier == OmyaruSyncLiveActivityController.fallbackNotificationID {
+            completionHandler([.list])
+        } else {
+            completionHandler([.banner, .list])
+        }
+    }
+}
 
 @MainActor
-final class OmyaruSyncLiveActivityController {
+final class OmyaruSyncLiveActivityController: ObservableObject {
     static let shared = OmyaruSyncLiveActivityController()
-    private static let fallbackNotificationID = "omyaru.sync.progress.notice"
+    nonisolated static let fallbackNotificationID = "omyaru.sync.progress.notice"
 
     #if canImport(ActivityKit)
     private var activeActivityBox: Any? = nil
     #endif
     private var lastUpdateAt: Date = .distantPast
+    private var lastFallbackPostAt: Date = .distantPast
+    private var usingFallbackNotification: Bool = false
+    private var fallbackEnabled: Bool = false
+
+    @Published private(set) var liveBannerVisible: Bool = false
+    @Published private(set) var liveBannerPhase: String = ""
+    @Published private(set) var liveBannerDetail: String = ""
+    @Published private(set) var liveBannerProgress: Double = 0
+    @Published private(set) var liveBannerCompleted: Int = 0
+    @Published private(set) var liveBannerTotal: Int = 0
+    @Published private(set) var liveBannerIsError: Bool = false
+
+    /// Detects whether Omyaru is running dynamically loaded inside LiveContainer,
+    /// where iOS SpringBoard cannot load guest `.appex` WidgetKit/ActivityKit extensions.
+    var isRunningInLiveContainer: Bool {
+        let env = ProcessInfo.processInfo.environment
+        if env["LC_APP_URL"] != nil || env["LC_HOME_PATH"] != nil || env["LIVECONTAINER_RUNNING"] != nil {
+            return true
+        }
+        let path = Bundle.main.bundlePath
+        if path.contains("LiveContainer") || path.contains("/Documents/Applications/") {
+            return true
+        }
+        if let plugIns = Bundle.main.builtInPlugInsURL {
+            let extURL = plugIns.appendingPathComponent("OmyaruLiveActivity.appex")
+            if !FileManager.default.fileExists(atPath: extURL.path) {
+                return true
+            }
+        }
+        return false
+    }
 
     var areLiveActivitiesAvailable: Bool {
+        if isRunningInLiveContainer { return false }
         #if canImport(ActivityKit)
         if #available(iOS 16.1, *) {
             return ActivityAuthorizationInfo().areActivitiesEnabled
@@ -29,8 +77,9 @@ final class OmyaruSyncLiveActivityController {
     }
 
     func cleanupStaleActivitiesOnLaunch() {
+        UNUserNotificationCenter.current().delegate = OmyaruSyncNotificationDelegate.shared
         #if canImport(ActivityKit)
-        if #available(iOS 16.1, *) {
+        if #available(iOS 16.1, *), !isRunningInLiveContainer {
             Task {
                 for existing in Activity<OmyaruSyncActivityAttributes>.activities {
                     await existing.end(dismissalPolicy: .immediate)
@@ -48,10 +97,23 @@ final class OmyaruSyncLiveActivityController {
         progress: Double,
         enabled: Bool
     ) {
+        let clamped = min(1.0, max(0.0, progress))
+        liveBannerVisible = true
+        liveBannerPhase = phase
+        liveBannerDetail = detail
+        liveBannerProgress = clamped
+        liveBannerCompleted = 0
+        liveBannerTotal = 0
+        liveBannerIsError = false
+        fallbackEnabled = enabled
+        usingFallbackNotification = false
+
         guard enabled else { return }
         lastUpdateAt = Date()
+        lastFallbackPostAt = .distantPast
+
         #if canImport(ActivityKit)
-        if #available(iOS 16.1, *), ActivityAuthorizationInfo().areActivitiesEnabled {
+        if #available(iOS 16.1, *), !isRunningInLiveContainer, ActivityAuthorizationInfo().areActivitiesEnabled {
             let attributes = OmyaruSyncActivityAttributes(
                 accountLabel: accountLabel.isEmpty ? "Google Drive" : accountLabel,
                 isBackground: isBackground
@@ -59,7 +121,7 @@ final class OmyaruSyncLiveActivityController {
             let state = OmyaruSyncActivityAttributes.ContentState(
                 phase: phase,
                 detail: detail,
-                progress: min(1.0, max(0.0, progress)),
+                progress: clamped,
                 completedItems: 0,
                 totalItems: 0,
                 isFinished: false,
@@ -69,24 +131,30 @@ final class OmyaruSyncLiveActivityController {
                 for stale in Activity<OmyaruSyncActivityAttributes>.activities {
                     await stale.end(dismissalPolicy: .immediate)
                 }
-                if let created = try? Activity<OmyaruSyncActivityAttributes>.request(
-                    attributes: attributes,
-                    contentState: state,
-                    pushType: nil
-                ) {
+                do {
+                    let created = try Activity<OmyaruSyncActivityAttributes>.request(
+                        attributes: attributes,
+                        contentState: state,
+                        pushType: nil
+                    )
                     await MainActor.run {
                         self.activeActivityBox = created
+                        self.usingFallbackNotification = false
                     }
-                } else {
-                    self.postFallbackNotification(title: "Omyaru 동기화 중…", body: detail)
+                } catch {
+                    await MainActor.run {
+                        self.usingFallbackNotification = true
+                        self.postFallbackProgressNotification(phase: phase, detail: detail, progress: clamped, done: 0, total: 0, force: true)
+                    }
                 }
             }
             return
         }
         #endif
-        if isBackground {
-            postFallbackNotification(title: "Omyaru 동기화 중…", body: detail)
-        }
+        // LiveContainer or Live Activities disabled -> continuously updated progress notification + in-app live pill!
+        usingFallbackNotification = true
+        requestFallbackNotificationPermissionIfNeeded()
+        postFallbackProgressNotification(phase: phase, detail: detail, progress: clamped, done: 0, total: 0, force: true)
     }
 
     func update(
@@ -97,6 +165,15 @@ final class OmyaruSyncLiveActivityController {
         totalItems: Int = 0,
         force: Bool = false
     ) {
+        let clamped = min(1.0, max(0.0, progress))
+        liveBannerVisible = true
+        liveBannerPhase = phase
+        liveBannerDetail = detail
+        liveBannerProgress = clamped
+        liveBannerCompleted = completedItems
+        liveBannerTotal = totalItems
+        liveBannerIsError = false
+
         let now = Date()
         if !force && now.timeIntervalSince(lastUpdateAt) < 0.35 { return }
         lastUpdateAt = now
@@ -107,7 +184,7 @@ final class OmyaruSyncLiveActivityController {
             let state = OmyaruSyncActivityAttributes.ContentState(
                 phase: phase,
                 detail: detail,
-                progress: min(1.0, max(0.0, progress)),
+                progress: clamped,
                 completedItems: completedItems,
                 totalItems: totalItems,
                 isFinished: false,
@@ -116,11 +193,27 @@ final class OmyaruSyncLiveActivityController {
             Task {
                 await activity.update(using: state)
             }
+            return
         }
         #endif
+
+        if fallbackEnabled && (usingFallbackNotification || isRunningInLiveContainer) {
+            postFallbackProgressNotification(phase: phase, detail: detail, progress: clamped, done: completedItems, total: totalItems, force: force)
+        }
     }
 
     func finish(phase: String, detail: String, isError: Bool) {
+        liveBannerPhase = phase
+        liveBannerDetail = detail
+        liveBannerProgress = isError ? 0.0 : 1.0
+        liveBannerIsError = isError
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 2_800_000_000)
+            if DriveSyncManager.shared.busy == false {
+                self?.liveBannerVisible = false
+            }
+        }
+
         #if canImport(ActivityKit)
         if #available(iOS 16.1, *),
            let activity = activeActivityBox as? Activity<OmyaruSyncActivityAttributes> {
@@ -140,17 +233,47 @@ final class OmyaruSyncLiveActivityController {
             return
         }
         #endif
-        UNUserNotificationCenter.current().removeDeliveredNotifications(withIdentifiers: [Self.fallbackNotificationID])
+
+        if fallbackEnabled && (usingFallbackNotification || isRunningInLiveContainer) {
+            postFallbackNotification(
+                title: isError ? "Omyaru 동기화 \(phase)" : "Omyaru 동기화 완료",
+                body: detail
+            )
+            Task {
+                try? await Task.sleep(nanoseconds: 5_000_000_000)
+                UNUserNotificationCenter.current().removeDeliveredNotifications(withIdentifiers: [Self.fallbackNotificationID])
+            }
+        } else {
+            UNUserNotificationCenter.current().removeDeliveredNotifications(withIdentifiers: [Self.fallbackNotificationID])
+        }
+        usingFallbackNotification = false
     }
 
     func requestFallbackNotificationPermissionIfNeeded() {
+        UNUserNotificationCenter.current().delegate = OmyaruSyncNotificationDelegate.shared
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .badge]) { _, _ in }
+    }
+
+    private func postFallbackProgressNotification(phase: String, detail: String, progress: Double, done: Int, total: Int, force: Bool) {
+        let now = Date()
+        if !force && now.timeIntervalSince(lastFallbackPostAt) < 1.2 { return }
+        lastFallbackPostAt = now
+        let pct = Int((min(1.0, max(0.0, progress)) * 100).rounded())
+        let filled = Int((Double(pct) / 10.0).rounded())
+        let bar = String(repeating: "▓", count: max(0, min(10, filled))) + String(repeating: "░", count: max(0, 10 - filled))
+        let countText = total > 0 ? " (\(done)/\(total))" : ""
+        postFallbackNotification(
+            title: "Omyaru 동기화 · \(phase) \(pct)%",
+            body: "\(bar)\(countText) · \(detail)"
+        )
     }
 
     private func postFallbackNotification(title: String, body: String) {
         let content = UNMutableNotificationContent()
         content.title = title
         content.body = body
+        content.sound = nil
+        content.interruptionLevel = .passive
         let request = UNNotificationRequest(identifier: Self.fallbackNotificationID, content: content, trigger: nil)
         UNUserNotificationCenter.current().add(request)
     }

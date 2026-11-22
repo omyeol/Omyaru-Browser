@@ -114,8 +114,8 @@ enum BookshelfPath {
 
 // MARK: - Cloud Image Chunk Manifest (Wire-Compatible with Android/Windows/Umtomi)
 
-struct ShelfCloudImage: Codable, Equatable, Hashable {
-    struct Reference: Codable, Equatable, Hashable {
+struct ShelfCloudImage: Codable, Equatable, Hashable, Sendable {
+    struct Reference: Codable, Equatable, Hashable, Sendable {
         var id: String
         var name: String
     }
@@ -160,16 +160,24 @@ final class ShelfModel: ObservableObject {
     @Published var status: String = ""
     @Published var busy: Bool = false
 
-    let root: URL = {
+    let privateRoot: URL = {
         let base = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
         return base.appendingPathComponent("Bookshelf", isDirectory: true)
     }()
 
-    private var catalogURL: URL { root.appendingPathComponent("catalog.json") }
+    /// Active storage directory for bookshelf images (shared `<BaseFolder>/<account>/originals` when configured, otherwise private sandbox).
+    var root: URL {
+        if let accountRoot = SharedSyncFolderManager.shared.activeAccountRoot(for: DriveSyncManager.shared.connectedEmail) {
+            return SharedSyncFolderManager.originalsDirectory(in: accountRoot)
+        }
+        return privateRoot
+    }
+
+    private var catalogURL: URL { privateRoot.appendingPathComponent("catalog.json") }
 
     init() {
-        try? FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-        if let data = try? Data(contentsOf: root.appendingPathComponent("catalog.json")),
+        try? FileManager.default.createDirectory(at: privateRoot, withIntermediateDirectories: true)
+        if let data = try? Data(contentsOf: privateRoot.appendingPathComponent("catalog.json")),
            let decoded = try? JSONDecoder().decode(BookshelfCatalogData.self, from: data) {
             catalog = Self.normalizeCatalog(decoded)
         } else {
@@ -249,15 +257,90 @@ final class ShelfModel: ObservableObject {
     }
 
     func imageURL(for item: BookshelfItem) -> URL {
-        root.appendingPathComponent(item.fileName)
+        let fm = FileManager.default
+        if let accountRoot = SharedSyncFolderManager.shared.activeAccountRoot(for: DriveSyncManager.shared.connectedEmail) {
+            if let sha = item.cloud?.sha256,
+               let byHash = SharedSyncFolderManager.existingOriginalURL(sha256: sha, in: accountRoot) {
+                return byHash
+            }
+            let sharedCandidate = SharedSyncFolderManager.originalsDirectory(in: accountRoot).appendingPathComponent(item.fileName)
+            if fm.fileExists(atPath: sharedCandidate.path) {
+                return sharedCandidate
+            }
+            let privateCandidate = privateRoot.appendingPathComponent(item.fileName)
+            if fm.fileExists(atPath: privateCandidate.path) {
+                return privateCandidate
+            }
+            if let sha = item.cloud?.sha256, sha.count == 64 {
+                return SharedSyncFolderManager.originalsDirectory(in: accountRoot).appendingPathComponent("\(sha.lowercased()).png")
+            }
+            return sharedCandidate
+        }
+        return privateRoot.appendingPathComponent(item.fileName)
     }
 
-    func save() {
+    func reloadFromSharedStorageIfAvailable(accountEmail: String?) {
+        guard let accountRoot = SharedSyncFolderManager.shared.activeAccountRoot(for: accountEmail) else { return }
+        let sharedCatalogFile = SharedSyncFolderManager.sharedCatalogURL(in: accountRoot)
+        guard FileManager.default.fileExists(atPath: sharedCatalogFile.path) else {
+            persistToSharedCatalogIfAvailable(accountEmail: accountEmail)
+            return
+        }
+        if let merged = try? SharedSyncFolderManager.withCatalogWriteLock(in: accountRoot, { () -> BookshelfCatalogData? in
+            guard let data = try? Data(contentsOf: sharedCatalogFile),
+                  let remote = try? JSONDecoder().decode(BookshelfCatalogData.self, from: data) else { return nil }
+            return Self.mergeCatalogs(local: catalog, shared: remote)
+        }), let merged {
+            catalog = Self.normalizeCatalog(merged)
+            save(syncToShared: false)
+        }
+    }
+
+    private static func mergeCatalogs(local: BookshelfCatalogData, shared: BookshelfCatalogData) -> BookshelfCatalogData {
+        var result = shared
+        var seenFolders = Set(result.folders.map { $0.lowercased() })
+        for folder in local.folders {
+            if seenFolders.insert(folder.lowercased()).inserted {
+                result.folders.append(folder)
+            }
+        }
+        for (k, v) in local.folderIds where result.folderIds[k] == nil {
+            result.folderIds[k] = v
+        }
+        for (k, v) in local.folderNotes where (result.folderNotes[k] ?? "").isEmpty && !v.isEmpty {
+            result.folderNotes[k] = v
+        }
+        for (k, v) in local.folderColumnCounts where result.folderColumnCounts[k] == nil {
+            result.folderColumnCounts[k] = v
+        }
+        var existingItemIDs = Set(result.items.map { $0.id.lowercased() })
+        for item in local.items {
+            if existingItemIDs.insert(item.id.lowercased()).inserted {
+                result.items.append(item)
+            }
+        }
+        return result
+    }
+
+    private func persistToSharedCatalogIfAvailable(accountEmail: String?) {
+        guard let accountRoot = SharedSyncFolderManager.shared.activeAccountRoot(for: accountEmail) else { return }
+        let snapshot = catalog
+        let sharedCatalogFile = SharedSyncFolderManager.sharedCatalogURL(in: accountRoot)
+        try? SharedSyncFolderManager.withCatalogWriteLock(in: accountRoot) {
+            let encoded = try JSONEncoder().encode(snapshot)
+            try encoded.write(to: sharedCatalogFile, options: .atomic)
+        }
+    }
+
+    func save(syncToShared: Bool = true) {
         catalog = Self.normalizeCatalog(catalog)
         do {
-            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+            try FileManager.default.createDirectory(at: privateRoot, withIntermediateDirectories: true)
             let data = try JSONEncoder().encode(catalog)
             try data.write(to: catalogURL, options: .atomic)
+            if syncToShared {
+                persistToSharedCatalogIfAvailable(accountEmail: DriveSyncManager.shared.connectedEmail)
+            }
         } catch {
             status = "저장 실패: \(error.localizedDescription)"
         }
@@ -367,11 +450,13 @@ final class ShelfModel: ObservableObject {
         let removedItems = catalog.items.filter {
             includeSubfolders ? BookshelfPath.contains(folder, $0.folder) : ($0.folder.caseInsensitiveCompare(folder) == .orderedSame)
         }
-        for item in removedItems {
-            try? FileManager.default.removeItem(at: imageURL(for: item))
-        }
+        let removedURLs = removedItems.map { imageURL(for: $0) }
         catalog.items.removeAll {
             includeSubfolders ? BookshelfPath.contains(folder, $0.folder) : ($0.folder.caseInsensitiveCompare(folder) == .orderedSame)
+        }
+        let liveURLs = Set(catalog.items.map { imageURL(for: $0).standardizedFileURL })
+        for url in removedURLs where !liveURLs.contains(url.standardizedFileURL) {
+            try? FileManager.default.removeItem(at: url)
         }
         catalog.folders.removeAll {
             includeSubfolders ? BookshelfPath.contains(folder, $0) : ($0.caseInsensitiveCompare(folder) == .orderedSame)
@@ -435,11 +520,17 @@ final class ShelfModel: ObservableObject {
         if !catalog.folders.contains(where: { $0.caseInsensitiveCompare(targetFolder) == .orderedSame }) {
             catalog.folders.append(targetFolder)
         }
-        let fileName = nextNumberedFileName(ext: ext)
-        let targetURL = root.appendingPathComponent(fileName)
         do {
-            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-            try data.write(to: targetURL, options: .atomic)
+            let fileName: String
+            if let accountRoot = SharedSyncFolderManager.shared.activeAccountRoot(for: DriveSyncManager.shared.connectedEmail) {
+                let storedURL = try SharedSyncFolderManager.storeOriginal(data, fallbackExt: ext, in: accountRoot)
+                fileName = storedURL.lastPathComponent
+            } else {
+                fileName = nextNumberedFileName(ext: ext)
+                let targetURL = privateRoot.appendingPathComponent(fileName)
+                try FileManager.default.createDirectory(at: privateRoot, withIntermediateDirectories: true)
+                try data.write(to: targetURL, options: .atomic)
+            }
             let pixelWidth = Int(uiImage.size.width * uiImage.scale)
             let pixelHeight = Int(uiImage.size.height * uiImage.scale)
             let item = BookshelfItem(
@@ -486,8 +577,11 @@ final class ShelfModel: ObservableObject {
         guard let idx = catalog.items.firstIndex(where: { $0.id == itemID }) else { return }
         let item = catalog.items[idx]
         let url = imageURL(for: item)
-        try? FileManager.default.removeItem(at: url)
         catalog.items.remove(at: idx)
+        let stillReferenced = catalog.items.contains { imageURL(for: $0).standardizedFileURL == url.standardizedFileURL }
+        if !stillReferenced {
+            try? FileManager.default.removeItem(at: url)
+        }
         save()
     }
 
@@ -508,10 +602,12 @@ final class ShelfModel: ObservableObject {
     func removeImages(_ ids: Set<String>) {
         guard !ids.isEmpty else { return }
         let targets = catalog.items.filter { ids.contains($0.id) }
-        for item in targets {
-            try? FileManager.default.removeItem(at: imageURL(for: item))
-        }
+        let urls = targets.map { imageURL(for: $0) }
         catalog.items.removeAll { ids.contains($0.id) }
+        let liveURLs = Set(catalog.items.map { imageURL(for: $0).standardizedFileURL })
+        for url in urls where !liveURLs.contains(url.standardizedFileURL) {
+            try? FileManager.default.removeItem(at: url)
+        }
         save()
         status = "\(targets.count)개 사진을 삭제했습니다."
     }

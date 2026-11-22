@@ -57,10 +57,10 @@ def main() -> None:
                 "buildVersion": build_version,
                 "date": date.today().isoformat(),
                 "localizedDescription": (
-                    f"v{version} (build {build_version}): Fixed Google Drive sync login persistence across app restarts "
-                    "(dual Keychain + sandboxed session persistence + automatic silent refresh), added Background Sync with ON/OFF toggle "
-                    "(BGAppRefreshTask + BGProcessingTask + background URLSession + active transfer keep-alive), and native iOS Live Activities "
-                    "('실시간 현황' Lock Screen & Dynamic Island live sync progress), plus iOS 26 Safari Liquid Glass UI & full Android parity."
+                    f"v{version} (build {build_version}): High-speed parallel Google Drive sync (multi-core off-MainActor PBKDF2, "
+                    "6x concurrent chunk & batch transfers, single appDataFolder listing, persistent KeyRing cache, delta-only CRDT shelf replica), "
+                    "shared sync folder picker with per-account subfolder (<Folder>/<account>) & kernel flock cross-app sync lock for zero duplication with Umtomi, "
+                    "and automatic LiveContainer Live Activity fallback (live-updating progress notification + floating top sync pill)."
                 ),
                 "downloadURL": download_url,
                 "size": ipa.stat().st_size,
