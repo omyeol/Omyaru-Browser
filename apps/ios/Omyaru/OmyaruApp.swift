@@ -58,9 +58,10 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
         let defaultGroup = BrowserGroup(id: Self.defaultGroup, name: "개인")
         let initialTabs = saved?.tabs.filter { !$0.isPrivate } ?? []
         let initialTab = BrowserTab(groupID: Self.defaultGroup)
+        let resolvedTabs = initialTabs.isEmpty ? [initialTab] : initialTabs
         groups = saved?.groups.isEmpty == false ? saved!.groups : [defaultGroup]
-        tabs = initialTabs.isEmpty ? [initialTab] : initialTabs
-        activeID = saved?.activeID ?? tabs[0].id
+        tabs = resolvedTabs
+        activeID = saved?.activeID ?? resolvedTabs[0].id
         activeGroupID = saved?.activeGroupID == Self.privateGroup ? Self.defaultGroup : (saved?.activeGroupID ?? Self.defaultGroup)
         bookmarks = saved?.bookmarks ?? []
         history = saved?.history ?? []
