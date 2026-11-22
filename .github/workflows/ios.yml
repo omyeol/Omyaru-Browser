@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths:
       - "apps/ios/**"
+      - "!apps/ios/altstore-source.json"
       - ".github/workflows/ios.yml"
   workflow_dispatch:
 
@@ -54,3 +55,14 @@ jobs:
           gh release upload ios-latest "$RUNNER_TEMP/Omyaru.ipa" \
             "$RUNNER_TEMP/altstore-source.json" --clobber
           gh release edit ios-latest --title 'Omyaru iOS v0.1.0 Preview'
+      - name: Refresh raw AltStore source
+        if: github.ref == 'refs/heads/main'
+        run: |
+          cp "$RUNNER_TEMP/altstore-source.json" apps/ios/altstore-source.json
+          git add apps/ios/altstore-source.json
+          if ! git diff --cached --quiet; then
+            git -c user.name='github-actions[bot]' \
+              -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+              commit -m 'Update AltStore source for latest iOS IPA'
+            git push origin HEAD:main
+          fi

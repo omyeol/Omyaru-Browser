@@ -1,0 +1,38 @@
+{
+  "name": "Omyaru",
+  "subtitle": "Omyaru Browser for iPhone and iPad",
+  "description": "Omyaru iOS preview builds for AltStore Classic.",
+  "iconURL": "https://raw.githubusercontent.com/omyeol/Omyaru-Browser/main/apps/ios/Omyaru/Assets.xcassets/AppIcon.appiconset/AppIcon.png",
+  "website": "https://github.com/omyeol/Omyaru-Browser",
+  "tintColor": "#5D97FF",
+  "apps": [
+    {
+      "name": "Omyaru Browser",
+      "bundleIdentifier": "cuttan.omyaru.app",
+      "developerName": "Omyeol",
+      "subtitle": "Privacy browser and bookshelf",
+      "localizedDescription": "Browser tabs, private group, bookmarks, downloads, bookshelf and manual update checks. Preview build; Android feature parity is still in progress.",
+      "iconURL": "https://raw.githubusercontent.com/omyeol/Omyaru-Browser/main/apps/ios/Omyaru/Assets.xcassets/AppIcon.appiconset/AppIcon.png",
+      "tintColor": "#5D97FF",
+      "category": "utilities",
+      "versions": [
+        {
+          "version": "0.1.0",
+          "buildVersion": "1",
+          "date": "2026-11-22",
+          "localizedDescription": "First iOS preview build.",
+          "downloadURL": "https://github.com/omyeol/Omyaru-Browser/releases/download/ios-latest/Omyaru.ipa",
+          "size": 225140,
+          "minOSVersion": "16.0"
+        }
+      ],
+      "appPermissions": {
+        "entitlements": [],
+        "privacy": {
+          "NSPhotoLibraryUsageDescription": "선택한 사진을 책장에 추가합니다.",
+          "NSPhotoLibraryAddUsageDescription": "책장 이미지를 사진 앱에 저장합니다."
+        }
+      }
+    }
+  ]
+}

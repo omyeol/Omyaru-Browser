@@ -8,10 +8,9 @@ protocol, VPN engine, or long-page region capture. It has not been tested on a
 physical iOS device. Do not describe it as Android feature parity.
 
 GitHub Actions builds an unsigned device IPA. AltStore Classic re-signs sideloaded
-apps for the user's device. The stable source URL, after the first successful
-GitHub release, is:
+apps for the user's device. The stable source URL is:
 
-`https://github.com/omyeol/Omyaru-Browser/releases/download/ios-latest/altstore-source.json`
+`https://raw.githubusercontent.com/omyeol/Omyaru-Browser/main/apps/ios/altstore-source.json`
 
 Xcode project generation on a Mac: `xcodegen generate --spec project.yml` from
 this directory. The generated `.xcodeproj` is not committed.
