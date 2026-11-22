@@ -18,11 +18,11 @@
       "versions": [
         {
           "version": "0.15.18",
-          "buildVersion": "80",
+          "buildVersion": "81",
           "date": "2026-11-22",
-          "localizedDescription": "v0.15.18 (build 80): Fixed Google Drive sync login persistence across app restarts (dual Keychain + sandboxed session persistence + automatic silent refresh), added Background Sync with ON/OFF toggle (BGAppRefreshTask + BGProcessingTask + background URLSession + active transfer keep-alive), and native iOS Live Activities ('실시간 현황' Lock Screen & Dynamic Island live sync progress), plus iOS 26 Safari Liquid Glass UI & full Android parity.",
+          "localizedDescription": "v0.15.18 (build 81): High-speed parallel Google Drive sync (multi-core off-MainActor PBKDF2, 6x concurrent chunk & batch transfers, single appDataFolder listing, persistent KeyRing cache, delta-only CRDT shelf replica), shared sync folder picker with per-account subfolder (<Folder>/<account>) & kernel flock cross-app sync lock for zero duplication with Umtomi, and automatic LiveContainer Live Activity fallback (live-updating progress notification + floating top sync pill).",
           "downloadURL": "https://github.com/omyeol/Omyaru-Browser/releases/download/v0.15.18/Omyaru-v0.15.18-ios.ipa",
-          "size": 1972495,
+          "size": 2113938,
           "minOSVersion": "16.0"
         }
       ],
