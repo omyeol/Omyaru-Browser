@@ -2,188 +2,651 @@ import SwiftUI
 import PhotosUI
 import UniformTypeIdentifiers
 import UIKit
+import ImageIO
+import CryptoKit
 
-struct ShelfFolder: Codable, Identifiable, Hashable {
-    var id: UUID = UUID()
-    var name: String
-    var note: String = ""
-    var columns: Int = 2
-    var images: [String] = []
+// MARK: - Bookshelf Path Helper (Parity with Android/Windows BookshelfPath)
+
+enum BookshelfPath {
+    static func normalize(_ raw: String) -> String? {
+        let replaced = raw.replacingOccurrences(of: "\\", with: "/")
+        let segments = replaced
+            .split(separator: "/", omittingEmptySubsequences: true)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+        guard !segments.isEmpty, segments.count <= 16 else { return nil }
+        for seg in segments {
+            if seg.isEmpty || seg == "." || seg == ".." || seg.count > 80 { return nil }
+            if seg.contains(where: { "<>:\"|?*".contains($0) || $0.isNewline }) { return nil }
+        }
+        return segments.joined(separator: "/")
+    }
+
+    static func parent(_ path: String) -> String {
+        guard let norm = normalize(path), let idx = norm.lastIndex(of: "/") else { return "" }
+        return String(norm[..<idx])
+    }
+
+    static func leaf(_ path: String) -> String {
+        guard let norm = normalize(path) else { return path.trimmingCharacters(in: .whitespacesAndNewlines) }
+        guard let idx = norm.lastIndex(of: "/") else { return norm }
+        return String(norm[norm.index(after: idx)...])
+    }
+
+    static func contains(_ root: String, _ candidate: String) -> Bool {
+        guard let r = normalize(root), let c = normalize(candidate) else { return false }
+        if r.caseInsensitiveCompare(c) == .orderedSame { return true }
+        return c.lowercased().hasPrefix(r.lowercased() + "/")
+    }
+
+    static func allDisplayFolders(_ folders: [String]) -> [String] {
+        var seen = Set<String>()
+        var result: [String] = []
+        for folder in folders {
+            guard let norm = normalize(folder) else { continue }
+            var ancestors: [String] = []
+            var cur = norm
+            while !cur.isEmpty {
+                ancestors.append(cur)
+                cur = parent(cur)
+            }
+            for path in ancestors.reversed() {
+                let key = path.lowercased()
+                if seen.insert(key).inserted {
+                    result.append(path)
+                }
+            }
+        }
+        return result
+    }
+
+    static func relocation(_ folders: [String], from source: String, to destination: String) -> [String: String]? {
+        guard let src = normalize(source), let dst = normalize(destination) else { return nil }
+        if src.caseInsensitiveCompare(dst) == .orderedSame { return nil }
+        if contains(src, dst) { return nil }
+        var map: [String: String] = [:]
+        let all = allDisplayFolders(folders)
+        for folder in all where contains(src, folder) {
+            let suffix = folder.count == src.count ? "" : String(folder.dropFirst(src.count))
+            guard let target = normalize(dst + suffix) else { return nil }
+            map[folder] = target
+        }
+        if map.isEmpty { map[src] = dst }
+        let movingKeys = Set(map.keys.map { $0.lowercased() })
+        let existingRemaining = Set(all.map { $0.lowercased() }).subtracting(movingKeys)
+        for target in map.values {
+            if existingRemaining.contains(target.lowercased()) { return nil }
+        }
+        return map
+    }
+
+    static func moveSibling(_ folders: [String], folder: String, direction: Int) -> [String]? {
+        guard let target = normalize(folder), direction != 0 else { return nil }
+        let all = allDisplayFolders(folders)
+        let parentPath = parent(target)
+        let siblings = all.filter { parent($0).caseInsensitiveCompare(parentPath) == .orderedSame }
+        guard let idx = siblings.firstIndex(where: { $0.caseInsensitiveCompare(target) == .orderedSame }) else { return nil }
+        let nextIdx = idx + (direction < 0 ? -1 : 1)
+        guard siblings.indices.contains(nextIdx) else { return nil }
+        let other = siblings[nextIdx]
+
+        var blocks: [(root: String, items: [String])] = []
+        var consumed = Set<String>()
+        for f in folders {
+            let key = f.lowercased()
+            if consumed.contains(key) { continue }
+            if let sib = siblings.first(where: { contains($0, f) }) {
+                let group = folders.filter { contains(sib, $0) }
+                for g in group { consumed.insert(g.lowercased()) }
+                blocks.append((sib, group))
+            } else {
+                consumed.insert(key)
+                blocks.append((f, [f]))
+            }
+        }
+        guard let b1 = blocks.firstIndex(where: { $0.root.caseInsensitiveCompare(target) == .orderedSame }),
+              let b2 = blocks.firstIndex(where: { $0.root.caseInsensitiveCompare(other) == .orderedSame }) else {
+            return nil
+        }
+        blocks.swapAt(b1, b2)
+        return blocks.flatMap(\.items)
+    }
 }
+
+// MARK: - Cloud Image Chunk Manifest (Wire-Compatible with Android/Windows/Umtomi)
+
+struct ShelfCloudImage: Codable, Equatable, Hashable {
+    struct Reference: Codable, Equatable, Hashable {
+        var id: String
+        var name: String
+    }
+    var version: Int = 1
+    var length: Int
+    var sha256: String
+    var chunks: [String]
+    var files: [Reference]
+}
+
+// MARK: - Bookshelf Item & Catalog Models
+
+struct BookshelfItem: Codable, Identifiable, Hashable {
+    var id: String = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
+    var folder: String
+    var fileName: String
+    var sourceUrl: String = ""
+    var width: Int = 720
+    var height: Int = 1024
+    var createdAtEpochMs: Int64 = Int64(Date().timeIntervalSince1970 * 1000)
+    var cloud: ShelfCloudImage? = nil
+}
+
+struct BookshelfCatalogData: Codable {
+    var activeFolder: String = "기본 책장"
+    var columnCount: Int = 2
+    var folders: [String] = ["기본 책장"]
+    var folderIds: [String: String] = [:]
+    var folderNotes: [String: String] = [:]
+    var folderColumnCounts: [String: Int] = [:]
+    var items: [BookshelfItem] = []
+}
+
+// MARK: - Bookshelf Store (Singleton & ObservableObject)
 
 @MainActor
 final class ShelfModel: ObservableObject {
-    @Published var folders: [ShelfFolder] = []
-    @Published var activeID: UUID?
-    @Published var status = ""
-    private let root = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0].appendingPathComponent("Bookshelf")
+    static let shared = ShelfModel()
+
+    @Published var catalog: BookshelfCatalogData
+    @Published var expandedFolders: Set<String> = []
+    @Published var status: String = ""
+    @Published var busy: Bool = false
+
+    let root: URL = {
+        let base = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        return base.appendingPathComponent("Bookshelf", isDirectory: true)
+    }()
+
     private var catalogURL: URL { root.appendingPathComponent("catalog.json") }
-    var active: ShelfFolder? { folders.first { $0.id == activeID } }
 
     init() {
         try? FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-        if let data = try? Data(contentsOf: catalogURL), let saved = try? JSONDecoder().decode([ShelfFolder].self, from: data) {
-            folders = saved
+        if let data = try? Data(contentsOf: root.appendingPathComponent("catalog.json")),
+           let decoded = try? JSONDecoder().decode(BookshelfCatalogData.self, from: data) {
+            catalog = Self.normalizeCatalog(decoded)
+        } else {
+            catalog = Self.normalizeCatalog(BookshelfCatalogData())
         }
-        if folders.isEmpty { folders = [ShelfFolder(name: "기본 책장")] }
-        activeID = folders[0].id
+        expandAncestors(of: catalog.activeFolder)
     }
 
-    func imageURL(_ name: String, in folder: ShelfFolder) -> URL {
-        root.appendingPathComponent(folder.id.uuidString).appendingPathComponent(name)
+    private static func compactUUID() -> String {
+        UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
+    }
+
+    static func normalizeCatalog(_ input: BookshelfCatalogData) -> BookshelfCatalogData {
+        var c = input
+        var seen = Set<String>()
+        var normalizedFolders: [String] = []
+        for raw in c.folders {
+            if let norm = BookshelfPath.normalize(raw) {
+                let key = norm.lowercased()
+                if seen.insert(key).inserted {
+                    normalizedFolders.append(norm)
+                }
+            }
+        }
+        for item in c.items {
+            if let norm = BookshelfPath.normalize(item.folder) {
+                let key = norm.lowercased()
+                if seen.insert(key).inserted {
+                    normalizedFolders.append(norm)
+                }
+            }
+        }
+        if normalizedFolders.isEmpty {
+            normalizedFolders.append("기본 책장")
+        }
+        c.folders = normalizedFolders
+
+        // Preserve notes, IDs, and columnCounts for both explicit and virtual parent folders!
+        let allPaths = Set(BookshelfPath.allDisplayFolders(normalizedFolders).map { $0 })
+        for path in allPaths {
+            if c.folderIds[path] == nil {
+                c.folderIds[path] = compactUUID()
+            }
+            if c.folderColumnCounts[path] == nil {
+                c.folderColumnCounts[path] = 2
+            } else {
+                c.folderColumnCounts[path] = min(6, max(1, c.folderColumnCounts[path] ?? 2))
+            }
+        }
+        for (k, v) in c.folderColumnCounts {
+            c.folderColumnCounts[k] = min(6, max(1, v))
+        }
+
+        if let activeNorm = BookshelfPath.normalize(c.activeFolder),
+           allPaths.contains(where: { $0.caseInsensitiveCompare(activeNorm) == .orderedSame }) {
+            c.activeFolder = allPaths.first(where: { $0.caseInsensitiveCompare(activeNorm) == .orderedSame }) ?? normalizedFolders[0]
+        } else {
+            c.activeFolder = normalizedFolders[0]
+        }
+        c.columnCount = min(6, max(1, c.folderColumnCounts[c.activeFolder] ?? c.columnCount))
+        c.folderColumnCounts[c.activeFolder] = c.columnCount
+        return c
+    }
+
+    var activeFolder: String { catalog.activeFolder }
+    var activeNote: String { catalog.folderNotes[catalog.activeFolder] ?? "" }
+    var activeColumns: Int { min(6, max(1, catalog.folderColumnCounts[catalog.activeFolder] ?? 2)) }
+    var allDisplayFolders: [String] { BookshelfPath.allDisplayFolders(catalog.folders) }
+
+    func visibleItems(in folder: String? = nil) -> [BookshelfItem] {
+        let target = folder ?? catalog.activeFolder
+        return catalog.items.filter { BookshelfPath.contains(target, $0.folder) }
+    }
+
+    func directItems(in folder: String) -> [BookshelfItem] {
+        catalog.items.filter { $0.folder.caseInsensitiveCompare(folder) == .orderedSame }
+    }
+
+    func imageURL(for item: BookshelfItem) -> URL {
+        root.appendingPathComponent(item.fileName)
     }
 
     func save() {
+        catalog = Self.normalizeCatalog(catalog)
         do {
-            let data = try JSONEncoder().encode(folders)
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+            let data = try JSONEncoder().encode(catalog)
             try data.write(to: catalogURL, options: .atomic)
-        } catch { status = error.localizedDescription }
+        } catch {
+            status = "저장 실패: \(error.localizedDescription)"
+        }
     }
 
-    func addFolder(_ name: String) {
-        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
-        let folder = ShelfFolder(name: trimmed)
-        folders.append(folder)
-        activeID = folder.id
+    func expandAncestors(of path: String) {
+        var cur = path
+        while !cur.isEmpty {
+            expandedFolders.insert(cur)
+            cur = BookshelfPath.parent(cur)
+        }
+    }
+
+    func selectFolder(_ path: String) {
+        guard let norm = BookshelfPath.normalize(path) else { return }
+        catalog.activeFolder = norm
+        if catalog.folderColumnCounts[norm] == nil {
+            catalog.folderColumnCounts[norm] = 2
+        }
+        catalog.columnCount = min(6, max(1, catalog.folderColumnCounts[norm] ?? 2))
+        expandAncestors(of: norm)
         save()
     }
 
-    func rename(_ id: UUID, to name: String) {
-        guard let index = folders.firstIndex(where: { $0.id == id }), !name.trimmingCharacters(in: .whitespaces).isEmpty else { return }
-        folders[index].name = name.trimmingCharacters(in: .whitespaces)
+    @discardableResult
+    func addFolder(_ requestedPath: String, select: Bool = true) -> String? {
+        guard let norm = BookshelfPath.normalize(requestedPath) else {
+            status = "사용할 수 없는 폴더 이름입니다."
+            return nil
+        }
+        if !catalog.folders.contains(where: { $0.caseInsensitiveCompare(norm) == .orderedSame }) {
+            catalog.folders.append(norm)
+        }
+        if catalog.folderIds[norm] == nil { catalog.folderIds[norm] = Self.compactUUID() }
+        if catalog.folderColumnCounts[norm] == nil { catalog.folderColumnCounts[norm] = 2 }
+        if select {
+            catalog.activeFolder = norm
+            catalog.columnCount = catalog.folderColumnCounts[norm] ?? 2
+            expandAncestors(of: norm)
+        }
         save()
+        return norm
     }
 
-    func removeFolder(_ id: UUID) {
-        guard folders.count > 1 else { status = "마지막 책장은 삭제할 수 없습니다."; return }
-        guard let index = folders.firstIndex(where: { $0.id == id }) else { return }
-        let directory = root.appendingPathComponent(id.uuidString)
-        do {
-            if FileManager.default.fileExists(atPath: directory.path) { try FileManager.default.removeItem(at: directory) }
-            folders.remove(at: index)
-            if activeID == id { activeID = folders[0].id }
-            save()
-        } catch { status = error.localizedDescription }
+    @discardableResult
+    func renameOrMoveFolder(from source: String, to destination: String) -> Bool {
+        guard let moves = BookshelfPath.relocation(catalog.folders, from: source, to: destination) else {
+            status = "같은 이름의 폴더가 있거나 이동할 수 없는 위치입니다."
+            return false
+        }
+        var savedIds: [String: String] = [:]
+        var savedNotes: [String: String] = [:]
+        var savedCols: [String: Int] = [:]
+        for (oldPath, _) in moves {
+            savedIds[oldPath] = catalog.folderIds[oldPath] ?? Self.compactUUID()
+            savedNotes[oldPath] = catalog.folderNotes[oldPath] ?? ""
+            savedCols[oldPath] = catalog.folderColumnCounts[oldPath] ?? 2
+        }
+        for i in catalog.folders.indices {
+            if let renamed = moves[catalog.folders[i]] {
+                catalog.folders[i] = renamed
+            }
+        }
+        // If moving a virtual parent folder whose children were in catalog.folders, ensure destination exists
+        if let topTarget = moves[source], !catalog.folders.contains(where: { BookshelfPath.contains(topTarget, $0) }) {
+            catalog.folders.append(topTarget)
+        }
+        for (oldPath, newPath) in moves {
+            catalog.folderIds.removeValue(forKey: oldPath)
+            catalog.folderNotes.removeValue(forKey: oldPath)
+            catalog.folderColumnCounts.removeValue(forKey: oldPath)
+            catalog.folderIds[newPath] = savedIds[oldPath]
+            catalog.folderNotes[newPath] = savedNotes[oldPath]
+            catalog.folderColumnCounts[newPath] = savedCols[oldPath]
+        }
+        for i in catalog.items.indices {
+            if let targetFolder = moves[catalog.items[i].folder] {
+                catalog.items[i].folder = targetFolder
+            }
+        }
+        if let activeMoved = moves[catalog.activeFolder] {
+            catalog.activeFolder = activeMoved
+            expandAncestors(of: activeMoved)
+        }
+        save()
+        status = "‘\(BookshelfPath.leaf(destination))’ 폴더 이동 완료"
+        return true
+    }
+
+    @discardableResult
+    func moveFolderOrder(_ folder: String, direction: Int) -> Bool {
+        guard let reordered = BookshelfPath.moveSibling(catalog.folders, folder: folder, direction: direction) else {
+            return false
+        }
+        catalog.folders = reordered
+        save()
+        return true
+    }
+
+    @discardableResult
+    func deleteFolder(_ folder: String, includeSubfolders: Bool = true) -> Bool {
+        let all = allDisplayFolders
+        guard all.count > 1 else {
+            status = "마지막 책장 폴더는 삭제할 수 없습니다."
+            return false
+        }
+        let removedItems = catalog.items.filter {
+            includeSubfolders ? BookshelfPath.contains(folder, $0.folder) : ($0.folder.caseInsensitiveCompare(folder) == .orderedSame)
+        }
+        for item in removedItems {
+            try? FileManager.default.removeItem(at: imageURL(for: item))
+        }
+        catalog.items.removeAll {
+            includeSubfolders ? BookshelfPath.contains(folder, $0.folder) : ($0.folder.caseInsensitiveCompare(folder) == .orderedSame)
+        }
+        catalog.folders.removeAll {
+            includeSubfolders ? BookshelfPath.contains(folder, $0) : ($0.caseInsensitiveCompare(folder) == .orderedSame)
+        }
+        for key in Array(catalog.folderNotes.keys) where BookshelfPath.contains(folder, key) {
+            catalog.folderNotes.removeValue(forKey: key)
+            catalog.folderColumnCounts.removeValue(forKey: key)
+            catalog.folderIds.removeValue(forKey: key)
+        }
+        if catalog.folders.isEmpty {
+            catalog.folders = ["기본 책장"]
+        }
+        if BookshelfPath.contains(folder, catalog.activeFolder) {
+            let parent = BookshelfPath.parent(folder)
+            catalog.activeFolder = (!parent.isEmpty && allDisplayFolders.contains(parent)) ? parent : catalog.folders[0]
+        }
+        save()
+        return true
     }
 
     func updateNote(_ note: String) {
-        guard let index = folders.firstIndex(where: { $0.id == activeID }) else { return }
-        folders[index].note = String(note.prefix(4000))
+        let clipped = String(note.prefix(4000))
+        if catalog.folderNotes[catalog.activeFolder] == clipped { return }
+        catalog.folderNotes[catalog.activeFolder] = clipped
         save()
     }
 
     func updateColumns(_ columns: Int) {
-        guard let index = folders.firstIndex(where: { $0.id == activeID }) else { return }
-        folders[index].columns = min(6, max(2, columns))
+        let clamped = min(6, max(1, columns))
+        catalog.folderColumnCounts[catalog.activeFolder] = clamped
+        catalog.columnCount = clamped
         save()
     }
 
-    func add(_ data: Data, fileExtension ext: String = "jpg") {
-        guard let index = folders.firstIndex(where: { $0.id == activeID }), UIImage(data: data) != nil else { return }
-        let directory = root.appendingPathComponent(folders[index].id.uuidString)
-        let name = UUID().uuidString + "." + ext
-        do {
-            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-            try data.write(to: directory.appendingPathComponent(name), options: .atomic)
-            folders[index].images.append(name)
-            save()
-        } catch { status = error.localizedDescription }
+    private func nextNumberedFileName(ext: String) -> String {
+        let cleanExt = ext.trimmingCharacters(in: CharacterSet(charactersIn: ".")).lowercased()
+        let resolvedExt = cleanExt.isEmpty ? "png" : cleanExt
+        let existingFiles = (try? FileManager.default.contentsOfDirectory(atPath: root.path)) ?? []
+        var maxNumber = 0
+        for name in existingFiles {
+            let base = (name as NSString).deletingPathExtension
+            if base.lowercased().hasPrefix("image"),
+               let num = Int(base.dropFirst(5)), num > maxNumber {
+                maxNumber = num
+            }
+        }
+        var next = maxNumber + 1
+        while FileManager.default.fileExists(atPath: root.appendingPathComponent("image\(next).\(resolvedExt)").path) {
+            next += 1
+        }
+        return "image\(next).\(resolvedExt)"
     }
 
-    func removeImage(_ name: String) {
-        guard let index = folders.firstIndex(where: { $0.id == activeID }) else { return }
-        let url = imageURL(name, in: folders[index])
+    @discardableResult
+    func addImageData(_ data: Data, fileExtension ext: String = "png", toFolder folder: String? = nil, sourceUrl: String = "") -> BookshelfItem? {
+        guard let uiImage = UIImage(data: data), uiImage.size.width > 0, uiImage.size.height > 0 else {
+            status = "유효한 이미지 데이터가 아닙니다."
+            return nil
+        }
+        let targetFolder = BookshelfPath.normalize(folder ?? catalog.activeFolder) ?? catalog.activeFolder
+        if !catalog.folders.contains(where: { $0.caseInsensitiveCompare(targetFolder) == .orderedSame }) {
+            catalog.folders.append(targetFolder)
+        }
+        let fileName = nextNumberedFileName(ext: ext)
+        let targetURL = root.appendingPathComponent(fileName)
         do {
-            if FileManager.default.fileExists(atPath: url.path) { try FileManager.default.removeItem(at: url) }
-            folders[index].images.removeAll { $0 == name }
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+            try data.write(to: targetURL, options: .atomic)
+            let pixelWidth = Int(uiImage.size.width * uiImage.scale)
+            let pixelHeight = Int(uiImage.size.height * uiImage.scale)
+            let item = BookshelfItem(
+                folder: targetFolder,
+                fileName: fileName,
+                sourceUrl: sourceUrl,
+                width: max(1, pixelWidth),
+                height: max(1, pixelHeight)
+            )
+            catalog.items.append(item)
             save()
-        } catch { status = error.localizedDescription }
+            status = "‘\(BookshelfPath.leaf(targetFolder))’ 책장에 이미지 추가됨"
+            return item
+        } catch {
+            status = "이미지 저장 실패: \(error.localizedDescription)"
+            return nil
+        }
+    }
+
+    func moveImage(_ itemID: String, toFolder targetFolder: String) {
+        guard let norm = BookshelfPath.normalize(targetFolder),
+              let idx = catalog.items.firstIndex(where: { $0.id == itemID }) else { return }
+        if !catalog.folders.contains(where: { $0.caseInsensitiveCompare(norm) == .orderedSame }) {
+            catalog.folders.append(norm)
+        }
+        catalog.items[idx].folder = norm
+        save()
+        status = "사진을 ‘\(BookshelfPath.leaf(norm))’ 폴더로 이동했습니다."
+    }
+
+    func moveImageOrder(_ itemID: String, direction: Int) {
+        let visible = visibleItems()
+        guard let visIdx = visible.firstIndex(where: { $0.id == itemID }) else { return }
+        let targetVisIdx = visIdx + direction
+        guard visible.indices.contains(targetVisIdx) else { return }
+        let otherID = visible[targetVisIdx].id
+        guard let i1 = catalog.items.firstIndex(where: { $0.id == itemID }),
+              let i2 = catalog.items.firstIndex(where: { $0.id == otherID }) else { return }
+        catalog.items.swapAt(i1, i2)
+        save()
+    }
+
+    func removeImage(_ itemID: String) {
+        guard let idx = catalog.items.firstIndex(where: { $0.id == itemID }) else { return }
+        let item = catalog.items[idx]
+        let url = imageURL(for: item)
+        try? FileManager.default.removeItem(at: url)
+        catalog.items.remove(at: idx)
+        save()
     }
 
     func exportPDF(landscape: Bool) -> URL? {
-        guard let folder = active else { return nil }
-        let size = landscape ? CGSize(width: 960, height: 540) : CGSize(width: 540, height: 960)
-        let output = FileManager.default.temporaryDirectory.appendingPathComponent("\(folder.name)-\(UUID().uuidString).pdf")
-        let renderer = UIGraphicsPDFRenderer(bounds: CGRect(origin: .zero, size: size))
+        let items = visibleItems()
+        guard !items.isEmpty else {
+            status = "내보낼 이미지가 없습니다."
+            return nil
+        }
+        let cols = max(1, activeColumns)
+        let pageSize = landscape ? CGSize(width: 842, height: 595) : CGSize(width: 595, height: 842)
+        let colWidth = pageSize.width / CGFloat(cols)
+        var colHeights = Array(repeating: CGFloat.zero, count: cols)
+        var placements: [(BookshelfItem, CGRect)] = []
+
+        for item in items {
+            let col = colHeights.enumerated().min(by: { $0.element < $1.element })?.offset ?? 0
+            let aspect = CGFloat(max(1, item.height)) / CGFloat(max(1, item.width))
+            let drawHeight = colWidth * aspect
+            let rect = CGRect(x: CGFloat(col) * colWidth, y: colHeights[col], width: colWidth, height: drawHeight)
+            colHeights[col] += drawHeight
+            placements.append((item, rect))
+        }
+
+        let totalHeight = max(pageSize.height, colHeights.max() ?? pageSize.height)
+        let pageCount = max(1, Int(ceil(totalHeight / pageSize.height)))
+        let safeLeaf = BookshelfPath.leaf(activeFolder).replacingOccurrences(of: "/", with: "_")
+        let output = FileManager.default.temporaryDirectory.appendingPathComponent("Omyaru-\(safeLeaf)-\(UUID().uuidString.prefix(6)).pdf")
+        let renderer = UIGraphicsPDFRenderer(bounds: CGRect(origin: .zero, size: pageSize))
         do {
             try renderer.writePDF(to: output) { context in
-                var y = [CGFloat](repeating: 0, count: folder.columns)
-                let cellWidth = size.width / CGFloat(folder.columns)
-                context.beginPage()
-                for name in folder.images {
-                    guard let image = UIImage(contentsOfFile: imageURL(name, in: folder).path), image.size.width > 0 else { continue }
-                    let column = y.enumerated().min(by: { $0.element < $1.element })!.offset
-                    var height = image.size.height * cellWidth / image.size.width
-                    if height > size.height { height = size.height }
-                    if y[column] + height > size.height {
-                        context.beginPage()
-                        y = [CGFloat](repeating: 0, count: folder.columns)
-                    }
-                    image.draw(in: CGRect(x: CGFloat(column) * cellWidth, y: y[column], width: cellWidth, height: height))
-                    y[column] += height
-                }
-            }
-            return output
-        } catch { status = error.localizedDescription; return nil }
-    }
-}
-
-struct BookshelfView: View {
-    @Environment(\.dismiss) private var dismiss
-    @StateObject private var model = ShelfModel()
-    @State private var selectedPhotos: [PhotosPickerItem] = []
-    @State private var showFilePicker = false
-    @State private var showFolders = false
-    @State private var showFullscreen = false
-    @State private var newFolderName = ""
-    @State private var showNewFolder = false
-    @State private var pdfURL: URL?
-    @State private var showPDFOptions = false
-    @State private var note = ""
-
-    var body: some View {
-        NavigationStack {
-            VStack(spacing: 0) {
-                HStack {
-                    Button { showFolders = true } label: {
-                        Label(model.active?.name ?? "책장", systemImage: "folder").lineLimit(1)
-                    }
-                    Spacer()
-                    Button { model.updateColumns((model.active?.columns ?? 2) - 1) } label: { Image(systemName: "minus") }
-                    Text("\(model.active?.columns ?? 2)열").font(.caption)
-                    Button { model.updateColumns((model.active?.columns ?? 2) + 1) } label: { Image(systemName: "plus") }
-                }.padding(.horizontal)
-                TextEditor(text: $note).frame(height: 65)
-                    .scrollContentBackground(.hidden)
-                    .background(.thinMaterial)
-                    .onChange(of: note) { value in model.updateNote(value) }
-                ScrollView {
-                    if let folder = model.active {
-                        LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 0), count: folder.columns), spacing: 0) {
-                            ForEach(folder.images, id: \.self) { name in
-                                if let image = UIImage(contentsOfFile: model.imageURL(name, in: folder).path) {
-                                    Image(uiImage: image).resizable().scaledToFit()
-                                        .contextMenu { Button("삭제", role: .destructive) { model.removeImage(name) } }
-                                }
+                for page in 0..<pageCount {
+                    context.beginPage()
+                    let slice = CGRect(x: 0, y: CGFloat(page) * pageSize.height, width: pageSize.width, height: pageSize.height)
+                    for (item, rect) in placements where rect.intersects(slice) {
+                        autoreleasepool {
+                            if let img = UIImage(contentsOfFile: imageURL(for: item).path) {
+                                img.draw(in: rect.offsetBy(dx: 0, dy: -slice.minY))
                             }
                         }
                     }
                 }
             }
-            .navigationTitle(model.active?.name ?? "책장")
+            return output
+        } catch {
+            status = "PDF 생성 실패: \(error.localizedDescription)"
+            return nil
+        }
+    }
+}
+
+// MARK: - Main Bookshelf View
+
+struct BookshelfView: View {
+    @Environment(\.dismiss) private var dismiss
+    @ObservedObject var model: ShelfModel = .shared
+    @State private var selectedPhotos: [PhotosPickerItem] = []
+    @State private var showFilePicker = false
+    @State private var showFolderTree = false
+    @State private var movingFolderPath: String? = nil
+    @State private var movingImageItem: BookshelfItem? = nil
+    @State private var showFullscreen = false
+    @State private var inspectedItem: BookshelfItem? = nil
+    @State private var showNewFolderAlert = false
+    @State private var newFolderParent: String = ""
+    @State private var newFolderName = ""
+    @State private var renamingFolderPath: String? = nil
+    @State private var renameInput = ""
+    @State private var deletingFolderPath: String? = nil
+    @State private var pdfURL: URL? = nil
+    @State private var showPDFOptions = false
+    @State private var showSyncSheet = false
+    @State private var noteText = ""
+
+    var body: some View {
+        NavigationStack {
+            VStack(spacing: 0) {
+                folderBreadcrumbBar
+                noteAndColumnBar
+                galleryBody
+            }
+            .background(Color(red: 0.07, green: 0.07, blue: 0.08))
+            .navigationTitle(BookshelfPath.leaf(model.activeFolder))
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .topBarLeading) { Button("완료") { dismiss() } }
+                ToolbarItem(placement: .topBarLeading) {
+                    Button("완료") { dismiss() }
+                }
                 ToolbarItemGroup(placement: .topBarTrailing) {
+                    Button {
+                        showSyncSheet = true
+                    } label: {
+                        Image(systemName: "arrow.triangle.2.circlepath.icloud")
+                    }
                     PhotosPicker(selection: $selectedPhotos, maxSelectionCount: 0, matching: .images) {
                         Image(systemName: "photo.badge.plus")
                     }
                     Menu {
-                        Button("파일에서 여러 장 추가") { showFilePicker = true }
-                        Button("전체 화면") { showFullscreen = true }
-                        Button("PDF 내보내기") { showPDFOptions = true }
-                    } label: { Image(systemName: "ellipsis.circle") }
+                        Button {
+                            showFilePicker = true
+                        } label: {
+                            Label("파일에서 사진 여러 장 추가", systemImage: "folder.badge.plus")
+                        }
+                        Button {
+                            if let img = UIPasteboard.general.image, let data = img.pngData() {
+                                _ = model.addImageData(data, fileExtension: "png")
+                            } else {
+                                model.status = "클립보드에 이미지가 없습니다."
+                            }
+                        } label: {
+                            Label("클립보드 이미지 붙여넣기", systemImage: "doc.on.clipboard")
+                        }
+                        Divider()
+                        Button {
+                            newFolderParent = ""
+                            newFolderName = ""
+                            showNewFolderAlert = true
+                        } label: {
+                            Label("새 최상위 폴더 만들기", systemImage: "folder.badge.plus")
+                        }
+                        Button {
+                            newFolderParent = model.activeFolder
+                            newFolderName = ""
+                            showNewFolderAlert = true
+                        } label: {
+                            Label("현재 폴더에 하위 폴더 만들기", systemImage: "plus.rectangle.on.folder")
+                        }
+                        Button {
+                            renamingFolderPath = model.activeFolder
+                            renameInput = BookshelfPath.leaf(model.activeFolder)
+                        } label: {
+                            Label("현재 폴더 이름 변경", systemImage: "pencil")
+                        }
+                        Button {
+                            movingFolderPath = model.activeFolder
+                            showFolderTree = true
+                        } label: {
+                            Label("현재 폴더 다른 위치로 이동", systemImage: "folder.badge.gearshape")
+                        }
+                        Divider()
+                        Button {
+                            showFullscreen = true
+                        } label: {
+                            Label("전체 화면 보기", systemImage: "arrow.up.left.and.arrow.down.right")
+                        }
+                        Button {
+                            showPDFOptions = true
+                        } label: {
+                            Label("PDF로 내보내기", systemImage: "doc.richtext")
+                        }
+                        Divider()
+                        Button(role: .destructive) {
+                            deletingFolderPath = model.activeFolder
+                        } label: {
+                            Label("현재 폴더 삭제", systemImage: "trash")
+                        }
+                    } label: {
+                        Image(systemName: "ellipsis.circle")
+                    }
                 }
             }
             .fileImporter(isPresented: $showFilePicker, allowedContentTypes: [.image], allowsMultipleSelection: true) { result in
@@ -191,70 +654,817 @@ struct BookshelfView: View {
                     for url in urls {
                         let access = url.startAccessingSecurityScopedResource()
                         defer { if access { url.stopAccessingSecurityScopedResource() } }
-                        if let data = try? Data(contentsOf: url) { model.add(data, fileExtension: url.pathExtension.isEmpty ? "jpg" : url.pathExtension) }
+                        if let data = try? Data(contentsOf: url) {
+                            _ = model.addImageData(data, fileExtension: url.pathExtension.isEmpty ? "png" : url.pathExtension)
+                        }
                     }
                 }
             }
             .onChange(of: selectedPhotos) { photos in
+                guard !photos.isEmpty else { return }
                 Task {
                     for photo in photos {
-                        if let data = try? await photo.loadTransferable(type: Data.self) { model.add(data) }
+                        if let data = try? await photo.loadTransferable(type: Data.self) {
+                            _ = model.addImageData(data, fileExtension: "jpg")
+                        }
                     }
                     selectedPhotos = []
                 }
             }
-            .onChange(of: model.activeID) { _ in note = model.active?.note ?? "" }
-            .onAppear { note = model.active?.note ?? "" }
-            .sheet(isPresented: $showFolders) { foldersSheet }
-            .fullScreenCover(isPresented: $showFullscreen) { fullscreenGallery }
-            .confirmationDialog("PDF 방향", isPresented: $showPDFOptions) {
-                Button("세로 9:16") { pdfURL = model.exportPDF(landscape: false) }
-                Button("가로 16:9") { pdfURL = model.exportPDF(landscape: true) }
+            .onChange(of: model.activeFolder) { _ in
+                noteText = model.activeNote
+            }
+            .onAppear {
+                noteText = model.activeNote
+            }
+            .sheet(isPresented: $showFolderTree, onDismiss: {
+                movingFolderPath = nil
+            }) {
+                BookshelfFolderTreeSheet(
+                    model: model,
+                    movingFolder: movingFolderPath,
+                    onRequestCreateChild: { parent in
+                        showFolderTree = false
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+                            newFolderParent = parent
+                            newFolderName = ""
+                            showNewFolderAlert = true
+                        }
+                    },
+                    onRequestRename: { target in
+                        showFolderTree = false
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+                            renamingFolderPath = target
+                            renameInput = BookshelfPath.leaf(target)
+                        }
+                    },
+                    onRequestMove: { target in
+                        movingFolderPath = target
+                    },
+                    onRequestDelete: { target in
+                        showFolderTree = false
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+                            deletingFolderPath = target
+                        }
+                    }
+                )
+            }
+            .sheet(item: $movingImageItem) { item in
+                BookshelfImageMoveSheet(model: model, item: item)
+            }
+            .sheet(item: $inspectedItem) { item in
+                BookshelfSingleImageViewer(model: model, item: item)
+            }
+            .sheet(isPresented: $showSyncSheet) {
+                DriveSyncSheet(browser: nil, shelf: model)
+            }
+            .fullScreenCover(isPresented: $showFullscreen) {
+                fullscreenGallery
+            }
+            .confirmationDialog("PDF 내보내기 방향", isPresented: $showPDFOptions, titleVisibility: .visible) {
+                Button("세로 (9:16)") { pdfURL = model.exportPDF(landscape: false) }
+                Button("가로 (16:9)") { pdfURL = model.exportPDF(landscape: true) }
+                Button("취소", role: .cancel) {}
             }
             .sheet(isPresented: Binding(get: { pdfURL != nil }, set: { if !$0 { pdfURL = nil } })) {
                 if let url = pdfURL {
-                    NavigationStack { ShareLink(item: url) { Label("PDF 공유 또는 저장", systemImage: "square.and.arrow.up") }.padding().navigationTitle("PDF 내보내기") }
+                    NavigationStack {
+                        VStack(spacing: 20) {
+                            Image(systemName: "doc.richtext.fill")
+                                .font(.system(size: 52))
+                                .foregroundStyle(.blue)
+                            Text(url.lastPathComponent)
+                                .font(.headline)
+                            ShareLink(item: url) {
+                                Label("PDF 공유 또는 파일에 저장", systemImage: "square.and.arrow.up")
+                                    .frame(maxWidth: .infinity)
+                                    .padding(.vertical, 12)
+                            }
+                            .buttonStyle(.borderedProminent)
+                        }
+                        .padding(24)
+                        .navigationTitle("PDF 내보내기 완료")
+                        .toolbar {
+                            ToolbarItem(placement: .cancellationAction) {
+                                Button("닫기") { pdfURL = nil }
+                            }
+                        }
+                    }
+                    .presentationDetents([.medium])
+                }
+            }
+            .alert(newFolderParent.isEmpty ? "새 책장 폴더" : "‘\(BookshelfPath.leaf(newFolderParent))’의 하위 폴더 만들기",
+                   isPresented: $showNewFolderAlert) {
+                TextField("폴더 이름", text: $newFolderName)
+                Button("만들기") {
+                    let trimmed = newFolderName.trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard !trimmed.isEmpty else { return }
+                    let path = newFolderParent.isEmpty ? trimmed : "\(newFolderParent)/\(trimmed)"
+                    _ = model.addFolder(path, select: true)
+                    newFolderName = ""
+                }
+                Button("취소", role: .cancel) { newFolderName = "" }
+            }
+            .alert("폴더 이름 변경", isPresented: Binding(get: { renamingFolderPath != nil }, set: { if !$0 { renamingFolderPath = nil } })) {
+                TextField("새 폴더 이름", text: $renameInput)
+                Button("변경") {
+                    guard let target = renamingFolderPath else { return }
+                    let leaf = renameInput.trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard !leaf.isEmpty, !leaf.contains("/") else { return }
+                    let parent = BookshelfPath.parent(target)
+                    let dest = parent.isEmpty ? leaf : "\(parent)/\(leaf)"
+                    _ = model.renameOrMoveFolder(from: target, to: dest)
+                    renamingFolderPath = nil
+                }
+                Button("취소", role: .cancel) { renamingFolderPath = nil }
+            }
+            .alert("폴더 삭제 확인", isPresented: Binding(get: { deletingFolderPath != nil }, set: { if !$0 { deletingFolderPath = nil } })) {
+                Button("삭제", role: .destructive) {
+                    if let target = deletingFolderPath {
+                        _ = model.deleteFolder(target, includeSubfolders: true)
+                    }
+                    deletingFolderPath = nil
+                }
+                Button("취소", role: .cancel) { deletingFolderPath = nil }
+            } message: {
+                if let target = deletingFolderPath {
+                    let count = model.visibleItems(in: target).count
+                    Text("‘\(target)’ 폴더와 하위 폴더, 포함된 이미지 \(count)개를 모두 삭제할까요?")
                 }
             }
         }
+        .preferredColorScheme(.dark)
     }
 
-    private var foldersSheet: some View {
-        NavigationStack {
-            List(model.folders) { folder in
-                Button { model.activeID = folder.id; showFolders = false } label: {
-                    Label(folder.name, systemImage: folder.id == model.activeID ? "folder.fill" : "folder")
+    // MARK: - Subviews
+
+    private var folderBreadcrumbBar: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 6) {
+                Button {
+                    movingFolderPath = nil
+                    showFolderTree = true
+                } label: {
+                    HStack(spacing: 5) {
+                        Image(systemName: "sidebar.left")
+                        Text("폴더 트리")
+                        Image(systemName: "chevron.down").font(.caption2)
+                    }
+                    .font(.subheadline.weight(.semibold))
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 7)
+                    .background(Color(red: 0.17, green: 0.17, blue: 0.19), in: Capsule())
                 }
-                .contextMenu { Button("삭제", role: .destructive) { model.removeFolder(folder.id) } }
+                .buttonStyle(.plain)
+
+                let segments = breadcrumbPaths(for: model.activeFolder)
+                ForEach(Array(segments.enumerated()), id: \.element) { idx, path in
+                    if idx > 0 {
+                        Image(systemName: "chevron.right")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                    let isCurrent = idx == segments.count - 1
+                    Button {
+                        if isCurrent {
+                            movingFolderPath = nil
+                            showFolderTree = true
+                        } else {
+                            model.selectFolder(path)
+                        }
+                    } label: {
+                        HStack(spacing: 4) {
+                            Image(systemName: isCurrent ? "folder.fill" : "folder")
+                                .foregroundStyle(isCurrent ? .white : .blue)
+                            Text(BookshelfPath.leaf(path))
+                                .lineLimit(1)
+                            Text("(\(model.visibleItems(in: path).count))")
+                                .font(.caption2)
+                                .foregroundStyle(isCurrent ? .white.opacity(0.8) : .secondary)
+                        }
+                        .font(.subheadline.weight(isCurrent ? .semibold : .regular))
+                        .padding(.horizontal, 11)
+                        .padding(.vertical, 7)
+                        .background(isCurrent ? Color.blue : Color(red: 0.15, green: 0.15, blue: 0.17), in: Capsule())
+                    }
+                    .buttonStyle(.plain)
+                }
             }
-            .navigationTitle("책장 폴더")
-            .toolbar {
-                ToolbarItem(placement: .topBarLeading) { Button("완료") { showFolders = false } }
-                ToolbarItem(placement: .topBarTrailing) { Button { showNewFolder = true } label: { Image(systemName: "folder.badge.plus") } }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+        }
+        .background(Color(red: 0.11, green: 0.11, blue: 0.12))
+    }
+
+    private var noteAndColumnBar: some View {
+        VStack(spacing: 6) {
+            HStack(spacing: 8) {
+                HStack(spacing: 6) {
+                    Text("메모")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                        .background(Color(red: 0.18, green: 0.18, blue: 0.20), in: Capsule())
+                    TextField("폴더 메모 입력...", text: $noteText)
+                        .font(.subheadline)
+                        .onChange(of: noteText) { val in model.updateNote(val) }
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 7)
+                .background(Color(red: 0.13, green: 0.13, blue: 0.15), in: RoundedRectangle(cornerRadius: 10))
+
+                HStack(spacing: 0) {
+                    Button {
+                        model.updateColumns(model.activeColumns - 1)
+                    } label: {
+                        Image(systemName: "minus")
+                            .frame(width: 30, height: 32)
+                    }
+                    .disabled(model.activeColumns <= 1)
+
+                    Text("\(model.activeColumns)열")
+                        .font(.caption.weight(.semibold))
+                        .frame(minWidth: 32)
+
+                    Button {
+                        model.updateColumns(model.activeColumns + 1)
+                    } label: {
+                        Image(systemName: "plus")
+                            .frame(width: 30, height: 32)
+                    }
+                    .disabled(model.activeColumns >= 6)
+                }
+                .background(Color(red: 0.16, green: 0.16, blue: 0.18), in: RoundedRectangle(cornerRadius: 10))
             }
-            .alert("새 책장 폴더", isPresented: $showNewFolder) {
-                TextField("이름", text: $newFolderName)
-                Button("만들기") { model.addFolder(newFolderName); newFolderName = "" }
-                Button("취소", role: .cancel) { newFolderName = "" }
+            if !model.status.isEmpty {
+                Text(model.status)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.bottom, 8)
+        .background(Color(red: 0.11, green: 0.11, blue: 0.12))
+    }
+
+    private var galleryBody: some View {
+        let items = model.visibleItems()
+        let cols = model.activeColumns
+        return Group {
+            if items.isEmpty {
+                VStack(spacing: 14) {
+                    Spacer()
+                    Image(systemName: "photo.on.rectangle.angled")
+                        .font(.system(size: 46))
+                        .foregroundStyle(.secondary)
+                    Text("‘\(BookshelfPath.leaf(model.activeFolder))’ 폴더가 비어 있습니다")
+                        .font(.headline)
+                    Text("우측 상단 사진 추가 버튼이나 브라우저 실시간 영역 캡처로 이미지를 넣어보세요.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                        .padding(.horizontal, 32)
+                    Spacer()
+                }
+            } else {
+                GeometryReader { geo in
+                    let colWidth = max(40, geo.size.width / CGFloat(cols))
+                    let distributed = distributeIntoColumns(items: items, columnCount: cols)
+                    ScrollView {
+                        HStack(alignment: .top, spacing: 0) {
+                            ForEach(0..<cols, id: \.self) { colIndex in
+                                LazyVStack(spacing: 0) {
+                                    ForEach(distributed[colIndex]) { item in
+                                        BookshelfPhotoTile(
+                                            model: model,
+                                            item: item,
+                                            width: colWidth,
+                                            onTap: { inspectedItem = item },
+                                            onMoveFolder: { movingImageItem = item }
+                                        )
+                                    }
+                                }
+                                .frame(width: colWidth)
+                            }
+                        }
+                    }
+                }
             }
         }
     }
 
     private var fullscreenGallery: some View {
-        ZStack(alignment: .topTrailing) {
+        let items = model.visibleItems()
+        let cols = model.activeColumns
+        return ZStack(alignment: .topTrailing) {
             Color.black.ignoresSafeArea()
-            ScrollView {
-                if let folder = model.active {
-                    LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 0), count: folder.columns), spacing: 0) {
-                        ForEach(folder.images, id: \.self) { name in
-                            if let image = UIImage(contentsOfFile: model.imageURL(name, in: folder).path) {
-                                Image(uiImage: image).resizable().scaledToFit()
+            GeometryReader { geo in
+                let colWidth = max(40, geo.size.width / CGFloat(cols))
+                let distributed = distributeIntoColumns(items: items, columnCount: cols)
+                ScrollView {
+                    HStack(alignment: .top, spacing: 0) {
+                        ForEach(0..<cols, id: \.self) { colIndex in
+                            LazyVStack(spacing: 0) {
+                                ForEach(distributed[colIndex]) { item in
+                                    BookshelfPhotoTile(
+                                        model: model,
+                                        item: item,
+                                        width: colWidth,
+                                        onTap: { inspectedItem = item },
+                                        onMoveFolder: { movingImageItem = item }
+                                    )
+                                }
                             }
+                            .frame(width: colWidth)
                         }
                     }
                 }
-            }.ignoresSafeArea()
-            Button { showFullscreen = false } label: { Image(systemName: "xmark.circle.fill").font(.title).padding() }
+                .ignoresSafeArea()
+            }
+            Button {
+                showFullscreen = false
+            } label: {
+                Image(systemName: "xmark.circle.fill")
+                    .font(.system(size: 30))
+                    .foregroundStyle(.white.opacity(0.85))
+                    .padding(18)
+            }
         }
+    }
+
+    private func breadcrumbPaths(for active: String) -> [String] {
+        var list: [String] = []
+        var cur = active
+        while !cur.isEmpty {
+            list.append(cur)
+            cur = BookshelfPath.parent(cur)
+        }
+        return list.reversed()
+    }
+
+    private func distributeIntoColumns(items: [BookshelfItem], columnCount: Int) -> [[BookshelfItem]] {
+        let count = max(1, columnCount)
+        var columns = Array(repeating: [BookshelfItem](), count: count)
+        var heights = Array(repeating: Double.zero, count: count)
+        for item in items {
+            let shortest = heights.enumerated().min(by: { $0.element < $1.element })?.offset ?? 0
+            columns[shortest].append(item)
+            heights[shortest] += Double(max(1, item.height)) / Double(max(1, item.width))
+        }
+        return columns
+    }
+}
+
+// MARK: - Photo Tile with Context Menu
+
+private struct BookshelfPhotoTile: View {
+    @ObservedObject var model: ShelfModel
+    let item: BookshelfItem
+    let width: CGFloat
+    let onTap: () -> Void
+    let onMoveFolder: () -> Void
+
+    var body: some View {
+        let url = model.imageURL(for: item)
+        let aspect = CGFloat(max(1, item.height)) / CGFloat(max(1, item.width))
+        Group {
+            if let image = UIImage(contentsOfFile: url.path) {
+                Image(uiImage: image)
+                    .resizable()
+                    .scaledToFit()
+                    .frame(width: width)
+            } else {
+                Rectangle()
+                    .fill(Color.white.opacity(0.06))
+                    .frame(width: width, height: width * aspect)
+                    .overlay {
+                        VStack(spacing: 4) {
+                            Image(systemName: "icloud.and.arrow.down")
+                            Text(item.fileName).font(.caption2).foregroundStyle(.secondary)
+                        }
+                    }
+            }
+        }
+        .contentShape(Rectangle())
+        .onTapGesture { onTap() }
+        .contextMenu {
+            Button {
+                onTap()
+            } label: {
+                Label("크게 보기", systemImage: "magnifyingglass")
+            }
+            Button {
+                onMoveFolder()
+            } label: {
+                Label("다른 폴더로 이동...", systemImage: "folder")
+            }
+            Button {
+                model.moveImageOrder(item.id, direction: -1)
+            } label: {
+                Label("앞으로 이동", systemImage: "arrow.up")
+            }
+            Button {
+                model.moveImageOrder(item.id, direction: 1)
+            } label: {
+                Label("뒤로 이동", systemImage: "arrow.down")
+            }
+            if let image = UIImage(contentsOfFile: url.path) {
+                Button {
+                    UIPasteboard.general.image = image
+                    model.status = "이미지를 클립보드에 복사했습니다."
+                } label: {
+                    Label("이미지 복사", systemImage: "doc.on.doc")
+                }
+                Button {
+                    UIImageWriteToSavedPhotosAlbum(image, nil, nil, nil)
+                    model.status = "사진 앱에 저장했습니다."
+                } label: {
+                    Label("사진 앱에 저장", systemImage: "square.and.arrow.down")
+                }
+            }
+            Divider()
+            Button(role: .destructive) {
+                model.removeImage(item.id)
+            } label: {
+                Label("삭제", systemImage: "trash")
+            }
+        }
+    }
+}
+
+// MARK: - Hierarchical Folder Tree Sheet (With Explicit Confirm Button for Moving!)
+
+struct BookshelfFolderTreeSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    @ObservedObject var model: ShelfModel
+    var movingFolder: String?
+    var onRequestCreateChild: (String) -> Void
+    var onRequestRename: (String) -> Void
+    var onRequestMove: (String) -> Void
+    var onRequestDelete: (String) -> Void
+
+    @State private var selectedTargetParent: String = ""
+
+    private var isMoveMode: Bool {
+        movingFolder != nil && !(movingFolder?.isEmpty ?? true)
+    }
+
+    private var availableFolders: [String] {
+        let all = model.allDisplayFolders
+        guard let moving = movingFolder, !moving.isEmpty else { return all }
+        return all.filter { !BookshelfPath.contains(moving, $0) }
+    }
+
+    private func isVisible(_ path: String) -> Bool {
+        var p = BookshelfPath.parent(path)
+        while !p.isEmpty {
+            if !model.expandedFolders.contains(p) { return false }
+            p = BookshelfPath.parent(p)
+        }
+        return true
+    }
+
+    private func confirmMove(toParent parentPath: String) {
+        guard let moving = movingFolder, !moving.isEmpty else { return }
+        let leaf = BookshelfPath.leaf(moving)
+        let target = parentPath.isEmpty ? leaf : "\(parentPath)/\(leaf)"
+        if target.caseInsensitiveCompare(moving) == .orderedSame {
+            dismiss()
+            return
+        }
+        if model.renameOrMoveFolder(from: moving, to: target) {
+            dismiss()
+        }
+    }
+
+    var body: some View {
+        NavigationStack {
+            VStack(spacing: 0) {
+                if let moving = movingFolder, !moving.isEmpty {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("‘\(BookshelfPath.leaf(moving))’ 폴더를 이동할 위치를 선택하세요")
+                            .font(.subheadline.weight(.semibold))
+                        Text("폴더를 선택한 뒤 하단 또는 우측 상단의 [확인 (여기로 이동)] 버튼을 누르면 이동됩니다.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(12)
+                    .background(Color.blue.opacity(0.15))
+                }
+
+                List {
+                    if isMoveMode {
+                        Button {
+                            selectedTargetParent = ""
+                        } label: {
+                            HStack {
+                                Image(systemName: selectedTargetParent.isEmpty ? "checkmark.circle.fill" : "folder.fill")
+                                    .foregroundStyle(selectedTargetParent.isEmpty ? .blue : .secondary)
+                                Text("책장 (최상위로 이동)")
+                                    .font(.body.weight(selectedTargetParent.isEmpty ? .semibold : .regular))
+                                Spacer()
+                                Button("여기로 이동") {
+                                    confirmMove(toParent: "")
+                                }
+                                .buttonStyle(.borderedProminent)
+                                .controlSize(.small)
+                            }
+                        }
+                        .buttonStyle(.plain)
+                    }
+
+                    ForEach(availableFolders.filter { isVisible($0) }, id: \.self) { path in
+                        folderRow(for: path)
+                    }
+                }
+                .listStyle(.plain)
+
+                // Bottom explicit confirmation bar (always visible!)
+                HStack(spacing: 10) {
+                    Button {
+                        onRequestCreateChild(isMoveMode ? selectedTargetParent : model.activeFolder)
+                    } label: {
+                        Label("새 폴더", systemImage: "folder.badge.plus")
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 10)
+                    }
+                    .buttonStyle(.bordered)
+
+                    if isMoveMode {
+                        Button {
+                            confirmMove(toParent: selectedTargetParent)
+                        } label: {
+                            Label(
+                                selectedTargetParent.isEmpty
+                                    ? "확인 (최상위로 이동)"
+                                    : "확인 (‘\(BookshelfPath.leaf(selectedTargetParent))’(으)로 이동)",
+                                systemImage: "checkmark.circle.fill"
+                            )
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 10)
+                        }
+                        .buttonStyle(.borderedProminent)
+                    }
+                }
+                .padding(12)
+                .background(Color(red: 0.11, green: 0.11, blue: 0.13))
+            }
+            .navigationTitle(isMoveMode ? "이동할 폴더 선택" : "책장 폴더 트리")
+            .navigationBarTitleDisplayMode(.inline)
+            .onAppear {
+                if isMoveMode, let moving = movingFolder {
+                    selectedTargetParent = BookshelfPath.parent(moving)
+                } else {
+                    selectedTargetParent = model.activeFolder
+                }
+            }
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("닫기") { dismiss() }
+                }
+                if isMoveMode {
+                    ToolbarItem(placement: .confirmationAction) {
+                        Button("확인 (여기로 이동)") {
+                            confirmMove(toParent: selectedTargetParent)
+                        }
+                        .font(.body.weight(.semibold))
+                    }
+                }
+            }
+        }
+        .preferredColorScheme(.dark)
+    }
+
+    @ViewBuilder
+    private func folderRow(for path: String) -> some View {
+        let level = path.filter { $0 == "/" }.count
+        let leaf = BookshelfPath.leaf(path)
+        let children = availableFolders.filter { BookshelfPath.parent($0).caseInsensitiveCompare(path) == .orderedSame }
+        let hasChildren = !children.isEmpty
+        let isExpanded = model.expandedFolders.contains(path)
+        let isSelected = isMoveMode
+            ? (selectedTargetParent.caseInsensitiveCompare(path) == .orderedSame)
+            : (model.activeFolder.caseInsensitiveCompare(path) == .orderedSame)
+        let count = model.visibleItems(in: path).count
+
+        HStack(spacing: 8) {
+            if level > 0 {
+                Spacer().frame(width: CGFloat(level) * 18)
+            }
+            if hasChildren {
+                Button {
+                    if isExpanded { model.expandedFolders.remove(path) }
+                    else { model.expandedFolders.insert(path) }
+                } label: {
+                    Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
+                        .font(.caption.weight(.bold))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 24, height: 24)
+                }
+                .buttonStyle(.plain)
+            } else {
+                Spacer().frame(width: 24)
+            }
+
+            Button {
+                if isMoveMode {
+                    selectedTargetParent = path
+                } else {
+                    model.selectFolder(path)
+                    dismiss()
+                }
+            } label: {
+                HStack(spacing: 8) {
+                    Image(systemName: isSelected ? "folder.fill" : "folder")
+                        .foregroundStyle(isSelected ? .blue : .secondary)
+                    Text(leaf)
+                        .font(.body.weight(isSelected ? .semibold : .regular))
+                        .lineLimit(1)
+                    Text("(\(count))")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+
+            if isMoveMode {
+                Button("여기로 이동") {
+                    confirmMove(toParent: path)
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+            } else {
+                Menu {
+                    Button {
+                        onRequestCreateChild(path)
+                    } label: {
+                        Label("하위 폴더 만들기", systemImage: "folder.badge.plus")
+                    }
+                    Button {
+                        onRequestRename(path)
+                    } label: {
+                        Label("이름 변경", systemImage: "pencil")
+                    }
+                    Button {
+                        onRequestMove(path)
+                    } label: {
+                        Label("다른 폴더로 이동", systemImage: "folder.badge.gearshape")
+                    }
+                    Button {
+                        _ = model.moveFolderOrder(path, direction: -1)
+                    } label: {
+                        Label("위로 이동", systemImage: "arrow.up")
+                    }
+                    Button {
+                        _ = model.moveFolderOrder(path, direction: 1)
+                    } label: {
+                        Label("아래로 이동", systemImage: "arrow.down")
+                    }
+                    Divider()
+                    Button(role: .destructive) {
+                        onRequestDelete(path)
+                    } label: {
+                        Label("폴더 삭제", systemImage: "trash")
+                    }
+                } label: {
+                    Image(systemName: "ellipsis.circle")
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 4)
+                }
+            }
+        }
+        .padding(.vertical, 4)
+        .listRowBackground(isSelected ? Color.blue.opacity(0.16) : Color.clear)
+    }
+}
+
+// MARK: - Move Image to Another Folder Sheet (With Confirm Button)
+
+struct BookshelfImageMoveSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    @ObservedObject var model: ShelfModel
+    let item: BookshelfItem
+    @State private var selectedFolder: String = ""
+
+    var body: some View {
+        NavigationStack {
+            VStack(spacing: 0) {
+                List(model.allDisplayFolders, id: \.self) { folder in
+                    let level = folder.filter { $0 == "/" }.count
+                    let isSelected = selectedFolder.caseInsensitiveCompare(folder) == .orderedSame
+                    HStack {
+                        if level > 0 { Spacer().frame(width: CGFloat(level) * 18) }
+                        Button {
+                            selectedFolder = folder
+                        } label: {
+                            HStack {
+                                Image(systemName: isSelected ? "folder.fill" : "folder")
+                                    .foregroundStyle(isSelected ? .blue : .secondary)
+                                Text(BookshelfPath.leaf(folder))
+                                    .font(.body.weight(isSelected ? .semibold : .regular))
+                                Spacer()
+                            }
+                        }
+                        .buttonStyle(.plain)
+
+                        Button("여기로 이동") {
+                            model.moveImage(item.id, toFolder: folder)
+                            dismiss()
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.small)
+                    }
+                }
+                .listStyle(.plain)
+
+                Button {
+                    guard !selectedFolder.isEmpty else { return }
+                    model.moveImage(item.id, toFolder: selectedFolder)
+                    dismiss()
+                } label: {
+                    Label("확인 (‘\(BookshelfPath.leaf(selectedFolder))’(으)로 이동)", systemImage: "checkmark.circle.fill")
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 10)
+                }
+                .buttonStyle(.borderedProminent)
+                .padding(12)
+            }
+            .navigationTitle("사진 이동할 폴더 선택")
+            .navigationBarTitleDisplayMode(.inline)
+            .onAppear { selectedFolder = item.folder }
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("취소") { dismiss() }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("확인") {
+                        model.moveImage(item.id, toFolder: selectedFolder)
+                        dismiss()
+                    }
+                }
+            }
+        }
+        .preferredColorScheme(.dark)
+    }
+}
+
+// MARK: - Single Image Zoomable Viewer
+
+struct BookshelfSingleImageViewer: View {
+    @Environment(\.dismiss) private var dismiss
+    @ObservedObject var model: ShelfModel
+    let item: BookshelfItem
+    @State private var scale: CGFloat = 1.0
+
+    var body: some View {
+        NavigationStack {
+            ZStack {
+                Color.black.ignoresSafeArea()
+                if let uiImage = UIImage(contentsOfFile: model.imageURL(for: item).path) {
+                    ScrollView([.horizontal, .vertical], showsIndicators: false) {
+                        Image(uiImage: uiImage)
+                            .resizable()
+                            .scaledToFit()
+                            .frame(width: UIScreen.main.bounds.width * scale)
+                    }
+                    .gesture(
+                        MagnificationGesture()
+                            .onChanged { val in scale = min(4.0, max(1.0, val)) }
+                    )
+                    .onTapGesture(count: 2) {
+                        withAnimation(.spring()) { scale = scale > 1.1 ? 1.0 : 2.0 }
+                    }
+                }
+            }
+            .navigationTitle(item.fileName)
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("닫기") { dismiss() }
+                }
+                ToolbarItemGroup(placement: .topBarTrailing) {
+                    if let uiImage = UIImage(contentsOfFile: model.imageURL(for: item).path) {
+                        Button {
+                            UIPasteboard.general.image = uiImage
+                            model.status = "이미지를 복사했습니다."
+                        } label: {
+                            Image(systemName: "doc.on.doc")
+                        }
+                    }
+                    Button(role: .destructive) {
+                        model.removeImage(item.id)
+                        dismiss()
+                    } label: {
+                        Image(systemName: "trash")
+                    }
+                }
+            }
+        }
+        .preferredColorScheme(.dark)
     }
 }

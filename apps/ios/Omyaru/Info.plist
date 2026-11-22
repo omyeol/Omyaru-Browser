@@ -8,8 +8,9 @@
   <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
   <key>CFBundleName</key><string>Omyaru</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>0.1.0</string>
-  <key>CFBundleVersion</key><string>1</string>
+  <key>CFBundleShortVersionString</key><string>0.2.0</string>
+  <key>CFBundleVersion</key><string>2</string>
+  <key>NSFaceIDUsageDescription</key><string>Face ID로 Omyaru 브라우저와 책장 잠금을 해제합니다.</string>
   <key>LSRequiresIPhoneOS</key><true/>
   <key>UIApplicationSceneManifest</key><dict><key>UIApplicationSupportsMultipleScenes</key><false/></dict>
   <key>UILaunchScreen</key><dict/>

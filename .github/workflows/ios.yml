@@ -49,12 +49,12 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release view ios-latest >/dev/null 2>&1 || \
-            gh release create ios-latest --title 'Omyaru iOS v0.1.0 Preview' \
-              --notes 'iOS preview build for AltStore Classic. Android feature parity is in progress.' \
+            gh release create ios-latest --title 'Omyaru iOS v0.2.0' \
+              --notes 'Omyaru iOS v0.2.0 build for AltStore Classic with Android feature parity.' \
               --prerelease
           gh release upload ios-latest "$RUNNER_TEMP/Omyaru.ipa" \
             "$RUNNER_TEMP/altstore-source.json" --clobber
-          gh release edit ios-latest --title 'Omyaru iOS v0.1.0 Preview'
+          gh release edit ios-latest --title 'Omyaru iOS v0.2.0'
       - name: Refresh raw AltStore source
         if: github.ref == 'refs/heads/main'
         run: |
