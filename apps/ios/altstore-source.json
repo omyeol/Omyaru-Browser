@@ -18,11 +18,11 @@
       "versions": [
         {
           "version": "0.15.18",
-          "buildVersion": "78",
+          "buildVersion": "79",
           "date": "2026-11-22",
-          "localizedDescription": "v0.15.18 (build 78): iOS 26 Safari Liquid Glass UI & Animations — blur-bloom morphing glass popovers (Page Tools, Browser Menu, Tab Overview top-right menu with inline expandable Profile switcher, and lifted Tab Card long-press context menu with Pinned Tabs), fullscreen hero-zoom Tab Overview with ambient blurred backdrop, native horizontal swipe group pager + bottom Liquid Glass group carousel pill with gliding capsule & soft edge fade, floating 2-row Liquid Glass URL island + compact translucent scroll pill, right-edge FastScrollBar, web element context menu -> Bookshelf, live scroll-stitch capture, dual-mode watermark remover, hierarchical bookshelf, and full chunked Google Drive E2EE sync.",
+          "localizedDescription": "v0.15.18 (build 79): Built-in One-Tap Google Drive Sync (zero Client ID/token setup, Keychain token storage, automatic account email display & instant sync across Android/PC/iOS) + iOS 26 Safari Liquid Glass UI & Animations (blur-bloom morphing glass popovers, fullscreen hero-zoom Tab Overview, native horizontal swipe group pager & gliding carousel pill, floating 2-row Liquid Glass URL island, FastScrollBar, web element context menu -> Bookshelf, live capture, watermark remover, and hierarchical bookshelf).",
           "downloadURL": "https://github.com/omyeol/Omyaru-Browser/releases/download/v0.15.18/Omyaru-v0.15.18-ios.ipa",
-          "size": 1856128,
+          "size": 1871849,
           "minOSVersion": "16.0"
         }
       ],
