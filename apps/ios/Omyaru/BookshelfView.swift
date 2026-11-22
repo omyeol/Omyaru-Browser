@@ -286,11 +286,12 @@ final class ShelfModel: ObservableObject {
             persistToSharedCatalogIfAvailable(accountEmail: accountEmail)
             return
         }
-        if let merged = try? SharedSyncFolderManager.withCatalogWriteLock(in: accountRoot, { () -> BookshelfCatalogData? in
+        let merged: BookshelfCatalogData? = (try? SharedSyncFolderManager.withCatalogWriteLock(in: accountRoot) { () -> BookshelfCatalogData? in
             guard let data = try? Data(contentsOf: sharedCatalogFile),
                   let remote = try? JSONDecoder().decode(BookshelfCatalogData.self, from: data) else { return nil }
             return Self.mergeCatalogs(local: catalog, shared: remote)
-        }), let merged {
+        }) ?? nil
+        if let merged {
             catalog = Self.normalizeCatalog(merged)
             save(syncToShared: false)
         }

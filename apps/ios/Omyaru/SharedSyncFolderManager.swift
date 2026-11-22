@@ -13,7 +13,7 @@ import Darwin
 @MainActor
 final class SharedSyncFolderManager: ObservableObject {
     static let shared = SharedSyncFolderManager()
-    static let appIdentifier = "Omyaru Browser"
+    nonisolated static let appIdentifier = "Omyaru Browser"
 
     private static let bookmarkKey = "omyaru.ios.sharedSyncFolder.bookmarkV1"
     private static let displayNameKey = "omyaru.ios.sharedSyncFolder.displayNameV1"
@@ -47,7 +47,9 @@ final class SharedSyncFolderManager: ObservableObject {
     /// Sanitizes an email/account identifier identically across Android & iOS (Omyaru & Umtomi).
     nonisolated static func sanitizeAccountFolderName(_ raw: String?) -> String {
         let trimmed = (raw ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        guard !trimmed.isEmpty else { return "default" }
+        guard !trimmed.isEmpty, trimmed != ".", trimmed != "..", trimmed != ".omyaru", trimmed != ".omyaru-control" else {
+            return "default"
+        }
         let forbidden = CharacterSet(charactersIn: "\\/:*?\"<>|").union(.controlCharacters)
         var cleaned = trimmed.unicodeScalars.map { forbidden.contains($0) ? "_" : String($0) }.joined()
         cleaned = cleaned.trimmingCharacters(in: CharacterSet(charactersIn: ". "))

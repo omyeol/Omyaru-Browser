@@ -307,7 +307,7 @@ struct OmyaruFullSyncBundle: Codable {
 final class DriveSyncManager: NSObject, ObservableObject, ASWebAuthenticationPresentationContextProviding {
     static let shared = DriveSyncManager()
     static let tabResetConfirmationPhrase = "동기화 탭 초기화"
-    static let chunkSize = 1024 * 1024
+    nonisolated static let chunkSize = 1024 * 1024
     private static let maxConcurrentTransfers = 6
     /// Built-in public iOS OAuth client identifier for Omyaru Google Cloud project 136563471424.
     private static let defaultBuiltInClientID = "136563471424-n3bgne716cvcm8kdk767niqpommo04k2.apps.googleusercontent.com"
