@@ -57,13 +57,12 @@ def main() -> None:
                 "buildVersion": build_version,
                 "date": date.today().isoformat(),
                 "localizedDescription": (
-                    f"v{version} (build {build_version}): Exact Android floating bottom/top Liquid Glass URL island "
-                    "(2-row address + scrollable 20-shortcut nav bar, compact translucent scroll-collapse pill, long-press toolbar editor, "
-                    "profile-isolated URL suggestions, bookmark editor), right-edge FastScrollBar scrubber, web element long-press context menu "
-                    "(save image to Bookshelf, open in background tab, share), Android-exact Tab Overview (multi-select batch move/close, "
-                    "bottom group pill left/right swipe, group manager), webpage error panel, highlight Find in Page, media PiP & seek controls, "
-                    "5-second close-all safety countdown, live scroll-stitch capture, dual-mode watermark remover, hierarchical bookshelf, "
-                    "and full chunked Google Drive E2EE sync."
+                    f"v{version} (build {build_version}): iOS 26 Safari Liquid Glass UI & Animations — "
+                    "blur-bloom morphing glass popovers (Page Tools, Browser Menu, Tab Overview top-right menu with inline expandable Profile switcher, "
+                    "and lifted Tab Card long-press context menu with Pinned Tabs), fullscreen hero-zoom Tab Overview with ambient blurred backdrop, "
+                    "native horizontal swipe group pager + bottom Liquid Glass group carousel pill with gliding capsule & soft edge fade, "
+                    "floating 2-row Liquid Glass URL island + compact translucent scroll pill, right-edge FastScrollBar, web element context menu -> Bookshelf, "
+                    "live scroll-stitch capture, dual-mode watermark remover, hierarchical bookshelf, and full chunked Google Drive E2EE sync."
                 ),
                 "downloadURL": download_url,
                 "size": ipa.stat().st_size,

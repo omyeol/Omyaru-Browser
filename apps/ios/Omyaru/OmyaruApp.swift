@@ -84,6 +84,46 @@ struct BrowserTab: Codable, Identifiable, Hashable {
     var isPrivate: Bool = false
     var isDesktopMode: Bool = false
     var pageZoom: Double = 1.0
+    var isPinned: Bool = false
+
+    enum CodingKeys: String, CodingKey {
+        case id, title, url, profileID, groupID, isPrivate, isDesktopMode, pageZoom, isPinned
+    }
+
+    init(
+        id: UUID = UUID(),
+        title: String = "새 탭",
+        url: String = "about:blank",
+        profileID: UUID,
+        groupID: UUID,
+        isPrivate: Bool = false,
+        isDesktopMode: Bool = false,
+        pageZoom: Double = 1.0,
+        isPinned: Bool = false
+    ) {
+        self.id = id
+        self.title = title
+        self.url = url
+        self.profileID = profileID
+        self.groupID = groupID
+        self.isPrivate = isPrivate
+        self.isDesktopMode = isDesktopMode
+        self.pageZoom = pageZoom
+        self.isPinned = isPinned
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decodeIfPresent(UUID.self, forKey: .id) ?? UUID()
+        title = try c.decodeIfPresent(String.self, forKey: .title) ?? "새 탭"
+        url = try c.decodeIfPresent(String.self, forKey: .url) ?? "about:blank"
+        profileID = try c.decode(UUID.self, forKey: .profileID)
+        groupID = try c.decode(UUID.self, forKey: .groupID)
+        isPrivate = try c.decodeIfPresent(Bool.self, forKey: .isPrivate) ?? false
+        isDesktopMode = try c.decodeIfPresent(Bool.self, forKey: .isDesktopMode) ?? false
+        pageZoom = try c.decodeIfPresent(Double.self, forKey: .pageZoom) ?? 1.0
+        isPinned = try c.decodeIfPresent(Bool.self, forKey: .isPinned) ?? false
+    }
 }
 
 struct BookmarkFolder: Codable, Identifiable, Hashable {
@@ -374,7 +414,7 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
     static let defaultProfileID = UUID(uuidString: "00000000-0000-0000-0000-000000000010")!
     static let defaultGroupID = UUID(uuidString: "00000000-0000-0000-0000-000000000002")!
     static let appVersionName = "0.15.18"
-    static let appBuildNumber = 77
+    static let appBuildNumber = 78
 
     @Published var profiles: [BrowserProfile]
     @Published var groups: [BrowserGroup]
@@ -568,10 +608,73 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
     }
 
     var visibleTabs: [BrowserTab] {
-        if activeGroupID == Self.privateGroupID {
-            return tabs.filter { $0.isPrivate }
+        tabs(forGroup: activeGroupID)
+    }
+
+    func tabs(forGroup groupID: UUID) -> [BrowserTab] {
+        let raw: [BrowserTab]
+        if groupID == Self.privateGroupID {
+            raw = tabs.filter { $0.isPrivate }
+        } else {
+            raw = tabs.filter { !$0.isPrivate && $0.profileID == activeProfileID && $0.groupID == groupID }
         }
-        return tabs.filter { !$0.isPrivate && $0.profileID == activeProfileID && $0.groupID == activeGroupID }
+        let pinned = raw.filter { $0.isPinned }
+        let unpinned = raw.filter { !$0.isPinned }
+        return pinned + unpinned
+    }
+
+    func groupDisplayName(for groupID: UUID) -> String {
+        if groupID == Self.privateGroupID {
+            return "개인정보 보호"
+        }
+        if let firstGroup = profileGroups.first, groupID == firstGroup.id {
+            let count = tabs(forGroup: groupID).count
+            return "\(count)개의 탭"
+        }
+        if let g = groups.first(where: { $0.id == groupID }) {
+            return g.name
+        }
+        return activeProfile.name
+    }
+
+    func groupHeaderTitle(for groupID: UUID) -> String? {
+        if groupID == Self.privateGroupID { return "개인정보 보호" }
+        if let firstGroup = profileGroups.first, groupID == firstGroup.id { return nil }
+        return groups.first(where: { $0.id == groupID })?.name
+    }
+
+    func togglePinTab(_ tabID: UUID) {
+        guard let idx = tabs.firstIndex(where: { $0.id == tabID }) else { return }
+        tabs[idx].isPinned.toggle()
+        let pinnedNow = tabs[idx].isPinned
+        persist()
+        status = pinnedNow ? "탭을 고정했습니다." : "탭 고정을 해제했습니다."
+    }
+
+    func bookmarkAllVisibleTabs() {
+        let valid = visibleTabs.filter { !$0.url.isEmpty && $0.url != "about:blank" }
+        guard !valid.isEmpty else {
+            status = "북마크에 추가할 페이지가 없습니다."
+            return
+        }
+        let folderName = groupHeaderTitle(for: activeGroupID) ?? "\(activeProfile.name) 탭"
+        let folderID: String
+        if let existing = bookmarkFolders.first(where: { $0.name.caseInsensitiveCompare(folderName) == .orderedSame }) {
+            folderID = existing.id
+        } else {
+            let created = BookmarkFolder(name: folderName)
+            bookmarkFolders.append(created)
+            folderID = created.id
+        }
+        var added = 0
+        for t in valid {
+            if !bookmarks.contains(where: { $0.url.caseInsensitiveCompare(t.url) == .orderedSame && $0.folderID == folderID }) {
+                bookmarks.append(BrowserBookmark(title: t.title, url: t.url, folderID: folderID))
+                added += 1
+            }
+        }
+        persist()
+        status = added > 0 ? "'\(folderName)' 폴더에 \(added)개 탭을 북마크했습니다." : "이미 모든 탭이 북마크되어 있습니다."
     }
 
     func activeWebView() -> WKWebView? {

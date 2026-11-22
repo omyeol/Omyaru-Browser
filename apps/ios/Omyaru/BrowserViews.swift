@@ -43,65 +43,135 @@ struct BrowserScreen: View {
     @FocusState private var addressFocused: Bool
 
     var body: some View {
+        let isBottomBar = model.preferences.addressBarPosition == .bottom
         ZStack {
-            Color(red: 0.09, green: 0.075, blue: 0.067).ignoresSafeArea()
+            Color(red: 0.08, green: 0.08, blue: 0.09).ignoresSafeArea()
 
-            if let tab = model.activeTab {
-                if model.isStartPage {
-                    startPageView
-                } else {
-                    ZStack {
-                        BrowserWebView(webView: model.webView(for: tab.id, loadIfNeeded: true))
-                            .id(tab.id)
-                            .ignoresSafeArea(edges: .bottom)
+            // Main Browser Surface + Floating Toolbar (Smoothly Hero-Zooms & Blurs behind Fullscreen TabOverview!)
+            ZStack {
+                if let tab = model.activeTab {
+                    if model.isStartPage {
+                        startPageView
+                    } else {
+                        ZStack {
+                            BrowserWebView(webView: model.webView(for: tab.id, loadIfNeeded: true))
+                                .id(tab.id)
+                                .ignoresSafeArea(edges: .bottom)
 
-                        FastScrollBarOverlay(model: model)
-                            .padding(.top, model.preferences.addressBarPosition == .top ? (model.isChromeCollapsed ? 58 : 124) : 8)
-                            .padding(.bottom, model.preferences.addressBarPosition == .bottom ? (model.isChromeCollapsed ? 58 : 124) : 8)
+                            FastScrollBarOverlay(model: model)
+                                .padding(.top, isBottomBar ? 8 : (model.isChromeCollapsed ? 58 : 124))
+                                .padding(.bottom, isBottomBar ? (model.isChromeCollapsed ? 58 : 124) : 8)
 
-                        if let failedURL = model.failedLoadURL {
-                            pageErrorOverlay(failedURL: failedURL)
+                            if let failedURL = model.failedLoadURL {
+                                pageErrorOverlay(failedURL: failedURL)
+                            }
                         }
                     }
                 }
-            }
 
-            if showFindBar && !model.isStartPage {
-                VStack {
-                    if model.preferences.addressBarPosition == .top {
-                        Spacer().frame(height: model.isChromeCollapsed ? 56 : 122)
+                if showFindBar && !model.isStartPage {
+                    VStack {
+                        if !isBottomBar {
+                            Spacer().frame(height: model.isChromeCollapsed ? 56 : 122)
+                        }
+                        findInPageBar
+                        Spacer()
                     }
-                    findInPageBar
-                    Spacer()
                 }
+
+                // Floating Status Toast + Floating Liquid Glass URL Island (Top or Bottom!)
+                VStack(spacing: 6) {
+                    if isBottomBar {
+                        Spacer(minLength: 0)
+                    }
+
+                    if isBottomBar && !model.status.isEmpty {
+                        statusToastPill
+                    }
+
+                    floatingAndroidToolbarRegion
+
+                    if !isBottomBar && !model.status.isEmpty {
+                        statusToastPill
+                    }
+
+                    if !isBottomBar {
+                        Spacer(minLength: 0)
+                    }
+                }
+                .animation(.spring(response: 0.30, dampingFraction: 0.84), value: model.isChromeCollapsed)
+                .animation(.easeInOut(duration: 0.2), value: model.status)
+            }
+            .clipShape(RoundedRectangle(cornerRadius: showTabs ? 28 : 0, style: .continuous))
+            .scaleEffect(showTabs ? 0.88 : 1.0)
+            .blur(radius: showTabs ? 18 : 0)
+            .opacity(showTabs ? 0.52 : 1.0)
+            .allowsHitTesting(!showTabs && !showPageTools && !showBrowserMenu)
+            .animation(.spring(response: 0.36, dampingFraction: 0.86), value: showTabs)
+
+            // Exact Video 00:06->00:08 Morphing Liquid Glass Page Tools Popover
+            LiquidGlassMorphContainer(
+                isPresented: showPageTools,
+                alignment: isBottomBar ? .bottomLeading : .topLeading,
+                anchor: isBottomBar ? .bottomLeading : .topLeading,
+                edgeInsets: isBottomBar
+                    ? EdgeInsets(top: 0, leading: 14, bottom: model.isChromeCollapsed ? 62 : 126, trailing: 14)
+                    : EdgeInsets(top: model.isChromeCollapsed ? 62 : 126, leading: 14, bottom: 0, trailing: 14),
+                onDismiss: { showPageTools = false }
+            ) {
+                LiquidGlassPageToolsPopover(
+                    model: model,
+                    onDismiss: {
+                        withAnimation(.spring(response: 0.30, dampingFraction: 0.84)) { showPageTools = false }
+                    },
+                    onBookmarkEdit: { showBookmarkEdit = true },
+                    onFindInPage: { showFindBar = true },
+                    onOpenCapture: { showLiveCapture = true },
+                    onOpenWatermark: { showWatermarkRemover = true },
+                    onOpenExtensions: { showExtensions = true }
+                )
             }
 
-            // Floating Status Toast + Floating Android-Exact URL Island (Top or Bottom!)
-            VStack(spacing: 6) {
-                if model.preferences.addressBarPosition == .bottom {
-                    Spacer(minLength: 0)
-                }
-
-                if model.preferences.addressBarPosition == .bottom && !model.status.isEmpty {
-                    statusToastPill
-                }
-
-                floatingAndroidToolbarRegion
-
-                if model.preferences.addressBarPosition == .top && !model.status.isEmpty {
-                    statusToastPill
-                }
-
-                if model.preferences.addressBarPosition == .top {
-                    Spacer(minLength: 0)
-                }
+            // Morphing Liquid Glass Browser Menu Popover (Bottom-Right / Top-Right)
+            LiquidGlassMorphContainer(
+                isPresented: showBrowserMenu,
+                alignment: isBottomBar ? .bottomTrailing : .topTrailing,
+                anchor: isBottomBar ? .bottomTrailing : .topTrailing,
+                edgeInsets: isBottomBar
+                    ? EdgeInsets(top: 0, leading: 14, bottom: model.isChromeCollapsed ? 62 : 126, trailing: 14)
+                    : EdgeInsets(top: model.isChromeCollapsed ? 62 : 126, leading: 14, bottom: 0, trailing: 14),
+                onDismiss: { showBrowserMenu = false }
+            ) {
+                LiquidGlassBrowserMenuPopover(
+                    model: model,
+                    onDismiss: {
+                        withAnimation(.spring(response: 0.30, dampingFraction: 0.84)) { showBrowserMenu = false }
+                    },
+                    onAction: { action in triggerToolbarShortcut(action) },
+                    onOpenCaptureMenu: { showCaptureMenu = true },
+                    onOpenDownloads: { showDownloads = true },
+                    onOpenDriveSync: { showDriveSync = true },
+                    onOpenToolbarEditor: { showToolbarEditor = true },
+                    onCheckUpdates: { Task { await checkUpdates() } }
+                )
             }
-            .animation(.spring(response: 0.28, dampingFraction: 0.86), value: model.isChromeCollapsed)
-            .animation(.easeInOut(duration: 0.2), value: model.status)
+
+            // Exact Video 00:00->00:01->00:04 Fullscreen Hero-Zoom Liquid Glass Tab Overview!
+            if showTabs {
+                TabOverview(onDismiss: {
+                    withAnimation(.spring(response: 0.36, dampingFraction: 0.86)) {
+                        showTabs = false
+                    }
+                })
+                .environmentObject(model)
+                .transition(.asymmetric(
+                    insertion: .opacity.combined(with: .scale(scale: 1.08)),
+                    removal: .opacity.combined(with: .scale(scale: 1.06))
+                ))
+                .zIndex(20)
+            }
         }
-        .sheet(isPresented: $showTabs) {
-            TabOverview().environmentObject(model)
-        }
+        .animation(.spring(response: 0.36, dampingFraction: 0.86), value: showTabs)
         .sheet(isPresented: $showBookmarks) {
             BookmarksSheet().environmentObject(model)
         }
@@ -169,17 +239,6 @@ struct BrowserScreen: View {
                 ActivityShareSheet(items: items)
             }
         }
-        .sheet(isPresented: $showBrowserMenu) {
-            BrowserMenuSheet(
-                model: model,
-                onAction: { action in triggerToolbarShortcut(action) },
-                onOpenCaptureMenu: { showCaptureMenu = true },
-                onOpenDriveSync: { showDriveSync = true },
-                onOpenDownloads: { showDownloads = true },
-                onOpenToolbarEditor: { showToolbarEditor = true },
-                onCheckUpdates: { Task { await checkUpdates() } }
-            )
-        }
         .sheet(isPresented: $showToolbarEditor) {
             ToolbarEditorSheet(model: model)
         }
@@ -213,27 +272,6 @@ struct BrowserScreen: View {
         }
         .sheet(isPresented: $showProfiles) {
             ProfileManagerSheet().environmentObject(model)
-        }
-        .sheet(isPresented: $showPageTools) {
-            PageToolsSheet(
-                model: model,
-                onStartFind: {
-                    showPageTools = false
-                    showFindBar = true
-                },
-                onOpenCapture: {
-                    showPageTools = false
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { showLiveCapture = true }
-                },
-                onOpenWatermark: {
-                    showPageTools = false
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { showWatermarkRemover = true }
-                },
-                onOpenExtensions: {
-                    showPageTools = false
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { showExtensions = true }
-                }
-            )
         }
         .alert("즐겨찾기 추가", isPresented: $showAddFavorite) {
             TextField("이름 (예: 네이버)", text: $newFavTitle)
@@ -679,32 +717,35 @@ struct BrowserScreen: View {
             }
         }
         .background(
-            RoundedRectangle(cornerRadius: 18, style: .continuous)
-                .fill(Color(red: 0.13, green: 0.115, blue: 0.11).opacity(0.96))
+            LiquidGlassShapeBackground(
+                shape: RoundedRectangle(cornerRadius: 22, style: .continuous),
+                tintOpacity: 0.56,
+                rimOpacity: 0.36,
+                specularOpacity: 0.20,
+                shadowRadius: 16
+            )
         )
-        .overlay(
-            RoundedRectangle(cornerRadius: 18, style: .continuous)
-                .strokeBorder(androidOutlineColor, lineWidth: 1)
-        )
-        .shadow(color: .black.opacity(0.35), radius: 12, y: 4)
+        .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
         .padding(.horizontal, 4)
     }
 
-    // Exact Android Collapsed Floating Pill (TOOLBAR_COLLAPSED_WIDTH_DP = 147..196, HEIGHT = 42..45)
+    // Exact Android + iOS 26 Safari Liquid Glass Collapsed Floating Pill
     private var androidCollapsedPill: some View {
         HStack(spacing: 6) {
             Button {
-                showPageTools = true
+                withAnimation(.spring(response: 0.34, dampingFraction: 0.80)) {
+                    showPageTools.toggle()
+                }
             } label: {
-                Image(systemName: "puzzlepiece.extension")
+                Image(systemName: "line.3.horizontal.decrease")
                     .font(.system(size: 13, weight: .semibold))
-                    .foregroundStyle(model.isContentBlockingDisabledForCurrentHost ? .orange : androidOnSurfaceColor.opacity(0.92))
+                    .foregroundStyle(model.isContentBlockingDisabledForCurrentHost ? .orange : .white.opacity(0.92))
                     .frame(width: 30, height: 30)
             }
-            .buttonStyle(.plain)
+            .buttonStyle(LiquidGlassPressStyle())
 
             Text(model.collapsedPillTitle)
-                .font(.system(size: 12, weight: .semibold))
+                .font(.system(size: 12.5, weight: .semibold))
                 .foregroundStyle(.white)
                 .shadow(color: .black.opacity(0.85), radius: 2, x: 0, y: 0)
                 .lineLimit(1)
@@ -712,42 +753,44 @@ struct BrowserScreen: View {
                 .padding(.trailing, 8)
         }
         .padding(.horizontal, 6)
-        .frame(minWidth: 152, maxWidth: 204, minHeight: 42, maxHeight: 42)
-        .background {
-            ZStack {
-                Capsule().fill(.ultraThinMaterial).opacity(0.38)
-                Capsule().fill(androidFieldColor.opacity(0.24))
-            }
-        }
-        .overlay(
-            Capsule()
-                .strokeBorder(Color.white.opacity(0.22), lineWidth: 1)
+        .frame(minWidth: 156, maxWidth: 210, minHeight: 40, maxHeight: 40)
+        .background(
+            LiquidGlassShapeBackground(
+                shape: Capsule(),
+                tintOpacity: 0.28,
+                rimOpacity: 0.32,
+                specularOpacity: 0.20,
+                shadowRadius: 10
+            )
         )
-        .shadow(color: .black.opacity(0.28), radius: 8, y: 3)
         .contentShape(Capsule())
         .onTapGesture {
-            withAnimation(.spring(response: 0.28, dampingFraction: 0.84)) {
+            withAnimation(.spring(response: 0.30, dampingFraction: 0.84)) {
                 model.isChromeCollapsed = false
                 model.updateAllWebViewContentInsets()
             }
         }
     }
 
-    // Exact Android 2-Row Floating Island (activity_browser.xml + liquid_glass_toolbar_background.xml!)
+    // Exact Android 2-Row + iOS 26 Safari Liquid Glass Floating Island (Video Frames 00:00, 00:04, 00:09, 00:27!)
     private var androidExpandedIsland: some View {
         VStack(spacing: 4) {
-            // Row 1: address_row (46pt, rounded 22pt pill: [Puzzle] [URL TextField] [Bookmark] [Reload/Stop])
+            // Row 1: address_row (46pt capsule pill: [PageTools] [Centered Domain / URL TextField] [Bookmark] [Reload/Stop])
             HStack(spacing: 2) {
                 Button {
-                    showPageTools = true
+                    UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                    withAnimation(.spring(response: 0.34, dampingFraction: 0.80)) {
+                        showBrowserMenu = false
+                        showPageTools.toggle()
+                    }
                 } label: {
-                    Image(systemName: "puzzlepiece.extension")
-                        .font(.system(size: 17, weight: .medium))
+                    Image(systemName: "line.3.horizontal.decrease")
+                        .font(.system(size: 16, weight: .semibold))
                         .foregroundStyle(model.isContentBlockingDisabledForCurrentHost ? .orange : androidOnSurfaceColor)
                         .frame(width: 42, height: 42)
                         .contentShape(Rectangle())
                 }
-                .buttonStyle(.plain)
+                .buttonStyle(LiquidGlassPressStyle())
                 .simultaneousGesture(
                     LongPressGesture(minimumDuration: 0.5).onEnded { _ in
                         UIImpactFeedbackGenerator(style: .medium).impactOccurred()
@@ -756,8 +799,9 @@ struct BrowserScreen: View {
                 )
 
                 TextField("검색 또는 주소 입력", text: $address)
-                    .font(.system(size: 15))
+                    .font(.system(size: 15, weight: addressFocused ? .regular : .medium))
                     .foregroundStyle(androidOnSurfaceColor)
+                    .multilineTextAlignment(addressFocused ? .leading : .center)
                     .textInputAutocapitalization(.never)
                     .autocorrectionDisabled()
                     .keyboardType(.URL)
@@ -778,7 +822,7 @@ struct BrowserScreen: View {
                             .frame(width: 36, height: 42)
                             .contentShape(Rectangle())
                     }
-                    .buttonStyle(.plain)
+                    .buttonStyle(LiquidGlassPressStyle())
                 } else {
                     Button {
                         if !model.isStartPage {
@@ -788,12 +832,12 @@ struct BrowserScreen: View {
                         }
                     } label: {
                         Image(systemName: model.isCurrentBookmarked ? "bookmark.fill" : "bookmark")
-                            .font(.system(size: 16, weight: .medium))
-                            .foregroundStyle(model.isCurrentBookmarked ? androidAccentColor : androidOnSurfaceColor)
-                            .frame(width: 40, height: 42)
+                            .font(.system(size: 15, weight: .medium))
+                            .foregroundStyle(model.isCurrentBookmarked ? androidAccentColor : androidOnSurfaceColor.opacity(0.9))
+                            .frame(width: 36, height: 42)
                             .contentShape(Rectangle())
                     }
-                    .buttonStyle(.plain)
+                    .buttonStyle(LiquidGlassPressStyle())
 
                     Button {
                         if model.isLoading {
@@ -803,26 +847,29 @@ struct BrowserScreen: View {
                         }
                     } label: {
                         Image(systemName: model.isLoading ? "xmark" : "arrow.clockwise")
-                            .font(.system(size: 16, weight: .medium))
+                            .font(.system(size: 15.5, weight: .semibold))
                             .foregroundStyle(androidOnSurfaceColor)
-                            .frame(width: 40, height: 42)
+                            .frame(width: 38, height: 42)
                             .contentShape(Rectangle())
                     }
-                    .buttonStyle(.plain)
+                    .buttonStyle(LiquidGlassPressStyle())
                 }
             }
-            .padding(.horizontal, 4)
+            .padding(.horizontal, 6)
             .frame(height: 46)
             .background(
-                RoundedRectangle(cornerRadius: 22, style: .continuous)
-                    .fill(androidFieldColor)
+                Capsule()
+                    .fill(model.preferences.liquidGlassUi ? Color.white.opacity(0.08) : androidFieldColor)
             )
             .overlay(
-                RoundedRectangle(cornerRadius: 22, style: .continuous)
-                    .strokeBorder(addressFocused ? androidAccentColor : androidOutlineColor, lineWidth: 1)
+                Capsule()
+                    .strokeBorder(
+                        addressFocused ? androidAccentColor : (model.preferences.liquidGlassUi ? Color.white.opacity(0.18) : androidOutlineColor),
+                        lineWidth: addressFocused ? 1.2 : 0.8
+                    )
             )
 
-            // Row 2: navigation_scroller -> navigation_row (48pt, horizontally scrollable & centered when fits!)
+            // Row 2: navigation_scroller -> navigation_row (46pt, horizontally scrollable & centered when fits!)
             let activeShortcuts = model.preferences.toolbarShortcuts.isEmpty
                 ? ToolbarShortcutAction.defaultOrder
                 : model.preferences.toolbarShortcuts
@@ -834,56 +881,32 @@ struct BrowserScreen: View {
                                 .frame(maxWidth: activeShortcuts.count <= 6 ? .infinity : nil)
                         }
                     }
-                    .frame(minWidth: navGeo.size.width, minHeight: 48)
+                    .frame(minWidth: navGeo.size.width, minHeight: 46)
                 }
             }
-            .frame(height: 48)
+            .frame(height: 46)
         }
-        .padding(6)
+        .padding(.horizontal, 7)
+        .padding(.vertical, 6)
         .background {
             if model.preferences.liquidGlassUi {
-                // Exact Android liquid_glass_toolbar_background.xml layers
-                ZStack {
-                    RoundedRectangle(cornerRadius: 25, style: .continuous)
-                        .fill(.ultraThinMaterial)
-                    RoundedRectangle(cornerRadius: 25, style: .continuous)
-                        .fill(
-                            LinearGradient(
-                                colors: [
-                                    Color(red: 0.094, green: 0.114, blue: 0.149, opacity: 0.85),
-                                    Color(red: 0.071, green: 0.082, blue: 0.114, opacity: 0.77),
-                                    Color(red: 0.055, green: 0.067, blue: 0.094, opacity: 0.83)
-                                ],
-                                startPoint: .top,
-                                endPoint: .bottom
-                            )
-                        )
-                    RoundedRectangle(cornerRadius: 25, style: .continuous)
-                        .fill(
-                            LinearGradient(
-                                colors: [
-                                    Color.white.opacity(0.28),
-                                    Color.white.opacity(0.06),
-                                    Color.white.opacity(0.01)
-                                ],
-                                startPoint: .top,
-                                endPoint: .bottom
-                            )
-                        )
-                }
+                LiquidGlassShapeBackground(
+                    shape: RoundedRectangle(cornerRadius: 28, style: .continuous),
+                    tintOpacity: 0.44,
+                    rimOpacity: 0.34,
+                    specularOpacity: 0.24,
+                    shadowRadius: 16
+                )
             } else {
                 RoundedRectangle(cornerRadius: 24, style: .continuous)
-                    .fill(Color(red: 0.129, green: 0.114, blue: 0.106, opacity: 0.90))
+                    .fill(Color(red: 0.129, green: 0.114, blue: 0.106, opacity: 0.92))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 24, style: .continuous)
+                            .strokeBorder(androidOutlineColor, lineWidth: 1.0)
+                    )
+                    .shadow(color: .black.opacity(0.30), radius: 10, y: 4)
             }
         }
-        .overlay(
-            RoundedRectangle(cornerRadius: model.preferences.liquidGlassUi ? 25 : 24, style: .continuous)
-                .strokeBorder(
-                    model.preferences.liquidGlassUi ? Color.white.opacity(0.25) : androidOutlineColor,
-                    lineWidth: model.preferences.liquidGlassUi ? 1.2 : 1.0
-                )
-        )
-        .shadow(color: .black.opacity(model.preferences.liquidGlassUi ? 0.42 : 0.30), radius: model.preferences.liquidGlassUi ? 14 : 10, y: 4)
     }
 
     private func androidToolbarButton(for shortcut: ToolbarShortcutAction) -> some View {
@@ -912,11 +935,11 @@ struct BrowserScreen: View {
                         .foregroundStyle(androidOnSurfaceColor)
                 }
             }
-            .frame(width: 48, height: 46)
+            .frame(width: 48, height: 44)
             .contentShape(Rectangle())
             .opacity(isDisabled ? 0.35 : 1.0)
         }
-        .buttonStyle(.plain)
+        .buttonStyle(LiquidGlassPressStyle())
         .disabled(isDisabled)
         .simultaneousGesture(
             LongPressGesture(minimumDuration: 0.5).onEnded { _ in
@@ -936,9 +959,19 @@ struct BrowserScreen: View {
             if model.preferences.showKeyboardOnNewTab { addressFocused = true }
         case .tabs:
             model.captureSnapshot(for: model.activeID)
-            showTabs = true
+            addressFocused = false
+            showPageTools = false
+            showBrowserMenu = false
+            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+            withAnimation(.spring(response: 0.36, dampingFraction: 0.86)) {
+                showTabs = true
+            }
         case .menu:
-            showBrowserMenu = true
+            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+            withAnimation(.spring(response: 0.34, dampingFraction: 0.80)) {
+                showPageTools = false
+                showBrowserMenu.toggle()
+            }
         case .findInPage:
             showFindBar = true
         case .contentBlocking:
@@ -1168,16 +1201,21 @@ struct PageToolsSheet: View {
     }
 }
 
-// MARK: - Android-Exact Tab Overview (Top Profile Pill, Inline Search, Multi-Select Batch Move/Close, Bottom Group Pill Left/Right Swipe!)
+// MARK: - iOS 26 Safari Liquid Glass Fullscreen Tab Overview (Exact Reference Video 00:01, 00:11-00:26!)
 
 struct TabOverview: View {
     @EnvironmentObject private var model: BrowserModel
-    @Environment(\.dismiss) private var dismiss
+    var onDismiss: () -> Void
+
+    @Namespace private var pillNamespace
+    @State private var pagedGroupID: UUID = BrowserModel.defaultGroupID
     @State private var searchMode = false
     @State private var searchQuery = ""
     @State private var selectionMode = false
     @State private var selectedTabIDs: Set<UUID> = []
     @State private var useGridLayout = true
+    @State private var showTopMenu = false
+    @State private var contextMenuTab: BrowserTab? = nil
     @State private var newGroupName = ""
     @State private var showingNewGroup = false
     @State private var showingGroupManager = false
@@ -1185,28 +1223,196 @@ struct TabOverview: View {
     @State private var batchMoveIDs: Set<UUID> = []
     @State private var showingCloseAllConfirm = false
     @State private var draggingTabID: UUID? = nil
-    @State private var groupPillSwipeOffset: CGFloat = 0
     @FocusState private var searchFieldFocused: Bool
 
-    private var filteredTabs: [BrowserTab] {
+    private func displayedTabs(for groupID: UUID) -> [BrowserTab] {
         let q = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        let base = q.isEmpty ? model.visibleTabs : model.visibleTabs.filter {
+        let raw = model.tabs(forGroup: groupID)
+        let filtered = q.isEmpty ? raw : raw.filter {
             $0.title.lowercased().contains(q) || $0.url.lowercased().contains(q)
         }
-        return model.preferences.tabsStartFromBottom ? Array(base.reversed()) : base
+        return model.preferences.tabsStartFromBottom ? Array(filtered.reversed()) : filtered
     }
 
-    private var overviewBg: Color { Color(red: 0.125, green: 0.149, blue: 0.176) }
-    private var overviewControlBg: Color { Color(red: 0.192, green: 0.220, blue: 0.251) }
-    private var overviewOnSurface: Color { Color(red: 0.945, green: 0.910, blue: 0.894) }
-
     var body: some View {
-        VStack(spacing: 0) {
-            androidOverviewTopBar
-            if useGridLayout { gridTabBody } else { listTabBody }
-            androidOverviewBottomBar
+        ZStack {
+            // Ambient Frosted Liquid Glass Backdrop (soft radial glow over blurred live browser)
+            ZStack {
+                Color.black.opacity(0.36).ignoresSafeArea()
+                Rectangle().fill(.ultraThinMaterial).opacity(0.72).ignoresSafeArea()
+                RadialGradient(
+                    colors: [
+                        Color(hex: model.activeProfile.colorHex).opacity(0.16),
+                        Color(red: 0.16, green: 0.11, blue: 0.14).opacity(0.24),
+                        Color.black.opacity(0.45)
+                    ],
+                    center: .topLeading,
+                    startRadius: 40,
+                    endRadius: 540
+                )
+                .ignoresSafeArea()
+            }
+
+            VStack(spacing: 0) {
+                liquidGlassTopBar
+
+                // Exact Frames 00:15 -> 00:21: Native Interactive Horizontal Swipe Pager across ALL Groups!
+                TabView(selection: $pagedGroupID) {
+                    ForEach(model.workspaceGroupIDs, id: \.self) { groupID in
+                        groupPageView(for: groupID)
+                            .tag(groupID)
+                    }
+                }
+                .tabViewStyle(.page(indexDisplayMode: .never))
+                .animation(.spring(response: 0.34, dampingFraction: 0.86), value: pagedGroupID)
+
+                liquidGlassBottomCarouselBar
+            }
+
+            // Exact Video Frames 00:22 -> 00:25: Morphing Top-Right Menu Popover with Inline Expandable Profile List!
+            LiquidGlassMorphContainer(
+                isPresented: showTopMenu,
+                alignment: .topTrailing,
+                anchor: .topTrailing,
+                edgeInsets: EdgeInsets(top: 62, leading: 16, bottom: 0, trailing: 14),
+                onDismiss: { showTopMenu = false }
+            ) {
+                LiquidGlassTabOverviewMenuPopover(
+                    model: model,
+                    selectionMode: selectionMode,
+                    selectedCount: selectedTabIDs.count,
+                    useGridLayout: useGridLayout,
+                    onDismiss: {
+                        withAnimation(.spring(response: 0.30, dampingFraction: 0.84)) { showTopMenu = false }
+                    },
+                    onManageGroups: { showingGroupManager = true },
+                    onEnterSelectionMode: {
+                        withAnimation(.spring(response: 0.28, dampingFraction: 0.84)) {
+                            selectionMode = true
+                            selectedTabIDs.removeAll()
+                        }
+                    },
+                    onSelectAll: {
+                        selectedTabIDs = Set(model.visibleTabs.map(\.id))
+                    },
+                    onMoveSelected: {
+                        guard !selectedTabIDs.isEmpty else { return }
+                        batchMoveIDs = selectedTabIDs
+                        showingBatchMove = true
+                    },
+                    onCloseSelected: {
+                        let toClose = selectedTabIDs
+                        selectedTabIDs.removeAll()
+                        selectionMode = false
+                        withAnimation(.spring(response: 0.28, dampingFraction: 0.82)) {
+                            model.closeTabs(toClose)
+                        }
+                    },
+                    onToggleGridList: {
+                        withAnimation(.spring(response: 0.28, dampingFraction: 0.84)) {
+                            useGridLayout.toggle()
+                        }
+                    },
+                    onCloseAllTabs: { showingCloseAllConfirm = true }
+                )
+            }
+
+            // Exact Video Frames 00:12 & 00:14: Floating Liquid Glass Tab Card Long-Press Menu!
+            LiquidGlassMorphContainer(
+                isPresented: contextMenuTab != nil,
+                alignment: .center,
+                anchor: .center,
+                edgeInsets: EdgeInsets(top: 120, leading: 24, bottom: 80, trailing: 24),
+                onDismiss: { contextMenuTab = nil }
+            ) {
+                if let targetTab = contextMenuTab {
+                    VStack(spacing: 16) {
+                        // Lifted Mini Preview Card
+                        VStack(spacing: 6) {
+                            ZStack {
+                                Color(red: 0.12, green: 0.13, blue: 0.16)
+                                if let snap = model.tabSnapshots[targetTab.id] {
+                                    Image(uiImage: snap)
+                                        .resizable()
+                                        .scaledToFill()
+                                        .frame(width: 196, height: 150)
+                                        .clipped()
+                                } else {
+                                    Image(systemName: targetTab.url == "about:blank" ? "sparkles" : "globe")
+                                        .font(.largeTitle)
+                                        .foregroundStyle(.white.opacity(0.45))
+                                }
+                            }
+                            .frame(width: 196, height: 150)
+                            .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 18, style: .continuous)
+                                    .strokeBorder(Color.white.opacity(0.28), lineWidth: 1)
+                            )
+                            .shadow(color: .black.opacity(0.48), radius: 22, y: 10)
+
+                            Text(targetTab.title)
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(.white)
+                                .lineLimit(1)
+                                .frame(maxWidth: 220)
+                        }
+
+                        LiquidGlassTabCardContextPopover(
+                            tab: targetTab,
+                            onDismiss: {
+                                withAnimation(.spring(response: 0.28, dampingFraction: 0.84)) { contextMenuTab = nil }
+                            },
+                            onCopyLink: {
+                                UIPasteboard.general.string = targetTab.url
+                                model.status = "링크를 복사했습니다."
+                            },
+                            onTogglePin: {
+                                withAnimation(.spring(response: 0.28, dampingFraction: 0.84)) {
+                                    model.togglePinTab(targetTab.id)
+                                }
+                            },
+                            onDuplicate: {
+                                withAnimation(.spring(response: 0.28, dampingFraction: 0.82)) {
+                                    model.duplicateTab(targetTab.id)
+                                }
+                            },
+                            onSelectTab: {
+                                withAnimation(.spring(response: 0.28, dampingFraction: 0.84)) {
+                                    selectionMode = true
+                                    selectedTabIDs.insert(targetTab.id)
+                                }
+                            },
+                            onMoveTab: {
+                                batchMoveIDs = [targetTab.id]
+                                showingBatchMove = true
+                            },
+                            onCloseTab: {
+                                withAnimation(.spring(response: 0.28, dampingFraction: 0.82)) {
+                                    model.close(targetTab.id)
+                                }
+                            }
+                        )
+                    }
+                }
+            }
         }
-        .background(overviewBg.ignoresSafeArea())
+        .onAppear {
+            pagedGroupID = model.activeGroupID
+        }
+        .onChange(of: pagedGroupID) { nextGroup in
+            if nextGroup != model.activeGroupID {
+                UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                model.selectGroup(nextGroup)
+            }
+        }
+        .onChange(of: model.activeGroupID) { nextGroup in
+            if pagedGroupID != nextGroup {
+                withAnimation(.spring(response: 0.34, dampingFraction: 0.86)) {
+                    pagedGroupID = nextGroup
+                }
+            }
+        }
         .alert("새 탭 그룹", isPresented: $showingNewGroup) {
             TextField("그룹 이름", text: $newGroupName)
             Button("만들기") { model.addGroup(newGroupName); newGroupName = "" }
@@ -1224,126 +1430,16 @@ struct TabOverview: View {
         .sheet(isPresented: $showingCloseAllConfirm) {
             CloseAllTabsCountdownSheet(tabCount: model.visibleTabs.count) {
                 model.closeAllVisibleTabs()
-                dismiss()
+                onDismiss()
             }
         }
     }
 
-    // Top Bar: [⋯ Actions] — [Profile Pill / Selected Count] — [🔍 Search / ✓ Select All] + Inline Search Overlay
-    private var androidOverviewTopBar: some View {
+    // Exact Video Top Bar: Floating Liquid Glass Circles [🔍] [≡] ... [⋯]
+    private var liquidGlassTopBar: some View {
         ZStack {
-            HStack(spacing: 8) {
-                Menu {
-                    if selectionMode {
-                        Button {
-                            selectedTabIDs = Set(model.visibleTabs.map(\.id))
-                        } label: {
-                            Label("전체 선택", systemImage: "checkmark.circle")
-                        }
-                        Button {
-                            guard !selectedTabIDs.isEmpty else { return }
-                            batchMoveIDs = selectedTabIDs
-                            showingBatchMove = true
-                        } label: {
-                            Label("선택한 탭 이동 (\(selectedTabIDs.count))", systemImage: "folder.badge.gearshape")
-                        }
-                        .disabled(selectedTabIDs.isEmpty)
-                        Button(role: .destructive) {
-                            let toClose = selectedTabIDs
-                            selectedTabIDs.removeAll()
-                            selectionMode = false
-                            withAnimation(.spring(response: 0.28, dampingFraction: 0.82)) {
-                                model.closeTabs(toClose)
-                            }
-                        } label: {
-                            Label("선택한 탭 닫기 (\(selectedTabIDs.count))", systemImage: "trash")
-                        }
-                        .disabled(selectedTabIDs.isEmpty)
-                    } else {
-                        Button {
-                            selectionMode = true
-                            selectedTabIDs.removeAll()
-                        } label: {
-                            Label("탭 선택", systemImage: "checkmark.circle")
-                        }
-                        Button {
-                            useGridLayout.toggle()
-                        } label: {
-                            Label(useGridLayout ? "리스트 보기로 전환" : "그리드 보기로 전환", systemImage: useGridLayout ? "list.bullet" : "square.grid.2x2")
-                        }
-                        Button {
-                            showingNewGroup = true
-                        } label: {
-                            Label("새 탭 그룹 만들기", systemImage: "folder.badge.plus")
-                        }
-                        Button {
-                            showingGroupManager = true
-                        } label: {
-                            Label("탭 그룹 관리", systemImage: "rectangle.3.group")
-                        }
-                        Divider()
-                        Button {
-                            withAnimation(.spring(response: 0.28, dampingFraction: 0.82)) {
-                                model.restoreClosedTab()
-                            }
-                        } label: {
-                            Label("닫은 탭 복원 (\(model.closedTabs.count))", systemImage: "arrow.uturn.backward")
-                        }
-                        .disabled(model.closedTabs.isEmpty)
-                        Button(role: .destructive) {
-                            showingCloseAllConfirm = true
-                        } label: {
-                            Label("모든 탭 닫기", systemImage: "trash")
-                        }
-                    }
-                } label: {
-                    Image(systemName: "ellipsis")
-                        .font(.system(size: 18, weight: .semibold))
-                        .foregroundStyle(overviewOnSurface)
-                        .frame(width: 44, height: 44)
-                        .background(overviewControlBg, in: Circle())
-                }
-
-                Spacer()
-
-                if selectionMode {
-                    Text("\(selectedTabIDs.count)개 선택됨")
-                        .font(.subheadline.weight(.bold))
-                        .foregroundStyle(overviewOnSurface)
-                        .padding(.horizontal, 18)
-                        .frame(height: 42)
-                        .background(overviewControlBg, in: Capsule())
-                } else {
-                    Menu {
-                        ForEach(model.profiles) { profile in
-                            Button {
-                                withAnimation(.easeInOut(duration: 0.18)) {
-                                    model.selectProfile(profile.id)
-                                }
-                            } label: {
-                                Label(profile.name, systemImage: profile.icon)
-                            }
-                        }
-                    } label: {
-                        HStack(spacing: 6) {
-                            Image(systemName: model.activeProfile.icon)
-                                .foregroundStyle(Color(hex: model.activeProfile.colorHex))
-                            Text(model.activeProfile.name)
-                                .font(.subheadline.weight(.bold))
-                                .foregroundStyle(overviewOnSurface)
-                            Image(systemName: "chevron.down")
-                                .font(.caption2.weight(.bold))
-                                .foregroundStyle(overviewOnSurface.opacity(0.75))
-                        }
-                        .padding(.horizontal, 18)
-                        .frame(height: 42)
-                        .background(overviewControlBg, in: Capsule())
-                    }
-                }
-
-                Spacer()
-
-                Button {
+            HStack(spacing: 10) {
+                LiquidGlassCircleButton(systemImage: selectionMode ? "checkmark" : "magnifyingglass", size: 42, iconSize: 16) {
                     if selectionMode {
                         if selectedTabIDs.count == model.visibleTabs.count {
                             selectedTabIDs.removeAll()
@@ -1351,176 +1447,267 @@ struct TabOverview: View {
                             selectedTabIDs = Set(model.visibleTabs.map(\.id))
                         }
                     } else {
-                        withAnimation(.easeInOut(duration: 0.18)) {
+                        withAnimation(.spring(response: 0.30, dampingFraction: 0.84)) {
                             searchMode = true
                         }
                         searchFieldFocused = true
                     }
-                } label: {
-                    Image(systemName: selectionMode ? "checkmark" : "magnifyingglass")
-                        .font(.system(size: 17, weight: .semibold))
-                        .foregroundStyle(overviewOnSurface)
-                        .frame(width: 44, height: 44)
-                        .background(overviewControlBg, in: Circle())
                 }
-                .buttonStyle(.plain)
+
+                if !selectionMode {
+                    LiquidGlassCircleButton(
+                        systemImage: useGridLayout ? "line.3.horizontal.decrease" : "square.grid.2x2",
+                        size: 42,
+                        iconSize: 15
+                    ) {
+                        withAnimation(.spring(response: 0.30, dampingFraction: 0.84)) {
+                            useGridLayout.toggle()
+                        }
+                    }
+                }
+
+                Spacer()
+
+                if selectionMode {
+                    Text("\(selectedTabIDs.count)개 선택됨")
+                        .font(.subheadline.weight(.bold))
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 16)
+                        .frame(height: 38)
+                        .background(LiquidGlassShapeBackground(shape: Capsule(), tintOpacity: 0.42, rimOpacity: 0.34, shadowRadius: 8))
+                    Spacer()
+                }
+
+                LiquidGlassCircleButton(systemImage: "ellipsis", size: 42, iconSize: 17) {
+                    UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                    withAnimation(.spring(response: 0.34, dampingFraction: 0.80)) {
+                        showTopMenu.toggle()
+                    }
+                }
             }
             .opacity(searchMode && !selectionMode ? 0 : 1)
 
             if searchMode && !selectionMode {
                 HStack(spacing: 8) {
-                    Button {
-                        withAnimation(.easeInOut(duration: 0.18)) {
+                    LiquidGlassCircleButton(systemImage: "chevron.left", size: 42, iconSize: 16) {
+                        withAnimation(.spring(response: 0.28, dampingFraction: 0.84)) {
                             searchMode = false
                             searchQuery = ""
                             searchFieldFocused = false
                         }
-                    } label: {
-                        Image(systemName: "chevron.left")
-                            .font(.system(size: 17, weight: .semibold))
-                            .foregroundStyle(overviewOnSurface)
-                            .frame(width: 44, height: 44)
-                            .background(overviewControlBg, in: Circle())
                     }
-                    .buttonStyle(.plain)
 
                     TextField("탭 제목 또는 주소 검색", text: $searchQuery)
                         .font(.subheadline)
-                        .foregroundStyle(overviewOnSurface)
+                        .foregroundStyle(.white)
                         .focused($searchFieldFocused)
                         .padding(.horizontal, 16)
                         .frame(height: 42)
-                        .background(overviewControlBg, in: Capsule())
+                        .background(LiquidGlassShapeBackground(shape: Capsule(), tintOpacity: 0.46, rimOpacity: 0.34, shadowRadius: 10))
 
-                    Button {
+                    LiquidGlassCircleButton(systemImage: "xmark", size: 42, iconSize: 15) {
                         if !searchQuery.isEmpty {
                             searchQuery = ""
                         } else {
-                            withAnimation(.easeInOut(duration: 0.18)) {
+                            withAnimation(.spring(response: 0.28, dampingFraction: 0.84)) {
                                 searchMode = false
                                 searchFieldFocused = false
                             }
                         }
-                    } label: {
-                        Image(systemName: "xmark")
-                            .font(.system(size: 16, weight: .semibold))
-                            .foregroundStyle(overviewOnSurface)
-                            .frame(width: 44, height: 44)
-                            .background(overviewControlBg, in: Circle())
                     }
-                    .buttonStyle(.plain)
                 }
-                .transition(.opacity)
+                .transition(.opacity.combined(with: .scale(scale: 0.96)))
             }
         }
-        .padding(.horizontal, 12)
-        .padding(.top, 12)
-        .padding(.bottom, 8)
+        .padding(.horizontal, 14)
+        .padding(.top, 8)
+        .padding(.bottom, 6)
     }
 
-    private var gridTabBody: some View {
+    // Group Page Content (Bold Group Header + Centered Single Hero Card OR Responsive Liquid Glass Grid)
+    private func groupPageView(for groupID: UUID) -> some View {
+        let groupTabs = displayedTabs(for: groupID)
+        let headerTitle = model.groupHeaderTitle(for: groupID)
         let colCount = min(10, max(1, model.preferences.tabGridColumns))
         let ratio = model.preferences.tabThumbnailAspectRatio.heightRatio
+
         return GeometryReader { outerGeo in
-            let cellWidth = max(44, (outerGeo.size.width - CGFloat(colCount + 1) * 10) / CGFloat(colCount))
-            let thumbHeight = min(280, max(64, cellWidth * ratio))
             ScrollViewReader { proxy in
-                ScrollView {
-                    if filteredTabs.isEmpty {
-                        Text(searchQuery.isEmpty ? "열려 있는 탭이 없습니다." : "일치하는 탭이 없습니다.")
-                            .font(.subheadline)
-                            .foregroundStyle(.secondary)
-                            .frame(maxWidth: .infinity)
-                            .padding(.top, 80)
-                    } else {
-                        VStack {
-                            if model.preferences.tabsStartFromBottom {
-                                Spacer(minLength: 0)
+                ScrollView(showsIndicators: false) {
+                    VStack(alignment: .leading, spacing: 12) {
+                        // Exact Video Frames 00:16 -> 00:20: Large Bold Group Title ("무제", "만화", "만화 어허")
+                        if let headerTitle {
+                            Text(headerTitle)
+                                .font(.system(size: 28, weight: .bold))
+                                .foregroundStyle(.white)
+                                .padding(.horizontal, 16)
+                                .padding(.top, 4)
+                        }
+
+                        if groupTabs.isEmpty {
+                            VStack(spacing: 10) {
+                                Image(systemName: groupID == BrowserModel.privateGroupID ? "hand.raised.fill" : "square.on.square")
+                                    .font(.system(size: 36))
+                                    .foregroundStyle(.white.opacity(0.4))
+                                Text(searchQuery.isEmpty ? "열려 있는 탭이 없습니다." : "일치하는 탭이 없습니다.")
+                                    .font(.subheadline)
+                                    .foregroundStyle(.white.opacity(0.65))
                             }
-                            LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 10), count: colCount), spacing: 10) {
-                                ForEach(filteredTabs) { tab in
-                                    tabGridCard(tab: tab, thumbHeight: thumbHeight, outerGeo: outerGeo, scrollProxy: proxy)
-                                        .id(tab.id)
-                                        .transition(.asymmetric(
-                                            insertion: .scale(scale: 0.92).combined(with: .opacity),
-                                            removal: .scale(scale: 0.78).combined(with: .opacity)
-                                        ))
+                            .frame(maxWidth: .infinity)
+                            .padding(.top, 110)
+                        } else if !useGridLayout {
+                            VStack(spacing: 8) {
+                                ForEach(groupTabs) { tab in
+                                    liquidGlassListRow(tab: tab)
                                 }
                             }
-                            .padding(10)
-                            .animation(.spring(response: 0.28, dampingFraction: 0.82), value: model.tabs.map(\.id))
+                            .padding(.horizontal, 14)
+                        } else if groupTabs.count == 1 && headerTitle == nil && !selectionMode {
+                            // Exact Video Frame 00:01: Signature Single Large Centered Hero Card!
+                            HStack {
+                                Spacer(minLength: 0)
+                                let heroW = min(outerGeo.size.width * 0.68, 285)
+                                let heroH = min(outerGeo.size.height * 0.60, heroW * 1.38)
+                                safariTabCard(tab: groupTabs[0], cardHeight: heroH, isHeroSingle: true, outerGeo: outerGeo, scrollProxy: proxy, groupTabs: groupTabs)
+                                    .frame(width: heroW)
+                                Spacer(minLength: 0)
+                            }
+                            .padding(.top, 16)
+                        } else {
+                            let cellWidth = max(46, (outerGeo.size.width - 28 - CGFloat(colCount - 1) * 12) / CGFloat(colCount))
+                            let thumbHeight = min(290, max(78, cellWidth * ratio))
+                            VStack {
+                                if model.preferences.tabsStartFromBottom {
+                                    Spacer(minLength: 0)
+                                }
+                                LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 12), count: colCount), spacing: 14) {
+                                    ForEach(groupTabs) { tab in
+                                        safariTabCard(tab: tab, cardHeight: thumbHeight, isHeroSingle: false, outerGeo: outerGeo, scrollProxy: proxy, groupTabs: groupTabs)
+                                            .id(tab.id)
+                                            .transition(.asymmetric(
+                                                insertion: .scale(scale: 0.90).combined(with: .opacity),
+                                                removal: .scale(scale: 0.72).combined(with: .opacity)
+                                            ))
+                                    }
+                                }
+                                .padding(.horizontal, 14)
+                                .padding(.bottom, 16)
+                                .animation(.spring(response: 0.30, dampingFraction: 0.82), value: groupTabs.map(\.id))
+                            }
+                            .frame(minHeight: max(0, outerGeo.size.height - (headerTitle == nil ? 12 : 54)))
                         }
-                        .frame(minHeight: outerGeo.size.height)
                     }
+                    .padding(.bottom, 12)
                 }
             }
         }
     }
 
-    private func tabGridCard(tab: BrowserTab, thumbHeight: CGFloat, outerGeo: GeometryProxy, scrollProxy: ScrollViewProxy) -> some View {
+    // Exact Video Frames 00:01 & 00:16-00:20 Tab Card (Preview + Floating Top-Right X + Title BELOW Card!)
+    private func safariTabCard(
+        tab: BrowserTab,
+        cardHeight: CGFloat,
+        isHeroSingle: Bool,
+        outerGeo: GeometryProxy,
+        scrollProxy: ScrollViewProxy,
+        groupTabs: [BrowserTab]
+    ) -> some View {
         let isActive = tab.id == model.activeID
         let isSelected = selectedTabIDs.contains(tab.id)
-        return VStack(alignment: .leading, spacing: 0) {
-            HStack(spacing: 4) {
+        let host = URL(string: tab.url)?.host?.replacingOccurrences(of: "^www\\.", with: "", options: .regularExpression)
+        let cardLabel = tab.title.isEmpty || tab.title == "새 탭" ? (host ?? "새 탭") : tab.title
+
+        return VStack(spacing: 7) {
+            ZStack(alignment: .topTrailing) {
+                Group {
+                    if let snap = model.tabSnapshots[tab.id] {
+                        Image(uiImage: snap)
+                            .resizable()
+                            .scaledToFill()
+                            .frame(maxWidth: .infinity)
+                            .frame(height: cardHeight)
+                            .clipped()
+                    } else {
+                        ZStack {
+                            Color(red: 0.08, green: 0.09, blue: 0.11)
+                            Image(systemName: tab.url == "about:blank" ? "sparkles" : "safari")
+                                .font(.system(size: isHeroSingle ? 40 : 28))
+                                .foregroundStyle(.white.opacity(0.22))
+                        }
+                        .frame(maxWidth: .infinity)
+                        .frame(height: cardHeight)
+                    }
+                }
+                .clipShape(RoundedRectangle(cornerRadius: isHeroSingle ? 22 : 18, style: .continuous))
+                .overlay(
+                    RoundedRectangle(cornerRadius: isHeroSingle ? 22 : 18, style: .continuous)
+                        .strokeBorder(
+                            (selectionMode && isSelected)
+                                ? Color(red: 0.20, green: 0.56, blue: 1.0)
+                                : (isActive ? Color.white.opacity(0.55) : Color.white.opacity(0.14)),
+                            lineWidth: (isActive || (selectionMode && isSelected)) ? 2.0 : 0.9
+                        )
+                )
+                .shadow(color: .black.opacity(0.40), radius: isHeroSingle ? 18 : 10, y: 6)
+
+                // Pinned Badge Top-Left
+                if tab.isPinned {
+                    HStack {
+                        Image(systemName: "pin.fill")
+                            .font(.system(size: 10, weight: .bold))
+                            .foregroundStyle(.white)
+                            .padding(5)
+                            .background(Color.blue.opacity(0.85), in: Circle())
+                            .padding(8)
+                        Spacer()
+                    }
+                }
+
+                // Selection Checkmark or Floating Close (×) Circle at Top-Right
                 if selectionMode {
                     Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
-                        .font(.caption)
-                        .foregroundStyle(isSelected ? Color.blue : Color.secondary)
-                } else {
-                    Circle()
-                        .fill(isActive ? Color(red: 0.545, green: 0.671, blue: 1.0) : Color.secondary.opacity(0.5))
-                        .frame(width: 7, height: 7)
-                }
-                Text(tab.title).font(.caption2.weight(.semibold)).foregroundStyle(overviewOnSurface).lineLimit(1)
-                Spacer(minLength: 2)
-                if !selectionMode {
+                        .font(.system(size: 22))
+                        .foregroundStyle(isSelected ? Color(red: 0.20, green: 0.56, blue: 1.0) : .white.opacity(0.75))
+                        .padding(8)
+                } else if !isHeroSingle {
                     Button {
+                        UIImpactFeedbackGenerator(style: .light).impactOccurred()
                         withAnimation(.spring(response: 0.28, dampingFraction: 0.82)) {
                             model.close(tab.id)
                         }
                     } label: {
-                        Image(systemName: "xmark.circle.fill")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
+                        Image(systemName: "xmark")
+                            .font(.system(size: 10, weight: .bold))
+                            .foregroundStyle(.white.opacity(0.92))
+                            .frame(width: 24, height: 24)
+                            .background(Color.black.opacity(0.58), in: Circle())
+                            .overlay(Circle().strokeBorder(Color.white.opacity(0.20), lineWidth: 0.6))
                     }
-                    .buttonStyle(.plain)
+                    .buttonStyle(LiquidGlassPressStyle())
+                    .padding(7)
                 }
             }
-            .padding(.horizontal, 8)
-            .padding(.vertical, 6)
-            .background(Color(red: 0.16, green: 0.18, blue: 0.21))
 
-            ZStack {
-                Color(red: 0.11, green: 0.13, blue: 0.15)
-                if let snap = model.tabSnapshots[tab.id] {
-                    Image(uiImage: snap)
-                        .resizable()
-                        .scaledToFill()
-                        .frame(height: thumbHeight)
-                        .clipped()
-                } else {
-                    VStack(spacing: 4) {
-                        Image(systemName: tab.url == "about:blank" ? "sparkles" : "globe")
-                            .font(.title3)
-                            .foregroundStyle(.secondary)
-                        Text(URL(string: tab.url)?.host ?? tab.title)
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                            .padding(.horizontal, 6)
-                    }
-                    .frame(height: thumbHeight)
+            // Icon + Title cleanly BELOW the Card (Exact Video Frames 00:01 & 00:16-00:20!)
+            HStack(spacing: 5) {
+                if isHeroSingle { Spacer(minLength: 0) }
+                ZStack {
+                    Circle()
+                        .fill(Color.white.opacity(0.16))
+                        .frame(width: 15, height: 15)
+                    Image(systemName: tab.isPrivate ? "hand.raised.fill" : "globe")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundStyle(.white.opacity(0.85))
                 }
+                Text(cardLabel)
+                    .font(.system(size: isHeroSingle ? 13 : 11.5, weight: .medium))
+                    .foregroundStyle(.white.opacity(0.92))
+                    .lineLimit(1)
+                if isHeroSingle { Spacer(minLength: 0) }
             }
+            .padding(.horizontal, 4)
         }
-        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .strokeBorder(
-                    (selectionMode && isSelected) ? Color.blue : (isActive ? Color(red: 0.545, green: 0.671, blue: 1.0) : Color.white.opacity(0.10)),
-                    lineWidth: (isActive || (selectionMode && isSelected)) ? 2 : 1
-                )
-        )
+        .contentShape(Rectangle())
         .onTapGesture {
             if selectionMode {
                 if !selectedTabIDs.insert(tab.id).inserted {
@@ -1528,50 +1715,25 @@ struct TabOverview: View {
                 }
             } else {
                 model.select(tab.id)
-                dismiss()
+                onDismiss()
             }
         }
-        .contextMenu {
-            Button {
-                UIPasteboard.general.string = tab.url
-                model.status = "탭 링크를 복사했습니다."
-            } label: { Label("링크 복사", systemImage: "doc.on.doc") }
-            Button {
-                withAnimation(.spring(response: 0.28, dampingFraction: 0.82)) {
-                    model.duplicateTab(tab.id)
-                }
-            } label: {
-                Label("탭 복제 (바로 뒤에 생성)", systemImage: "plus.square.on.square")
+        .onLongPressGesture(minimumDuration: 0.42) {
+            guard !selectionMode else { return }
+            UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+            withAnimation(.spring(response: 0.34, dampingFraction: 0.80)) {
+                contextMenuTab = tab
             }
-            Button {
-                selectionMode = true
-                selectedTabIDs.insert(tab.id)
-            } label: {
-                Label("탭 선택", systemImage: "checkmark.circle")
-            }
-            Button {
-                batchMoveIDs = [tab.id]
-                showingBatchMove = true
-            } label: {
-                Label("다른 그룹·프로필로 이동", systemImage: "folder.badge.gearshape")
-            }
-            Divider()
-            Button(role: .destructive) {
-                withAnimation(.spring(response: 0.28, dampingFraction: 0.82)) { model.close(tab.id) }
-            } label: { Label("이 탭 닫기", systemImage: "xmark") }
-            Button(role: .destructive) {
-                withAnimation(.spring(response: 0.28, dampingFraction: 0.82)) { model.closeOtherTabs(keeping: tab.id) }
-            } label: { Label("다른 탭 모두 닫기", systemImage: "xmark.circle") }
         }
         .simultaneousGesture(
-            LongPressGesture(minimumDuration: 0.35)
+            LongPressGesture(minimumDuration: 0.55)
                 .sequenced(before: DragGesture(coordinateSpace: .global))
                 .onChanged { value in
-                    guard !selectionMode && !searchMode else { return }
+                    guard !selectionMode && !searchMode && contextMenuTab == nil else { return }
                     if case let .second(true, drag?) = value {
                         draggingTabID = tab.id
                         let y = drag.location.y
-                        let listIds = filteredTabs.map(\.id)
+                        let listIds = groupTabs.map(\.id)
                         guard let currentIdx = listIds.firstIndex(of: tab.id) else { return }
                         if y < 170 && currentIdx > 0 {
                             let prevID = listIds[max(0, currentIdx - 1)]
@@ -1592,157 +1754,178 @@ struct TabOverview: View {
         )
     }
 
-    private var listTabBody: some View {
-        List {
-            ForEach(filteredTabs) { tab in
-                HStack(spacing: 10) {
-                    if selectionMode {
-                        Image(systemName: selectedTabIDs.contains(tab.id) ? "checkmark.circle.fill" : "circle")
-                            .foregroundStyle(selectedTabIDs.contains(tab.id) ? .blue : .secondary)
-                    } else {
-                        Circle()
-                            .fill(tab.id == model.activeID ? Color.blue : Color.secondary.opacity(0.4))
-                            .frame(width: 8, height: 8)
-                    }
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(tab.title).font(.subheadline.weight(.semibold)).lineLimit(1)
-                        Text(tab.url).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
-                    }
-                    Spacer()
-                    if !selectionMode {
-                        Button {
-                            withAnimation(.spring(response: 0.28, dampingFraction: 0.82)) { model.duplicateTab(tab.id) }
-                        } label: { Image(systemName: "plus.square.on.square").foregroundStyle(.secondary) }
-                        .buttonStyle(.plain)
-                        Button {
-                            withAnimation(.spring(response: 0.28, dampingFraction: 0.82)) { model.close(tab.id) }
-                        } label: { Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary) }
-                        .buttonStyle(.plain)
-                    }
-                }
-                .contentShape(Rectangle())
-                .onTapGesture {
-                    if selectionMode {
-                        if !selectedTabIDs.insert(tab.id).inserted { selectedTabIDs.remove(tab.id) }
-                    } else {
-                        model.select(tab.id)
-                        dismiss()
-                    }
-                }
+    private func liquidGlassListRow(tab: BrowserTab) -> some View {
+        let isActive = tab.id == model.activeID
+        let isSelected = selectedTabIDs.contains(tab.id)
+        return HStack(spacing: 12) {
+            if selectionMode {
+                Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
+                    .foregroundStyle(isSelected ? Color(red: 0.20, green: 0.56, blue: 1.0) : .white.opacity(0.6))
+            } else if tab.isPinned {
+                Image(systemName: "pin.fill").font(.caption).foregroundStyle(.blue)
+            } else {
+                Circle()
+                    .fill(isActive ? Color(red: 0.35, green: 0.65, blue: 1.0) : Color.white.opacity(0.35))
+                    .frame(width: 8, height: 8)
             }
-            .onMove(perform: model.reorder)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(tab.title).font(.subheadline.weight(.semibold)).foregroundStyle(.white).lineLimit(1)
+                Text(tab.url).font(.caption2).foregroundStyle(.white.opacity(0.62)).lineLimit(1)
+            }
+            Spacer()
+            if !selectionMode {
+                Button {
+                    withAnimation(.spring(response: 0.28, dampingFraction: 0.82)) { model.duplicateTab(tab.id) }
+                } label: { Image(systemName: "plus.square.on.square").foregroundStyle(.white.opacity(0.75)) }
+                .buttonStyle(LiquidGlassPressStyle())
+                Button {
+                    withAnimation(.spring(response: 0.28, dampingFraction: 0.82)) { model.close(tab.id) }
+                } label: { Image(systemName: "xmark.circle.fill").foregroundStyle(.white.opacity(0.65)) }
+                .buttonStyle(LiquidGlassPressStyle())
+            }
         }
-        .listStyle(.plain)
-        .scrollContentBackground(.hidden)
-        .environment(\.editMode, .constant(selectionMode ? .inactive : .active))
+        .padding(.horizontal, 14)
+        .padding(.vertical, 12)
+        .background(
+            LiquidGlassShapeBackground(shape: RoundedRectangle(cornerRadius: 16, style: .continuous), tintOpacity: 0.40, rimOpacity: 0.24, shadowRadius: 6)
+        )
+        .contentShape(Rectangle())
+        .onTapGesture {
+            if selectionMode {
+                if !selectedTabIDs.insert(tab.id).inserted { selectedTabIDs.remove(tab.id) }
+            } else {
+                model.select(tab.id)
+                onDismiss()
+            }
+        }
+        .onLongPressGesture(minimumDuration: 0.42) {
+            guard !selectionMode else { return }
+            UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+            withAnimation(.spring(response: 0.34, dampingFraction: 0.80)) {
+                contextMenuTab = tab
+            }
+        }
     }
 
-    // Bottom Bar (Exact Android showTabSwitcher): [＋ New Tab] — [Group · N개 (Swipe Left/Right!)] — [✓ Done]
-    private var androidOverviewBottomBar: some View {
-        HStack {
+    // Exact Video Frames 00:01 & 00:15-00:21 Bottom Bar:
+    // [ (＋) Glass Circle ]  [ Liquid Glass Group Carousel Pill with Sliding Active Capsule & Soft Edge Fade ]  [ (✓) Blue Circle ]
+    private var liquidGlassBottomCarouselBar: some View {
+        HStack(spacing: 10) {
             if selectionMode {
-                Button {
+                LiquidGlassCircleButton(systemImage: "folder.badge.gearshape", size: 48, iconSize: 18) {
                     guard !selectedTabIDs.isEmpty else { return }
                     batchMoveIDs = selectedTabIDs
                     showingBatchMove = true
-                } label: {
-                    Image(systemName: "folder.badge.gearshape")
-                        .font(.system(size: 18, weight: .semibold))
-                        .foregroundStyle(overviewOnSurface)
-                        .frame(width: 48, height: 48)
-                        .background(overviewControlBg, in: Circle())
                 }
-                .buttonStyle(.plain)
-                .disabled(selectedTabIDs.isEmpty)
+                .opacity(selectedTabIDs.isEmpty ? 0.45 : 1)
             } else {
-                Button {
-                    withAnimation(.spring(response: 0.28, dampingFraction: 0.82)) {
-                        _ = model.newTab()
-                    }
-                    dismiss()
-                } label: {
-                    Image(systemName: "plus")
-                        .font(.system(size: 20, weight: .semibold))
-                        .foregroundStyle(overviewOnSurface)
-                        .frame(width: 48, height: 48)
-                        .background(overviewControlBg, in: Circle())
+                LiquidGlassCircleButton(systemImage: "plus", size: 48, iconSize: 20) {
+                    UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                    _ = model.newTab()
+                    onDismiss()
                 }
-                .buttonStyle(.plain)
             }
 
-            Spacer()
-
-            // Center Group Pill — Tap opens TabGroupManagerSheet; Swipe Left/Right switches Private <-> Default <-> Custom Groups!
-            Button {
-                if !selectionMode && !searchMode {
-                    showingGroupManager = true
-                }
-            } label: {
-                HStack(spacing: 6) {
-                    if model.activeGroupID == BrowserModel.privateGroupID {
-                        Image(systemName: "hand.raised.fill")
-                            .font(.caption)
-                            .foregroundStyle(.purple)
-                    }
-                    Text(selectionMode
-                        ? "\(selectedTabIDs.count)개 선택됨"
-                        : "\(model.activeGroupDisplayName) · \(filteredTabs.count)개")
-                        .font(.subheadline.weight(.semibold))
-                        .foregroundStyle(overviewOnSurface)
-                }
-                .padding(.horizontal, 18)
-                .frame(height: 44)
-                .background(overviewControlBg, in: Capsule())
-                .offset(x: groupPillSwipeOffset)
-            }
-            .buttonStyle(.plain)
-            .simultaneousGesture(
-                DragGesture(minimumDistance: 16)
-                    .onChanged { value in
-                        guard !selectionMode && !searchMode else { return }
-                        if abs(value.translation.width) > abs(value.translation.height) {
-                            groupPillSwipeOffset = max(-24, min(24, value.translation.width * 0.32))
-                        }
-                    }
-                    .onEnded { value in
-                        guard !selectionMode && !searchMode else {
-                            groupPillSwipeOffset = 0
-                            return
-                        }
-                        let dx = value.translation.width
-                        let dy = value.translation.height
-                        withAnimation(.spring(response: 0.24, dampingFraction: 0.82)) {
-                            groupPillSwipeOffset = 0
-                            if abs(dx) >= 40 && abs(dx) > abs(dy) * 1.2 {
-                                let direction = dx < 0 ? 1 : -1
-                                if model.switchWorkspaceGroup(direction: direction) {
-                                    UIImpactFeedbackGenerator(style: .light).impactOccurred()
+            // Center Liquid Glass Group Carousel Pill with Soft Edge Fade Mask!
+            if selectionMode {
+                Text("\(selectedTabIDs.count)개 선택됨")
+                    .font(.system(size: 14.5, weight: .semibold))
+                    .foregroundStyle(.white)
+                    .frame(maxWidth: .infinity)
+                    .frame(height: 46)
+                    .background(LiquidGlassShapeBackground(shape: Capsule(), tintOpacity: 0.38, rimOpacity: 0.34, shadowRadius: 12))
+            } else {
+                ScrollViewReader { stripProxy in
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 4) {
+                            ForEach(model.workspaceGroupIDs, id: \.self) { groupID in
+                                let isCurrent = pagedGroupID == groupID
+                                Button {
+                                    if isCurrent {
+                                        showingGroupManager = true
+                                    } else {
+                                        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                                        withAnimation(.spring(response: 0.34, dampingFraction: 0.82)) {
+                                            pagedGroupID = groupID
+                                        }
+                                    }
+                                } label: {
+                                    Text(model.groupDisplayName(for: groupID))
+                                        .font(.system(size: 14, weight: isCurrent ? .semibold : .medium))
+                                        .foregroundStyle(isCurrent ? .white : .white.opacity(0.60))
+                                        .lineLimit(1)
+                                        .padding(.horizontal, 14)
+                                        .frame(height: 36)
+                                        .background {
+                                            if isCurrent {
+                                                Capsule()
+                                                    .fill(Color.white.opacity(0.22))
+                                                    .overlay(
+                                                        Capsule()
+                                                            .strokeBorder(Color.white.opacity(0.32), lineWidth: 0.8)
+                                                    )
+                                                    .matchedGeometryEffect(id: "activeGroupCapsule", in: pillNamespace)
+                                            }
+                                        }
                                 }
+                                .buttonStyle(.plain)
+                                .id(groupID)
                             }
                         }
+                        .padding(.horizontal, 26)
+                        .frame(minHeight: 46)
                     }
-            )
-
-            Spacer()
-
-            Button {
-                if selectionMode {
-                    selectionMode = false
-                    selectedTabIDs.removeAll()
-                } else {
-                    dismiss()
+                    .onAppear {
+                        DispatchQueue.main.async {
+                            stripProxy.scrollTo(pagedGroupID, anchor: .center)
+                        }
+                    }
+                    .onChange(of: pagedGroupID) { target in
+                        withAnimation(.spring(response: 0.34, dampingFraction: 0.84)) {
+                            stripProxy.scrollTo(target, anchor: .center)
+                        }
+                    }
                 }
-            } label: {
-                Image(systemName: "checkmark")
-                    .font(.system(size: 18, weight: .bold))
-                    .foregroundStyle(.white)
-                    .frame(width: 48, height: 48)
-                    .background(Color(red: 0.35, green: 0.56, blue: 0.96), in: Circle())
+                .mask(
+                    LinearGradient(
+                        stops: [
+                            .init(color: .clear, location: 0.0),
+                            .init(color: .black, location: 0.12),
+                            .init(color: .black, location: 0.88),
+                            .init(color: .clear, location: 1.0)
+                        ],
+                        startPoint: .leading,
+                        endPoint: .trailing
+                    )
+                )
+                .frame(height: 46)
+                .background(
+                    LiquidGlassShapeBackground(shape: Capsule(), tintOpacity: 0.36, rimOpacity: 0.34, specularOpacity: 0.22, shadowRadius: 12)
+                )
+                .clipShape(Capsule())
             }
-            .buttonStyle(.plain)
+
+            // Vibrant iOS 26 Safari Blue Checkmark Circle (✓)
+            LiquidGlassCircleButton(
+                systemImage: "checkmark",
+                size: 48,
+                iconSize: 18,
+                tint: Color(red: 0.08, green: 0.48, blue: 1.0)
+            ) {
+                UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                if selectionMode {
+                    withAnimation(.spring(response: 0.28, dampingFraction: 0.84)) {
+                        selectionMode = false
+                        selectedTabIDs.removeAll()
+                    }
+                } else {
+                    onDismiss()
+                }
+            }
         }
         .padding(.horizontal, 14)
-        .padding(.vertical, 10)
+        .padding(.top, 6)
+        .padding(.bottom, 10)
     }
 }
 
