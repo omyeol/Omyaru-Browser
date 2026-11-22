@@ -9,11 +9,17 @@
   <key>CFBundleName</key><string>Omyaru</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>0.15.18</string>
-  <key>CFBundleVersion</key><string>78</string>
-  <key>CFBundleURLTypes</key><array><dict>
-    <key>CFBundleURLName</key><string>cuttan.omyaru.app</string>
-    <key>CFBundleURLSchemes</key><array><string>cuttan.omyaru.app</string></array>
-  </dict></array>
+  <key>CFBundleVersion</key><string>79</string>
+  <key>GIDClientID</key><string>$(OMYARU_GOOGLE_IOS_CLIENT_ID)</string>
+  <key>CFBundleURLTypes</key><array>
+    <dict>
+      <key>CFBundleURLName</key><string>GoogleOAuth</string>
+      <key>CFBundleURLSchemes</key><array>
+        <string>$(OMYARU_GOOGLE_IOS_URL_SCHEME)</string>
+        <string>cuttan.omyaru.app</string>
+      </array>
+    </dict>
+  </array>
   <key>NSFaceIDUsageDescription</key><string>Face ID로 Omyaru 브라우저와 책장 잠금을 해제합니다.</string>
   <key>LSRequiresIPhoneOS</key><true/>
   <key>UIApplicationSceneManifest</key><dict><key>UIApplicationSupportsMultipleScenes</key><false/></dict>

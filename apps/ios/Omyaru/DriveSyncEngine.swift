@@ -180,18 +180,15 @@ final class DriveSyncManager: NSObject, ObservableObject, ASWebAuthenticationPre
     static let shared = DriveSyncManager()
     static let tabResetConfirmationPhrase = "동기화 탭 초기화"
     static let chunkSize = 1024 * 1024
+    /// Built-in public iOS OAuth client identifier for Omyaru Google Cloud project 136563471424.
+    private static let defaultBuiltInClientID = "136563471424-n3bgne716cvcm8kdk767niqpommo04k2.apps.googleusercontent.com"
+    private static let keychainService = "cuttan.omyaru.app.drive-sync"
 
-    @Published var clientID: String {
-        didSet { UserDefaults.standard.set(clientID, forKey: "omyaru.ios.drive.clientId") }
-    }
-    @Published var accessToken: String {
-        didSet { UserDefaults.standard.set(accessToken, forKey: "omyaru.ios.drive.accessToken") }
-    }
-    @Published var refreshToken: String {
-        didSet { UserDefaults.standard.set(refreshToken, forKey: "omyaru.ios.drive.refreshToken") }
+    @Published var connectedEmail: String {
+        didSet { UserDefaults.standard.set(connectedEmail, forKey: "omyaru.ios.drive.email") }
     }
     @Published var syncPassphrase: String {
-        didSet { UserDefaults.standard.set(syncPassphrase, forKey: "omyaru.ios.drive.passphrase") }
+        didSet { Self.saveKeychainString(syncPassphrase, account: "sync_passphrase") }
     }
     @Published var autoSyncEnabled: Bool {
         didSet { UserDefaults.standard.set(autoSyncEnabled, forKey: "omyaru.ios.drive.autoSync") }
@@ -199,12 +196,34 @@ final class DriveSyncManager: NSObject, ObservableObject, ASWebAuthenticationPre
     @Published var onDemandCloudPhotos: Bool {
         didSet { UserDefaults.standard.set(onDemandCloudPhotos, forKey: "omyaru.ios.drive.onDemand") }
     }
+    @Published private(set) var isConnected: Bool = false
     @Published var busy: Bool = false
-    @Published var status: String = "로컬 암호화 대기 중"
+    @Published var status: String = "Google 계정을 연결하면 Android · PC · iOS가 자동 동기화됩니다."
     @Published var progress: Double? = nil
     @Published var lastSyncedAt: Date? = nil
 
+    private var accessToken: String = "" {
+        didSet {
+            Self.saveKeychainString(accessToken, account: "access_token")
+            isConnected = !accessToken.isEmpty || !refreshToken.isEmpty
+        }
+    }
+    private var refreshToken: String = "" {
+        didSet {
+            Self.saveKeychainString(refreshToken, account: "refresh_token")
+            isConnected = !accessToken.isEmpty || !refreshToken.isEmpty
+        }
+    }
     private var cachedKeyRing: OmyaruDriveKeyRing? = nil
+
+    private var resolvedClientID: String {
+        if let plist = (Bundle.main.object(forInfoDictionaryKey: "GIDClientID") as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           plist.hasSuffix(".apps.googleusercontent.com") {
+            return plist
+        }
+        return Self.defaultBuiltInClientID
+    }
 
     private var syncStateDirectory: URL {
         let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -213,19 +232,57 @@ final class DriveSyncManager: NSObject, ObservableObject, ASWebAuthenticationPre
         return dir
     }
 
-    override init() {
-        let d = UserDefaults.standard
-        let plistClient = (Bundle.main.object(forInfoDictionaryKey: "GIDClientID") as? String) ?? ""
-        clientID = d.string(forKey: "omyaru.ios.drive.clientId") ?? plistClient
-        accessToken = d.string(forKey: "omyaru.ios.drive.accessToken") ?? ""
-        refreshToken = d.string(forKey: "omyaru.ios.drive.refreshToken") ?? ""
-        syncPassphrase = d.string(forKey: "omyaru.ios.drive.passphrase") ?? ""
-        autoSyncEnabled = d.bool(forKey: "omyaru.ios.drive.autoSync")
-        onDemandCloudPhotos = d.bool(forKey: "omyaru.ios.drive.onDemand")
-        super.init()
+    private static func readKeychainString(account: String) -> String? {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: keychainService,
+            kSecAttrAccount as String: account,
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne
+        ]
+        var result: AnyObject?
+        guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
+              let data = result as? Data else { return nil }
+        return String(data: data, encoding: .utf8)
     }
 
-    var isConnected: Bool { !accessToken.isEmpty }
+    private static func saveKeychainString(_ value: String, account: String) {
+        let baseQuery: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: keychainService,
+            kSecAttrAccount as String: account
+        ]
+        SecItemDelete(baseQuery as CFDictionary)
+        guard !value.isEmpty, let data = value.data(using: .utf8) else { return }
+        var item = baseQuery
+        item[kSecValueData as String] = data
+        item[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+        SecItemAdd(item as CFDictionary, nil)
+    }
+
+    override init() {
+        let d = UserDefaults.standard
+        connectedEmail = d.string(forKey: "omyaru.ios.drive.email") ?? ""
+        autoSyncEnabled = d.bool(forKey: "omyaru.ios.drive.autoSync")
+        onDemandCloudPhotos = d.bool(forKey: "omyaru.ios.drive.onDemand")
+
+        let kcAccess = Self.readKeychainString(account: "access_token") ?? d.string(forKey: "omyaru.ios.drive.accessToken") ?? ""
+        let kcRefresh = Self.readKeychainString(account: "refresh_token") ?? d.string(forKey: "omyaru.ios.drive.refreshToken") ?? ""
+        let kcPass = Self.readKeychainString(account: "sync_passphrase") ?? d.string(forKey: "omyaru.ios.drive.passphrase") ?? ""
+        syncPassphrase = kcPass
+        super.init()
+
+        accessToken = kcAccess
+        refreshToken = kcRefresh
+        // Clean up any legacy plaintext token entries in UserDefaults
+        d.removeObject(forKey: "omyaru.ios.drive.clientId")
+        d.removeObject(forKey: "omyaru.ios.drive.accessToken")
+        d.removeObject(forKey: "omyaru.ios.drive.refreshToken")
+        d.removeObject(forKey: "omyaru.ios.drive.passphrase")
+        if isConnected {
+            status = connectedEmail.isEmpty ? "Google Drive 연결됨" : "\(connectedEmail) 연결됨"
+        }
+    }
 
     func presentationAnchor(for session: ASWebAuthenticationSession) -> ASPresentationAnchor {
         UIApplication.shared.connectedScenes
@@ -234,17 +291,14 @@ final class DriveSyncManager: NSObject, ObservableObject, ASWebAuthenticationPre
             .first(where: \.isKeyWindow) ?? ASPresentationAnchor()
     }
 
-    // MARK: - Google OAuth 2.0 PKCE Sign-In & Refresh
+    // MARK: - Built-In One-Tap Google OAuth 2.0 PKCE Sign-In & Refresh (Zero User Setup!)
 
-    func signInWithGoogle() async {
-        let trimmedClient = clientID.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard trimmedClient.hasSuffix(".apps.googleusercontent.com") else {
-            status = "Google iOS OAuth 클라이언트 ID(.apps.googleusercontent.com)를 입력하거나 암호화 동기화 파일을 사용해 주세요."
-            return
-        }
+    @discardableResult
+    func signInWithGoogle() async -> Bool {
+        let trimmedClient = resolvedClientID
         let prefix = String(trimmedClient.dropLast(".apps.googleusercontent.com".count))
         let callbackScheme = "com.googleusercontent.apps.\(prefix)"
-        let redirectURI = "\(callbackScheme):/oauthredirect"
+        let redirectURI = "\(callbackScheme):/oauth2redirect/google"
         let verifier = generateCodeVerifier()
         let challenge = codeChallenge(for: verifier)
 
@@ -255,12 +309,14 @@ final class DriveSyncManager: NSObject, ObservableObject, ASWebAuthenticationPre
             URLQueryItem(name: "response_type", value: "code"),
             URLQueryItem(name: "scope", value: "https://www.googleapis.com/auth/drive.appdata"),
             URLQueryItem(name: "code_challenge", value: challenge),
-            URLQueryItem(name: "code_challenge_method", value: "S256")
+            URLQueryItem(name: "code_challenge_method", value: "S256"),
+            URLQueryItem(name: "access_type", value: "offline"),
+            URLQueryItem(name: "prompt", value: "consent select_account")
         ]
-        guard let authURL = comps.url else { return }
+        guard let authURL = comps.url else { return false }
 
         busy = true
-        status = "Google 계정 인증 진행 중..."
+        status = "Google 계정 선택 대기 중..."
         defer { busy = false }
 
         do {
@@ -271,7 +327,7 @@ final class DriveSyncManager: NSObject, ObservableObject, ASWebAuthenticationPre
                     } else if let url {
                         continuation.resume(returning: url)
                     } else {
-                        continuation.resume(throwing: NSError(domain: "OmyaruOAuth", code: -1, userInfo: [NSLocalizedDescriptionKey: "인증이 취소되었습니다."]))
+                        continuation.resume(throwing: NSError(domain: "OmyaruOAuth", code: -1, userInfo: [NSLocalizedDescriptionKey: "로그인이 취소되었습니다."]))
                     }
                 }
                 session.presentationContextProvider = self
@@ -279,21 +335,28 @@ final class DriveSyncManager: NSObject, ObservableObject, ASWebAuthenticationPre
                 session.start()
             }
 
-            guard let code = URLComponents(url: callbackURL, resolvingAgainstBaseURL: false)?
-                .queryItems?.first(where: { $0.name == "code" })?.value else {
-                status = "인증 코드를 받지 못했습니다."
-                return
+            let items = URLComponents(url: callbackURL, resolvingAgainstBaseURL: false)?.queryItems ?? []
+            if let errCode = items.first(where: { $0.name == "error" })?.value {
+                status = errCode == "access_denied" ? "Google 권한 승인이 취소되었습니다." : "Google 로그인 오류: \(errCode)"
+                return false
+            }
+            guard let code = items.first(where: { $0.name == "code" })?.value, !code.isEmpty else {
+                status = "Google 인증 코드를 받지 못했습니다."
+                return false
             }
 
+            status = "Google 로그인 완료 중..."
             var tokenReq = URLRequest(url: URL(string: "https://oauth2.googleapis.com/token")!)
             tokenReq.httpMethod = "POST"
             tokenReq.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+            let formAllowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-._~"))
+            func enc(_ s: String) -> String { s.addingPercentEncoding(withAllowedCharacters: formAllowed) ?? s }
             let bodyItems = [
-                "client_id=\(trimmedClient.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? trimmedClient)",
-                "code=\(code.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? code)",
-                "code_verifier=\(verifier)",
+                "client_id=\(enc(trimmedClient))",
+                "code=\(enc(code))",
+                "code_verifier=\(enc(verifier))",
                 "grant_type=authorization_code",
-                "redirect_uri=\(redirectURI.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? redirectURI)"
+                "redirect_uri=\(enc(redirectURI))"
             ]
             tokenReq.httpBody = bodyItems.joined(separator: "&").data(using: .utf8)
 
@@ -301,29 +364,46 @@ final class DriveSyncManager: NSObject, ObservableObject, ASWebAuthenticationPre
             guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode),
                   let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
                   let token = json["access_token"] as? String else {
-                status = "토큰 교환 실패"
-                return
+                let errJson = (try? JSONSerialization.jsonObject(with: data) as? [String: Any])
+                let desc = (errJson?["error_description"] as? String) ?? (errJson?["error"] as? String) ?? "다시 시도해 주세요."
+                status = "Google 인증 처리 실패: \(desc)"
+                return false
             }
             accessToken = token
-            if let refresh = json["refresh_token"] as? String {
+            if let refresh = json["refresh_token"] as? String, !refresh.isEmpty {
                 refreshToken = refresh
             }
             cachedKeyRing = nil
-            status = "Google Drive 연결 완료"
+            await fetchConnectedAccountEmail()
+            status = connectedEmail.isEmpty ? "Google Drive 연결 완료" : "\(connectedEmail) 연결 완료"
+            return true
         } catch {
             status = "Google 로그인 취소 또는 실패: \(error.localizedDescription)"
+            return false
+        }
+    }
+
+    private func fetchConnectedAccountEmail() async {
+        guard let url = URL(string: "https://www.googleapis.com/drive/v3/about?fields=user(emailAddress,displayName)") else { return }
+        if let data = try? await driveDataRequest(URLRequest(url: url, timeoutInterval: 15)),
+           let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let user = json["user"] as? [String: Any],
+           let email = user["emailAddress"] as? String, !email.isEmpty {
+            connectedEmail = email
         }
     }
 
     private func refreshAccessTokenIfPossible() async -> Bool {
-        let trimmedClient = clientID.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedClient = resolvedClientID
         guard !trimmedClient.isEmpty, !refreshToken.isEmpty else { return false }
         var req = URLRequest(url: URL(string: "https://oauth2.googleapis.com/token")!)
         req.httpMethod = "POST"
         req.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+        let formAllowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-._~"))
+        func enc(_ s: String) -> String { s.addingPercentEncoding(withAllowedCharacters: formAllowed) ?? s }
         let body = [
-            "client_id=\(trimmedClient)",
-            "refresh_token=\(refreshToken)",
+            "client_id=\(enc(trimmedClient))",
+            "refresh_token=\(enc(refreshToken))",
             "grant_type=refresh_token"
         ].joined(separator: "&")
         req.httpBody = body.data(using: .utf8)
@@ -340,9 +420,10 @@ final class DriveSyncManager: NSObject, ObservableObject, ASWebAuthenticationPre
     func disconnectGoogle() {
         accessToken = ""
         refreshToken = ""
+        connectedEmail = ""
         autoSyncEnabled = false
         cachedKeyRing = nil
-        status = "Google Drive 연결 해제됨"
+        status = "Google Drive 연결이 해제되었습니다."
     }
 
     private func generateCodeVerifier() -> String {
@@ -366,8 +447,11 @@ final class DriveSyncManager: NSObject, ObservableObject, ASWebAuthenticationPre
 
     func syncWithGoogleDrive(browser: BrowserModel?, shelf: ShelfModel) async {
         guard !busy else { return }
+        if accessToken.isEmpty && !refreshToken.isEmpty {
+            _ = await refreshAccessTokenIfPossible()
+        }
         guard !accessToken.isEmpty else {
-            status = "먼저 Google 계정을 연결하거나 액세스 토큰을 입력해 주세요."
+            status = "먼저 Google 계정을 연결해 주세요."
             return
         }
         busy = true
@@ -432,7 +516,9 @@ final class DriveSyncManager: NSObject, ObservableObject, ASWebAuthenticationPre
         if FileManager.default.fileExists(atPath: localURL.path) {
             return localURL
         }
-        guard let manifest = item.cloud, !accessToken.isEmpty else { return nil }
+        guard let manifest = item.cloud, isConnected else { return nil }
+        if accessToken.isEmpty { _ = await refreshAccessTokenIfPossible() }
+        guard !accessToken.isEmpty else { return nil }
         do {
             let keys: OmyaruDriveKeyRing
             if let cached = cachedKeyRing {
@@ -1119,70 +1205,125 @@ struct DriveSyncSheet: View {
     var body: some View {
         NavigationStack {
             Form {
-                Section("Google Drive 클라우드 동기화 (Android · PC · iOS 완전 호환)") {
-                    TextField("Google iOS OAuth Client ID (.apps.googleusercontent.com)", text: $sync.clientID)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                        .font(.caption)
-
-                    SecureField("Google OAuth 액세스 토큰 (선택 · 직접 입력 시)", text: $sync.accessToken)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                        .font(.caption)
-
-                    HStack(spacing: 10) {
-                        Button {
-                            Task { await sync.signInWithGoogle() }
-                        } label: {
-                            Label(sync.isConnected ? "Google 재연결" : "Google 계정 연결", systemImage: "person.badge.key.fill")
+                Section {
+                    if sync.isConnected {
+                        HStack(spacing: 12) {
+                            Image(systemName: "checkmark.icloud.fill")
+                                .font(.title2)
+                                .foregroundStyle(.green)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(sync.connectedEmail.isEmpty ? "Google Drive 연결됨" : sync.connectedEmail)
+                                    .font(.subheadline.weight(.semibold))
+                                Text("Android · PC · iOS 종단간 암호화 동기화 활성")
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                            }
                         }
-                        .buttonStyle(.bordered)
-                        .disabled(sync.busy)
+                        .padding(.vertical, 4)
 
                         Button {
                             Task { await sync.syncWithGoogleDrive(browser: browser, shelf: shelf) }
                         } label: {
-                            Label("지금 동기화", systemImage: "arrow.triangle.2.circlepath.icloud.fill")
+                            HStack {
+                                Label("지금 동기화", systemImage: "arrow.triangle.2.circlepath.icloud.fill")
+                                    .font(.subheadline.weight(.semibold))
+                                Spacer()
+                                if sync.busy { ProgressView().controlSize(.small) }
+                            }
                         }
-                        .buttonStyle(.borderedProminent)
-                        .disabled(sync.busy || !sync.isConnected)
-                    }
+                        .disabled(sync.busy)
 
-                    if sync.isConnected {
                         Toggle("앱 활성화 시 자동 동기화", isOn: $sync.autoSyncEnabled)
+
                         Picker("책장 사진 저장 방식", selection: $sync.onDemandCloudPhotos) {
                             Text("기기에 원본 모두 저장").tag(false)
                             Text("필요할 때 클라우드에서 불러오기").tag(true)
                         }
+                    } else {
+                        VStack(alignment: .leading, spacing: 10) {
+                            Text("Google 계정으로 한 번 로그인하면 Android, Windows, iOS의 탭·북마크·방문 기록·책장이 Google Drive 앱 전용 공간에 암호화되어 자동 동기화됩니다.")
+                                .font(.footnote)
+                                .foregroundStyle(.secondary)
+
+                            Button {
+                                Task {
+                                    if await sync.signInWithGoogle() {
+                                        await sync.syncWithGoogleDrive(browser: browser, shelf: shelf)
+                                    }
+                                }
+                            } label: {
+                                HStack {
+                                    Spacer()
+                                    if sync.busy {
+                                        ProgressView().controlSize(.small).padding(.trailing, 6)
+                                    } else {
+                                        Image(systemName: "person.badge.key.fill")
+                                    }
+                                    Text(sync.busy ? "Google 계정 연결 중..." : "Google 계정 연결")
+                                        .font(.subheadline.weight(.semibold))
+                                    Spacer()
+                                }
+                                .padding(.vertical, 10)
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .disabled(sync.busy)
+                        }
+                        .padding(.vertical, 4)
                     }
 
                     if let prog = sync.progress {
-                        ProgressView(value: prog)
+                        ProgressView(value: prog) {
+                            Text("동기화 진행 중")
+                                .font(.caption)
+                        } currentValueLabel: {
+                            Text("\(Int((prog * 100).rounded()))%")
+                                .font(.caption.monospacedDigit())
+                        }
                     }
-                    Text(sync.status)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+
+                    if !sync.status.isEmpty {
+                        Text(sync.status)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+
                     if let last = sync.lastSyncedAt {
                         LabeledContent("마지막 동기화") {
                             Text(last, format: .dateTime.month().day().hour().minute())
                         }
                     }
+                } header: {
+                    Text("Google Drive 동기화")
                 }
 
                 if sync.isConnected {
-                    Section("위험 구역 (동기화 제어)") {
+                    Section("동기화 관리") {
+                        Button {
+                            Task {
+                                if await sync.signInWithGoogle() {
+                                    await sync.syncWithGoogleDrive(browser: browser, shelf: shelf)
+                                }
+                            }
+                        } label: {
+                            Label("다른 Google 계정으로 변경", systemImage: "person.2")
+                        }
+                        .disabled(sync.busy)
+
                         Button("모든 기기 동기화 탭 초기화...", role: .destructive) {
                             tabResetInput = ""
                             showTabResetPrompt = true
                         }
-                        Button("Google Drive 연결 해제", role: .destructive) {
+                        .disabled(sync.busy)
+
+                        Button("Google 계정 연결 해제", role: .destructive) {
                             sync.disconnectGoogle()
                         }
+                        .disabled(sync.busy)
                     }
                 }
 
                 Section {
-                    SecureField("동기화 암호 (6자 이상 · PBKDF2 + AES-256-GCM)", text: $sync.syncPassphrase)
+                    SecureField("백업 파일 암호 (6자 이상)", text: $sync.syncPassphrase)
                     Button {
                         do {
                             let bytes = try sync.exportEncryptedBundle(browser: browser, shelf: shelf, password: sync.syncPassphrase)
@@ -1192,17 +1333,17 @@ struct DriveSyncSheet: View {
                             alertMessage = error.localizedDescription
                         }
                     } label: {
-                        Label("암호화 동기화 파일(.omyarusync) 내보내기", systemImage: "square.and.arrow.up")
+                        Label("암호화 백업 파일(.omyarusync) 내보내기", systemImage: "square.and.arrow.up")
                     }
                     Button {
                         importingBundle = true
                     } label: {
-                        Label("암호화 동기화 파일(.omyarusync) 가져오기", systemImage: "square.and.arrow.down")
+                        Label("암호화 백업 파일(.omyarusync) 가져오기", systemImage: "square.and.arrow.down")
                     }
                 } header: {
-                    Text("파일 / AirDrop / iCloud Drive 종단간 암호화 동기화")
+                    Text("오프라인 파일 백업 (선택)")
                 } footer: {
-                    Text("프로필·탭·북마크 폴더·방문 기록·책장 폴더와 이미지를 AES-256-GCM으로 종단간 암호화해 전송합니다.")
+                    Text("Google Drive 없이도 AirDrop이나 파일 앱으로 암호화된 데이터를 직접 옮길 수 있습니다.")
                 }
             }
             .navigationTitle("동기화")

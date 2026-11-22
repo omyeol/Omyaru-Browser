@@ -1,0 +1,5 @@
+// Public iOS OAuth client identifier for Omyaru Google Cloud project 136563471424.
+// Never store secrets or user tokens in this file.
+OMYARU_GOOGLE_IOS_CLIENT_ID = 136563471424-n3bgne716cvcm8kdk767niqpommo04k2.apps.googleusercontent.com
+OMYARU_GOOGLE_IOS_URL_SCHEME = com.googleusercontent.apps.136563471424-n3bgne716cvcm8kdk767niqpommo04k2
+#include? "DriveSync.local.xcconfig"

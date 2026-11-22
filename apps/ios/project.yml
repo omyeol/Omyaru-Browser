@@ -14,6 +14,9 @@ targets:
     platform: iOS
     sources:
       - path: Omyaru
+    configFiles:
+      Debug: DriveSync.xcconfig
+      Release: DriveSync.xcconfig
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: cuttan.omyaru.app
