@@ -15,9 +15,11 @@ struct BrowserScreen: View {
     @State private var address: String = ""
     @State private var showTabs = false
     @State private var showBookmarks = false
+    @State private var showBookmarkEdit = false
     @State private var showHistory = false
     @State private var showDownloads = false
     @State private var showBookshelf = false
+    @State private var showCaptureMenu = false
     @State private var showLiveCapture = false
     @State private var showWatermarkRemover = false
     @State private var pendingWatermarkImage: UIImage? = nil
@@ -28,6 +30,10 @@ struct BrowserScreen: View {
     @State private var showSettings = false
     @State private var showProfiles = false
     @State private var showPageTools = false
+    @State private var showBrowserMenu = false
+    @State private var showToolbarEditor = false
+    @State private var showCloseAllConfirm = false
+    @State private var sharePayload: [Any]? = nil
     @State private var showFindBar = false
     @State private var findInput = ""
     @State private var showAddFavorite = false
@@ -38,65 +44,74 @@ struct BrowserScreen: View {
 
     var body: some View {
         ZStack {
-            Color(red: 0.07, green: 0.07, blue: 0.08).ignoresSafeArea()
+            Color(red: 0.09, green: 0.075, blue: 0.067).ignoresSafeArea()
 
             if let tab = model.activeTab {
                 if model.isStartPage {
                     startPageView
                 } else {
-                    BrowserWebView(webView: model.webView(for: tab.id, loadIfNeeded: true))
-                        .id(tab.id)
+                    ZStack {
+                        BrowserWebView(webView: model.webView(for: tab.id, loadIfNeeded: true))
+                            .id(tab.id)
+                            .ignoresSafeArea(edges: .bottom)
+
+                        FastScrollBarOverlay(model: model)
+                            .padding(.top, model.preferences.addressBarPosition == .top ? (model.isChromeCollapsed ? 58 : 124) : 8)
+                            .padding(.bottom, model.preferences.addressBarPosition == .bottom ? (model.isChromeCollapsed ? 58 : 124) : 8)
+
+                        if let failedURL = model.failedLoadURL {
+                            pageErrorOverlay(failedURL: failedURL)
+                        }
+                    }
                 }
             }
 
             if showFindBar && !model.isStartPage {
                 VStack {
+                    if model.preferences.addressBarPosition == .top {
+                        Spacer().frame(height: model.isChromeCollapsed ? 56 : 122)
+                    }
                     findInPageBar
                     Spacer()
                 }
             }
 
-            // Floating compact pill to restore collapsed toolbar
-            if model.isChromeCollapsed && !model.isStartPage {
-                VStack {
-                    if model.preferences.addressBarPosition == .bottom { Spacer() }
-                    Button {
-                        withAnimation(.spring(response: 0.25, dampingFraction: 0.85)) {
-                            model.isChromeCollapsed = false
-                        }
-                    } label: {
-                        HStack(spacing: 6) {
-                            Image(systemName: "lock.fill").font(.caption2)
-                            Text(URL(string: model.currentURL)?.host ?? model.currentURL)
-                                .font(.caption.weight(.semibold))
-                                .lineLimit(1)
-                        }
-                        .padding(.horizontal, 14)
-                        .padding(.vertical, 6)
-                        .background(.ultraThinMaterial, in: Capsule())
-                        .shadow(radius: 6)
-                    }
-                    .buttonStyle(.plain)
-                    .padding(.vertical, 6)
-                    if model.preferences.addressBarPosition == .top { Spacer() }
+            // Floating Status Toast + Floating Android-Exact URL Island (Top or Bottom!)
+            VStack(spacing: 6) {
+                if model.preferences.addressBarPosition == .bottom {
+                    Spacer(minLength: 0)
+                }
+
+                if model.preferences.addressBarPosition == .bottom && !model.status.isEmpty {
+                    statusToastPill
+                }
+
+                floatingAndroidToolbarRegion
+
+                if model.preferences.addressBarPosition == .top && !model.status.isEmpty {
+                    statusToastPill
+                }
+
+                if model.preferences.addressBarPosition == .top {
+                    Spacer(minLength: 0)
                 }
             }
-        }
-        .safeAreaInset(edge: .top) {
-            if model.preferences.addressBarPosition == .top && !model.isChromeCollapsed {
-                browserChrome
-            }
-        }
-        .safeAreaInset(edge: .bottom) {
-            if model.preferences.addressBarPosition == .bottom && !model.isChromeCollapsed {
-                browserChrome
-            }
+            .animation(.spring(response: 0.28, dampingFraction: 0.86), value: model.isChromeCollapsed)
+            .animation(.easeInOut(duration: 0.2), value: model.status)
         }
         .sheet(isPresented: $showTabs) {
             TabOverview().environmentObject(model)
         }
         .sheet(isPresented: $showBookmarks) {
             BookmarksSheet().environmentObject(model)
+        }
+        .sheet(isPresented: $showBookmarkEdit) {
+            BookmarkEditSheet(
+                model: model,
+                existing: model.findBookmark(for: model.currentURL),
+                defaultTitle: model.activeTab?.title ?? model.currentHost,
+                defaultURL: model.currentURL
+            )
         }
         .sheet(isPresented: $showHistory) {
             HistorySheet().environmentObject(model)
@@ -106,6 +121,13 @@ struct BrowserScreen: View {
         }
         .sheet(isPresented: $showBookshelf) {
             BookshelfView()
+        }
+        .sheet(isPresented: $showCaptureMenu) {
+            CaptureActionMenuSheet(
+                onOpenLiveCapture: { showLiveCapture = true },
+                onOpenWatermark: { showWatermarkRemover = true },
+                onOpenBookshelf: { showBookshelf = true }
+            )
         }
         .sheet(isPresented: $showLiveCapture) {
             LiveCaptureView(
@@ -132,6 +154,39 @@ struct BrowserScreen: View {
         }
         .sheet(item: $model.pendingDownload) { prompt in
             DownloadConfirmationSheet(prompt: prompt, model: model)
+        }
+        .sheet(item: $model.activeContextElement) { element in
+            WebContextElementSheet(model: model, element: element) { urlStr in
+                if let url = URL(string: urlStr) {
+                    sharePayload = [url]
+                } else {
+                    sharePayload = [urlStr]
+                }
+            }
+        }
+        .sheet(isPresented: Binding(get: { sharePayload != nil }, set: { if !$0 { sharePayload = nil } })) {
+            if let items = sharePayload {
+                ActivityShareSheet(items: items)
+            }
+        }
+        .sheet(isPresented: $showBrowserMenu) {
+            BrowserMenuSheet(
+                model: model,
+                onAction: { action in triggerToolbarShortcut(action) },
+                onOpenCaptureMenu: { showCaptureMenu = true },
+                onOpenDriveSync: { showDriveSync = true },
+                onOpenDownloads: { showDownloads = true },
+                onOpenToolbarEditor: { showToolbarEditor = true },
+                onCheckUpdates: { Task { await checkUpdates() } }
+            )
+        }
+        .sheet(isPresented: $showToolbarEditor) {
+            ToolbarEditorSheet(model: model)
+        }
+        .sheet(isPresented: $showCloseAllConfirm) {
+            CloseAllTabsCountdownSheet(tabCount: model.visibleTabs.count) {
+                model.closeAllVisibleTabs()
+            }
         }
         .sheet(isPresented: $showDriveSync) {
             DriveSyncSheet(browser: model, shelf: .shared)
@@ -221,6 +276,10 @@ struct BrowserScreen: View {
         }
         .onChange(of: addressFocused) { focused in
             if focused {
+                if model.isChromeCollapsed {
+                    model.isChromeCollapsed = false
+                    model.updateAllWebViewContentInsets()
+                }
                 address = model.currentURL == "about:blank" ? "" : model.currentURL
             } else {
                 syncAddressField()
@@ -238,8 +297,58 @@ struct BrowserScreen: View {
         } else if model.preferences.showFullURL || addressFocused {
             address = raw
         } else {
-            address = URL(string: raw)?.host ?? raw
+            let host = URL(string: raw)?.host?.replacingOccurrences(of: "^www\\.", with: "", options: .regularExpression)
+            address = host ?? raw
         }
+    }
+
+    private var statusToastPill: some View {
+        Text(model.status)
+            .font(.caption.weight(.medium))
+            .foregroundStyle(.white)
+            .lineLimit(2)
+            .multilineTextAlignment(.center)
+            .padding(.horizontal, 14)
+            .padding(.vertical, 8)
+            .background(Color.black.opacity(0.78), in: Capsule())
+            .overlay(Capsule().strokeBorder(Color.white.opacity(0.16), lineWidth: 0.8))
+            .shadow(color: .black.opacity(0.35), radius: 8, y: 3)
+            .padding(.horizontal, 20)
+            .transition(.opacity.combined(with: .move(edge: .bottom)))
+    }
+
+    private func pageErrorOverlay(failedURL: String) -> some View {
+        let host = URL(string: failedURL)?.host ?? failedURL
+        return VStack(spacing: 14) {
+            Image(systemName: "wifi.exclamationmark")
+                .font(.system(size: 44))
+                .foregroundStyle(Color(red: 0.545, green: 0.671, blue: 1.0))
+            Text("페이지를 불러올 수 없습니다")
+                .font(.title3.weight(.bold))
+                .foregroundStyle(.primary)
+            Text(host)
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+            Text(model.failedLoadMessage ?? "네트워크 연결 또는 사이트 주소를 확인한 뒤 다시 시도해 주세요.")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+                .padding(.horizontal, 18)
+            Button {
+                model.retryFailedLoad()
+            } label: {
+                Label("다시 시도", systemImage: "arrow.clockwise")
+                    .font(.subheadline.weight(.semibold))
+                    .padding(.horizontal, 22)
+                    .padding(.vertical, 10)
+            }
+            .buttonStyle(.borderedProminent)
+            .padding(.top, 6)
+        }
+        .padding(24)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Color(red: 0.09, green: 0.075, blue: 0.067))
     }
 
     // MARK: - Safari-Style Start Page
@@ -412,6 +521,8 @@ struct BrowserScreen: View {
                 }
             }
             .padding(18)
+            .padding(.top, model.preferences.addressBarPosition == .top ? 124 : 0)
+            .padding(.bottom, model.preferences.addressBarPosition == .bottom ? 132 : 20)
         }
     }
 
@@ -477,58 +588,176 @@ struct BrowserScreen: View {
         .padding(.top, 6)
     }
 
-    // MARK: - Top or Bottom Safari Smart Search Bar & Full Customizable Toolbar
+    // MARK: - Android-Exact Floating Bottom/Top URL Island + Compact Collapsed Pill + Live Suggestions
 
-    private var browserChrome: some View {
-        VStack(spacing: 6) {
-            if addressFocused && !address.isEmpty {
-                let suggestions = model.urlSuggestions(for: address)
-                if !suggestions.isEmpty {
-                    ScrollView(.horizontal, showsIndicators: false) {
-                        HStack(spacing: 8) {
-                            ForEach(suggestions) { item in
-                                Button {
-                                    address = item.url
-                                    model.open(item.url)
-                                    addressFocused = false
-                                } label: {
-                                    HStack(spacing: 4) {
-                                        Image(systemName: "globe").font(.caption2).foregroundStyle(.blue)
-                                        Text(item.title).font(.caption.weight(.medium)).lineLimit(1)
-                                    }
-                                    .padding(.horizontal, 10)
-                                    .padding(.vertical, 6)
-                                    .background(chromeSurfaceColor, in: Capsule())
-                                }
-                                .buttonStyle(.plain)
-                            }
+    private var androidAccentColor: Color { Color(red: 0.545, green: 0.671, blue: 1.0) }
+    private var androidFieldColor: Color { Color(red: 0.149, green: 0.129, blue: 0.122) }
+    private var androidOutlineColor: Color { Color(red: 0.286, green: 0.251, blue: 0.235) }
+    private var androidOnSurfaceColor: Color { Color(red: 0.945, green: 0.910, blue: 0.894) }
+    private var androidMutedColor: Color { Color(red: 0.725, green: 0.682, blue: 0.667) }
+
+    private var floatingAndroidToolbarRegion: some View {
+        let isBottom = model.preferences.addressBarPosition == .bottom
+        let suggestions = (addressFocused && !address.isEmpty) ? model.urlSuggestions(for: address) : []
+        return VStack(spacing: 4) {
+            if isBottom && !suggestions.isEmpty {
+                floatingSuggestionsCard(suggestions)
+            }
+            if isBottom && model.isLoading {
+                androidProgressStrip
+            }
+
+            if model.isChromeCollapsed && !model.isStartPage {
+                androidCollapsedPill
+                    .transition(.scale(scale: 0.88).combined(with: .opacity))
+            } else {
+                androidExpandedIsland
+                    .transition(.opacity.combined(with: .scale(scale: 0.97)))
+            }
+
+            if !isBottom && model.isLoading {
+                androidProgressStrip
+            }
+            if !isBottom && !suggestions.isEmpty {
+                floatingSuggestionsCard(suggestions)
+            }
+        }
+        .padding(.horizontal, 8)
+        .padding(.top, isBottom ? 0 : 6)
+        .padding(.bottom, isBottom ? 6 : 0)
+    }
+
+    private var androidProgressStrip: some View {
+        GeometryReader { geo in
+            ZStack(alignment: .leading) {
+                Capsule().fill(Color.white.opacity(0.08))
+                Capsule()
+                    .fill(androidAccentColor)
+                    .frame(width: max(18, geo.size.width * CGFloat(max(0.08, model.estimatedProgress))))
+            }
+        }
+        .frame(height: 2.5)
+        .padding(.horizontal, 14)
+    }
+
+    private func floatingSuggestionsCard(_ suggestions: [BrowserBookmark]) -> some View {
+        VStack(spacing: 0) {
+            ForEach(Array(suggestions.enumerated()), id: \.element.id) { idx, item in
+                Button {
+                    address = item.url
+                    model.open(item.url)
+                    addressFocused = false
+                } label: {
+                    HStack(spacing: 10) {
+                        Image(systemName: "globe")
+                            .font(.caption)
+                            .foregroundStyle(androidAccentColor)
+                            .frame(width: 20)
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(item.title)
+                                .font(.subheadline.weight(.medium))
+                                .foregroundStyle(androidOnSurfaceColor)
+                                .lineLimit(1)
+                            Text(item.url)
+                                .font(.caption2)
+                                .foregroundStyle(androidMutedColor)
+                                .lineLimit(1)
                         }
-                        .padding(.horizontal, 4)
+                        Spacer(minLength: 4)
+                        Image(systemName: "arrow.up.left")
+                            .font(.caption2)
+                            .foregroundStyle(androidMutedColor)
                     }
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 10)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                if idx < suggestions.count - 1 {
+                    Divider().background(androidOutlineColor.opacity(0.6))
                 }
             }
+        }
+        .background(
+            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                .fill(Color(red: 0.13, green: 0.115, blue: 0.11).opacity(0.96))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                .strokeBorder(androidOutlineColor, lineWidth: 1)
+        )
+        .shadow(color: .black.opacity(0.35), radius: 12, y: 4)
+        .padding(.horizontal, 4)
+    }
 
-            if model.isLoading {
-                ProgressView(value: model.estimatedProgress)
-                    .tint(.blue)
-                    .scaleEffect(x: 1, y: 0.6)
+    // Exact Android Collapsed Floating Pill (TOOLBAR_COLLAPSED_WIDTH_DP = 147..196, HEIGHT = 42..45)
+    private var androidCollapsedPill: some View {
+        HStack(spacing: 6) {
+            Button {
+                showPageTools = true
+            } label: {
+                Image(systemName: "puzzlepiece.extension")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(model.isContentBlockingDisabledForCurrentHost ? .orange : androidOnSurfaceColor.opacity(0.92))
+                    .frame(width: 30, height: 30)
             }
+            .buttonStyle(.plain)
 
-            // Address Capsule
-            HStack(spacing: 8) {
+            Text(model.collapsedPillTitle)
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(.white)
+                .shadow(color: .black.opacity(0.85), radius: 2, x: 0, y: 0)
+                .lineLimit(1)
+                .frame(maxWidth: .infinity)
+                .padding(.trailing, 8)
+        }
+        .padding(.horizontal, 6)
+        .frame(minWidth: 152, maxWidth: 204, minHeight: 42, maxHeight: 42)
+        .background {
+            ZStack {
+                Capsule().fill(.ultraThinMaterial).opacity(0.38)
+                Capsule().fill(androidFieldColor.opacity(0.24))
+            }
+        }
+        .overlay(
+            Capsule()
+                .strokeBorder(Color.white.opacity(0.22), lineWidth: 1)
+        )
+        .shadow(color: .black.opacity(0.28), radius: 8, y: 3)
+        .contentShape(Capsule())
+        .onTapGesture {
+            withAnimation(.spring(response: 0.28, dampingFraction: 0.84)) {
+                model.isChromeCollapsed = false
+                model.updateAllWebViewContentInsets()
+            }
+        }
+    }
+
+    // Exact Android 2-Row Floating Island (activity_browser.xml + liquid_glass_toolbar_background.xml!)
+    private var androidExpandedIsland: some View {
+        VStack(spacing: 4) {
+            // Row 1: address_row (46pt, rounded 22pt pill: [Puzzle] [URL TextField] [Bookmark] [Reload/Stop])
+            HStack(spacing: 2) {
                 Button {
                     showPageTools = true
                 } label: {
                     Image(systemName: "puzzlepiece.extension")
-                        .font(.subheadline)
-                        .foregroundStyle(model.isContentBlockingDisabledForCurrentHost ? .orange : .blue)
+                        .font(.system(size: 17, weight: .medium))
+                        .foregroundStyle(model.isContentBlockingDisabledForCurrentHost ? .orange : androidOnSurfaceColor)
+                        .frame(width: 42, height: 42)
+                        .contentShape(Rectangle())
                 }
+                .buttonStyle(.plain)
+                .simultaneousGesture(
+                    LongPressGesture(minimumDuration: 0.5).onEnded { _ in
+                        UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+                        showToolbarEditor = true
+                    }
+                )
 
-                Image(systemName: model.currentURL.lowercased().hasPrefix("https") ? "lock.fill" : "magnifyingglass")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-
-                TextField("검색 또는 웹 사이트 이름 입력", text: $address)
+                TextField("검색 또는 주소 입력", text: $address)
+                    .font(.system(size: 15))
+                    .foregroundStyle(androidOnSurfaceColor)
                     .textInputAutocapitalization(.never)
                     .autocorrectionDisabled()
                     .keyboardType(.URL)
@@ -538,115 +767,163 @@ struct BrowserScreen: View {
                         model.open(address)
                         addressFocused = false
                     }
+                    .padding(.leading, 4)
+                    .padding(.trailing, 4)
 
                 if addressFocused && !address.isEmpty {
                     Button { address = "" } label: {
-                        Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary)
+                        Image(systemName: "xmark.circle.fill")
+                            .font(.system(size: 16))
+                            .foregroundStyle(androidMutedColor)
+                            .frame(width: 36, height: 42)
+                            .contentShape(Rectangle())
                     }
-                } else if !model.isStartPage {
-                    Button { model.toggleBookmark() } label: {
-                        Image(systemName: model.isCurrentBookmarked ? "star.fill" : "star")
-                            .foregroundStyle(model.isCurrentBookmarked ? .yellow : .secondary)
+                    .buttonStyle(.plain)
+                } else {
+                    Button {
+                        if !model.isStartPage {
+                            showBookmarkEdit = true
+                        } else {
+                            showBookmarks = true
+                        }
+                    } label: {
+                        Image(systemName: model.isCurrentBookmarked ? "bookmark.fill" : "bookmark")
+                            .font(.system(size: 16, weight: .medium))
+                            .foregroundStyle(model.isCurrentBookmarked ? androidAccentColor : androidOnSurfaceColor)
+                            .frame(width: 40, height: 42)
+                            .contentShape(Rectangle())
                     }
-                    Button { model.reload() } label: {
-                        Image(systemName: "arrow.clockwise")
-                            .font(.subheadline)
-                            .foregroundStyle(.secondary)
+                    .buttonStyle(.plain)
+
+                    Button {
+                        if model.isLoading {
+                            model.stopLoading()
+                        } else {
+                            model.reload()
+                        }
+                    } label: {
+                        Image(systemName: model.isLoading ? "xmark" : "arrow.clockwise")
+                            .font(.system(size: 16, weight: .medium))
+                            .foregroundStyle(androidOnSurfaceColor)
+                            .frame(width: 40, height: 42)
+                            .contentShape(Rectangle())
                     }
+                    .buttonStyle(.plain)
                 }
             }
-            .padding(.horizontal, 12)
-            .padding(.vertical, model.preferences.compactToolbar ? 7 : 10)
+            .padding(.horizontal, 4)
+            .frame(height: 46)
             .background(
-                model.preferences.liquidGlassUi ? Color.white.opacity(0.11) : Color(red: 0.14, green: 0.14, blue: 0.16),
-                in: RoundedRectangle(cornerRadius: 14, style: .continuous)
+                RoundedRectangle(cornerRadius: 22, style: .continuous)
+                    .fill(androidFieldColor)
             )
             .overlay(
-                RoundedRectangle(cornerRadius: 14, style: .continuous)
-                    .strokeBorder(addressFocused ? Color.blue : Color.white.opacity(0.12), lineWidth: 1)
+                RoundedRectangle(cornerRadius: 22, style: .continuous)
+                    .strokeBorder(addressFocused ? androidAccentColor : androidOutlineColor, lineWidth: 1)
             )
 
-            // Customizable Toolbar Row (Supports ALL 20 Android ToolbarShortcuts!)
+            // Row 2: navigation_scroller -> navigation_row (48pt, horizontally scrollable & centered when fits!)
             let activeShortcuts = model.preferences.toolbarShortcuts.isEmpty
                 ? ToolbarShortcutAction.defaultOrder
                 : model.preferences.toolbarShortcuts
-            HStack {
-                ForEach(Array(activeShortcuts.enumerated()), id: \.offset) { idx, shortcut in
-                    if idx > 0 { Spacer(minLength: 4) }
-                    toolbarItemView(for: shortcut)
+            GeometryReader { navGeo in
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 2) {
+                        ForEach(Array(activeShortcuts.enumerated()), id: \.offset) { _, shortcut in
+                            androidToolbarButton(for: shortcut)
+                                .frame(maxWidth: activeShortcuts.count <= 6 ? .infinity : nil)
+                        }
+                    }
+                    .frame(minWidth: navGeo.size.width, minHeight: 48)
                 }
             }
-            .font(.system(size: 19))
-            .padding(.horizontal, 8)
-            .padding(.top, 2)
-
-            if !model.status.isEmpty {
-                Text(model.status)
-                    .font(.caption2)
-                    .lineLimit(1)
-                    .foregroundStyle(.secondary)
-            }
+            .frame(height: 48)
         }
-        .buttonStyle(.plain)
-        .padding(.horizontal, 12)
-        .padding(.top, 8)
-        .padding(.bottom, 4)
+        .padding(6)
         .background {
             if model.preferences.liquidGlassUi {
-                Rectangle().fill(.ultraThinMaterial)
+                // Exact Android liquid_glass_toolbar_background.xml layers
+                ZStack {
+                    RoundedRectangle(cornerRadius: 25, style: .continuous)
+                        .fill(.ultraThinMaterial)
+                    RoundedRectangle(cornerRadius: 25, style: .continuous)
+                        .fill(
+                            LinearGradient(
+                                colors: [
+                                    Color(red: 0.094, green: 0.114, blue: 0.149, opacity: 0.85),
+                                    Color(red: 0.071, green: 0.082, blue: 0.114, opacity: 0.77),
+                                    Color(red: 0.055, green: 0.067, blue: 0.094, opacity: 0.83)
+                                ],
+                                startPoint: .top,
+                                endPoint: .bottom
+                            )
+                        )
+                    RoundedRectangle(cornerRadius: 25, style: .continuous)
+                        .fill(
+                            LinearGradient(
+                                colors: [
+                                    Color.white.opacity(0.28),
+                                    Color.white.opacity(0.06),
+                                    Color.white.opacity(0.01)
+                                ],
+                                startPoint: .top,
+                                endPoint: .bottom
+                            )
+                        )
+                }
             } else {
-                Color(red: 0.11, green: 0.11, blue: 0.12).opacity(0.96)
+                RoundedRectangle(cornerRadius: 24, style: .continuous)
+                    .fill(Color(red: 0.129, green: 0.114, blue: 0.106, opacity: 0.90))
             }
         }
+        .overlay(
+            RoundedRectangle(cornerRadius: model.preferences.liquidGlassUi ? 25 : 24, style: .continuous)
+                .strokeBorder(
+                    model.preferences.liquidGlassUi ? Color.white.opacity(0.25) : androidOutlineColor,
+                    lineWidth: model.preferences.liquidGlassUi ? 1.2 : 1.0
+                )
+        )
+        .shadow(color: .black.opacity(model.preferences.liquidGlassUi ? 0.42 : 0.30), radius: model.preferences.liquidGlassUi ? 14 : 10, y: 4)
     }
 
-    @ViewBuilder
-    private func toolbarItemView(for shortcut: ToolbarShortcutAction) -> some View {
-        if shortcut == .menu {
-            Menu {
-                Button { model.newTab() } label: { Label("새 탭", systemImage: "plus") }
-                Button {
-                    if let active = model.activeTab { model.duplicateTab(active.id) }
-                } label: {
-                    Label("현재 탭 복제 (바로 뒤에 생성)", systemImage: "plus.square.on.square")
-                }
-                Button { model.restoreClosedTab() } label: { Label("닫은 탭 복원", systemImage: "arrow.uturn.backward") }
-                Divider()
-                Button { showLiveCapture = true } label: { Label("실시간 영역 캡처", systemImage: "viewfinder") }
-                Button { showWatermarkRemover = true } label: { Label("워터마크 제거", systemImage: "wand.and.stars") }
-                Button { showBookshelf = true } label: { Label("책장", systemImage: "books.vertical") }
-                Divider()
-                Button { model.toggleBookmark() } label: { Label(model.isCurrentBookmarked ? "북마크 해제" : "북마크에 추가", systemImage: "star") }
-                Button { showBookmarks = true } label: { Label("북마크", systemImage: "book") }
-                Button { showHistory = true } label: { Label("방문 기록", systemImage: "clock") }
-                Button { showDownloads = true } label: { Label("다운로드", systemImage: "arrow.down.circle") }
-                Divider()
-                Button { showPageTools = true } label: { Label("페이지 도구 (배율·차단·찾기)", systemImage: "slider.horizontal.3") }
-                Button { showExtensions = true } label: { Label("확장 기능 · 유저스크립트", systemImage: "puzzlepiece.extension") }
-                Button { showNetworkPrivacy = true } label: { Label("VPN · 보안 DNS", systemImage: "network.badge.shield.half.filled") }
-                Button { showDriveSync = true } label: { Label("동기화", systemImage: "arrow.triangle.2.circlepath.icloud") }
-                Button { showSettings = true } label: { Label("설정", systemImage: "gearshape") }
-                Button { Task { await checkUpdates() } } label: { Label("업데이트 확인", systemImage: "arrow.triangle.2.circlepath") }
-            } label: {
-                Image(systemName: "ellipsis.circle")
-            }
-        } else {
-            Button {
-                triggerToolbarShortcut(shortcut)
-            } label: {
+    private func androidToolbarButton(for shortcut: ToolbarShortcutAction) -> some View {
+        let isDisabled = (shortcut == .back && !model.canGoBack) || (shortcut == .forward && !model.canGoForward)
+        return Button {
+            triggerToolbarShortcut(shortcut)
+        } label: {
+            Group {
                 if shortcut == .tabs {
+                    // Exact Android tab_count_background.xml: 22x22 rounded-5 square with 2pt border + count
                     ZStack {
-                        Image(systemName: "square.on.square")
-                        Text("\(model.visibleTabs.count)")
-                            .font(.system(size: 9, weight: .bold))
-                            .offset(x: 1, y: 1)
+                        RoundedRectangle(cornerRadius: 5, style: .continuous)
+                            .strokeBorder(androidOnSurfaceColor, lineWidth: 1.9)
+                            .frame(width: 22, height: 22)
+                        Text(model.visibleTabs.count > 99 ? ":D" : "\(model.visibleTabs.count)")
+                            .font(.system(size: 11, weight: .bold).monospacedDigit())
+                            .foregroundStyle(androidOnSurfaceColor)
                     }
+                } else if shortcut == .menu {
+                    Image(systemName: "ellipsis")
+                        .font(.system(size: 19, weight: .semibold))
+                        .foregroundStyle(androidOnSurfaceColor)
                 } else {
                     Image(systemName: shortcut.systemImage)
+                        .font(.system(size: 18, weight: .medium))
+                        .foregroundStyle(androidOnSurfaceColor)
                 }
             }
-            .disabled((shortcut == .back && !model.canGoBack) || (shortcut == .forward && !model.canGoForward))
+            .frame(width: 48, height: 46)
+            .contentShape(Rectangle())
+            .opacity(isDisabled ? 0.35 : 1.0)
         }
+        .buttonStyle(.plain)
+        .disabled(isDisabled)
+        .simultaneousGesture(
+            LongPressGesture(minimumDuration: 0.5).onEnded { _ in
+                UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+                showToolbarEditor = true
+            }
+        )
     }
 
     private func triggerToolbarShortcut(_ action: ToolbarShortcutAction) {
@@ -654,25 +931,49 @@ struct BrowserScreen: View {
         case .back: model.back()
         case .forward: model.forward()
         case .home: model.home()
-        case .newTab: _ = model.newTab()
-        case .tabs: showTabs = true
-        case .menu: showSettings = true
-        case .findInPage: showFindBar = true
-        case .contentBlocking: model.toggleContentBlockingForCurrentHost()
-        case .desktopSite: model.toggleDesktopMode()
-        case .extensions: showExtensions = true
-        case .capture: showLiveCapture = true
-        case .watermark: showWatermarkRemover = true
-        case .bookshelf: showBookshelf = true
-        case .vpn: showNetworkPrivacy = true
-        case .history: showHistory = true
-        case .bookmarks: showBookmarks = true
-        case .share, .copyAddress:
+        case .newTab:
+            _ = model.newTab()
+            if model.preferences.showKeyboardOnNewTab { addressFocused = true }
+        case .tabs:
+            model.captureSnapshot(for: model.activeID)
+            showTabs = true
+        case .menu:
+            showBrowserMenu = true
+        case .findInPage:
+            showFindBar = true
+        case .contentBlocking:
+            model.toggleContentBlockingForCurrentHost()
+        case .desktopSite:
+            model.toggleDesktopMode()
+        case .extensions:
+            showExtensions = true
+        case .capture:
+            showCaptureMenu = true
+        case .watermark:
+            showWatermarkRemover = true
+        case .bookshelf:
+            showBookshelf = true
+        case .vpn:
+            showNetworkPrivacy = true
+        case .history:
+            showHistory = true
+        case .bookmarks:
+            showBookmarks = true
+        case .share:
+            if let url = URL(string: model.currentURL), !model.isStartPage {
+                sharePayload = [url]
+            } else {
+                model.status = "공유할 웹페이지가 없습니다."
+            }
+        case .copyAddress:
             UIPasteboard.general.string = model.currentURL
             model.status = "현재 주소를 클립보드에 복사했습니다."
-        case .reopenClosedTab: model.restoreClosedTab()
-        case .closeAllTabs: model.closeAllVisibleTabs()
-        case .settings: showSettings = true
+        case .reopenClosedTab:
+            model.restoreClosedTab()
+        case .closeAllTabs:
+            showCloseAllConfirm = true
+        case .settings:
+            showSettings = true
         }
     }
 
@@ -795,6 +1096,40 @@ struct PageToolsSheet: View {
                     .buttonStyle(.bordered)
                 }
 
+                // 4. Media PiP & Seek Controls (Android BrowserMediaController Parity!)
+                HStack(spacing: 8) {
+                    let secs = model.preferences.pipSeekSeconds
+                    Button {
+                        model.seekActiveMedia(by: -secs)
+                    } label: {
+                        Label("-\(secs)초", systemImage: "gobackward")
+                            .font(.caption.weight(.semibold))
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 9)
+                            .background(Color(red: 0.16, green: 0.16, blue: 0.19), in: RoundedRectangle(cornerRadius: 12))
+                    }
+                    Button {
+                        model.enterActiveVideoPiP()
+                        dismiss()
+                    } label: {
+                        Label("PiP 전환", systemImage: "pip.enter")
+                            .font(.caption.weight(.semibold))
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 9)
+                            .background(Color(red: 0.16, green: 0.16, blue: 0.19), in: RoundedRectangle(cornerRadius: 12))
+                    }
+                    Button {
+                        model.seekActiveMedia(by: secs)
+                    } label: {
+                        Label("+\(secs)초", systemImage: "goforward")
+                            .font(.caption.weight(.semibold))
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 9)
+                            .background(Color(red: 0.16, green: 0.16, blue: 0.19), in: RoundedRectangle(cornerRadius: 12))
+                    }
+                }
+                .buttonStyle(.plain)
+
                 Spacer()
             }
             .padding(16)
@@ -833,16 +1168,25 @@ struct PageToolsSheet: View {
     }
 }
 
-// MARK: - Tab Overview (Respects Grid Columns 1..10, Aspect Ratio 1:1/3:4/16:9, Tabs From Bottom, Drag Auto-Scroll, Duplicate After Source!)
+// MARK: - Android-Exact Tab Overview (Top Profile Pill, Inline Search, Multi-Select Batch Move/Close, Bottom Group Pill Left/Right Swipe!)
 
 struct TabOverview: View {
     @EnvironmentObject private var model: BrowserModel
     @Environment(\.dismiss) private var dismiss
+    @State private var searchMode = false
     @State private var searchQuery = ""
+    @State private var selectionMode = false
+    @State private var selectedTabIDs: Set<UUID> = []
     @State private var useGridLayout = true
     @State private var newGroupName = ""
     @State private var showingNewGroup = false
+    @State private var showingGroupManager = false
+    @State private var showingBatchMove = false
+    @State private var batchMoveIDs: Set<UUID> = []
+    @State private var showingCloseAllConfirm = false
     @State private var draggingTabID: UUID? = nil
+    @State private var groupPillSwipeOffset: CGFloat = 0
+    @FocusState private var searchFieldFocused: Bool
 
     private var filteredTabs: [BrowserTab] {
         let q = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -852,114 +1196,226 @@ struct TabOverview: View {
         return model.preferences.tabsStartFromBottom ? Array(base.reversed()) : base
     }
 
+    private var overviewBg: Color { Color(red: 0.125, green: 0.149, blue: 0.176) }
+    private var overviewControlBg: Color { Color(red: 0.192, green: 0.220, blue: 0.251) }
+    private var overviewOnSurface: Color { Color(red: 0.945, green: 0.910, blue: 0.894) }
+
     var body: some View {
-        NavigationStack {
-            VStack(spacing: 0) {
-                groupAndSearchHeader
-                if useGridLayout { gridTabBody } else { listTabBody }
-                bottomOverviewBar
+        VStack(spacing: 0) {
+            androidOverviewTopBar
+            if useGridLayout { gridTabBody } else { listTabBody }
+            androidOverviewBottomBar
+        }
+        .background(overviewBg.ignoresSafeArea())
+        .alert("새 탭 그룹", isPresented: $showingNewGroup) {
+            TextField("그룹 이름", text: $newGroupName)
+            Button("만들기") { model.addGroup(newGroupName); newGroupName = "" }
+            Button("취소", role: .cancel) { newGroupName = "" }
+        }
+        .sheet(isPresented: $showingGroupManager) {
+            TabGroupManagerSheet(model: model)
+        }
+        .sheet(isPresented: $showingBatchMove) {
+            TabBatchMoveSheet(model: model, tabIDs: batchMoveIDs) {
+                selectedTabIDs.removeAll()
+                selectionMode = false
             }
-            .background(Color(red: 0.07, green: 0.07, blue: 0.08))
-            .navigationTitle("탭 (\(model.visibleTabs.count))")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .topBarLeading) {
-                    Button { useGridLayout.toggle() } label: {
-                        Image(systemName: useGridLayout ? "list.bullet" : "square.grid.2x2")
-                    }
-                }
-                ToolbarItemGroup(placement: .topBarTrailing) {
-                    Button {
-                        withAnimation(.spring(response: 0.28, dampingFraction: 0.82)) {
-                            _ = model.newTab()
-                        }
-                        dismiss()
-                    } label: {
-                        Image(systemName: "plus")
-                    }
-                    Button("완료") { dismiss() }.fontWeight(.semibold)
-                }
-            }
-            .alert("새 탭 그룹", isPresented: $showingNewGroup) {
-                TextField("그룹 이름", text: $newGroupName)
-                Button("만들기") { model.addGroup(newGroupName); newGroupName = "" }
-                Button("취소", role: .cancel) { newGroupName = "" }
+        }
+        .sheet(isPresented: $showingCloseAllConfirm) {
+            CloseAllTabsCountdownSheet(tabCount: model.visibleTabs.count) {
+                model.closeAllVisibleTabs()
+                dismiss()
             }
         }
     }
 
-    private var groupAndSearchHeader: some View {
-        VStack(spacing: 8) {
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 8) {
+    // Top Bar: [⋯ Actions] — [Profile Pill / Selected Count] — [🔍 Search / ✓ Select All] + Inline Search Overlay
+    private var androidOverviewTopBar: some View {
+        ZStack {
+            HStack(spacing: 8) {
+                Menu {
+                    if selectionMode {
+                        Button {
+                            selectedTabIDs = Set(model.visibleTabs.map(\.id))
+                        } label: {
+                            Label("전체 선택", systemImage: "checkmark.circle")
+                        }
+                        Button {
+                            guard !selectedTabIDs.isEmpty else { return }
+                            batchMoveIDs = selectedTabIDs
+                            showingBatchMove = true
+                        } label: {
+                            Label("선택한 탭 이동 (\(selectedTabIDs.count))", systemImage: "folder.badge.gearshape")
+                        }
+                        .disabled(selectedTabIDs.isEmpty)
+                        Button(role: .destructive) {
+                            let toClose = selectedTabIDs
+                            selectedTabIDs.removeAll()
+                            selectionMode = false
+                            withAnimation(.spring(response: 0.28, dampingFraction: 0.82)) {
+                                model.closeTabs(toClose)
+                            }
+                        } label: {
+                            Label("선택한 탭 닫기 (\(selectedTabIDs.count))", systemImage: "trash")
+                        }
+                        .disabled(selectedTabIDs.isEmpty)
+                    } else {
+                        Button {
+                            selectionMode = true
+                            selectedTabIDs.removeAll()
+                        } label: {
+                            Label("탭 선택", systemImage: "checkmark.circle")
+                        }
+                        Button {
+                            useGridLayout.toggle()
+                        } label: {
+                            Label(useGridLayout ? "리스트 보기로 전환" : "그리드 보기로 전환", systemImage: useGridLayout ? "list.bullet" : "square.grid.2x2")
+                        }
+                        Button {
+                            showingNewGroup = true
+                        } label: {
+                            Label("새 탭 그룹 만들기", systemImage: "folder.badge.plus")
+                        }
+                        Button {
+                            showingGroupManager = true
+                        } label: {
+                            Label("탭 그룹 관리", systemImage: "rectangle.3.group")
+                        }
+                        Divider()
+                        Button {
+                            withAnimation(.spring(response: 0.28, dampingFraction: 0.82)) {
+                                model.restoreClosedTab()
+                            }
+                        } label: {
+                            Label("닫은 탭 복원 (\(model.closedTabs.count))", systemImage: "arrow.uturn.backward")
+                        }
+                        .disabled(model.closedTabs.isEmpty)
+                        Button(role: .destructive) {
+                            showingCloseAllConfirm = true
+                        } label: {
+                            Label("모든 탭 닫기", systemImage: "trash")
+                        }
+                    }
+                } label: {
+                    Image(systemName: "ellipsis")
+                        .font(.system(size: 18, weight: .semibold))
+                        .foregroundStyle(overviewOnSurface)
+                        .frame(width: 44, height: 44)
+                        .background(overviewControlBg, in: Circle())
+                }
+
+                Spacer()
+
+                if selectionMode {
+                    Text("\(selectedTabIDs.count)개 선택됨")
+                        .font(.subheadline.weight(.bold))
+                        .foregroundStyle(overviewOnSurface)
+                        .padding(.horizontal, 18)
+                        .frame(height: 42)
+                        .background(overviewControlBg, in: Capsule())
+                } else {
                     Menu {
                         ForEach(model.profiles) { profile in
-                            Button { model.selectProfile(profile.id) } label: {
+                            Button {
+                                withAnimation(.easeInOut(duration: 0.18)) {
+                                    model.selectProfile(profile.id)
+                                }
+                            } label: {
                                 Label(profile.name, systemImage: profile.icon)
                             }
                         }
                     } label: {
-                        HStack(spacing: 4) {
+                        HStack(spacing: 6) {
                             Image(systemName: model.activeProfile.icon)
                                 .foregroundStyle(Color(hex: model.activeProfile.colorHex))
                             Text(model.activeProfile.name)
-                            Image(systemName: "chevron.down").font(.caption2)
+                                .font(.subheadline.weight(.bold))
+                                .foregroundStyle(overviewOnSurface)
+                            Image(systemName: "chevron.down")
+                                .font(.caption2.weight(.bold))
+                                .foregroundStyle(overviewOnSurface.opacity(0.75))
                         }
-                        .font(.caption.weight(.bold))
-                        .padding(.horizontal, 11)
-                        .padding(.vertical, 7)
-                        .background(Color(red: 0.19, green: 0.19, blue: 0.22), in: Capsule())
+                        .padding(.horizontal, 18)
+                        .frame(height: 42)
+                        .background(overviewControlBg, in: Capsule())
                     }
+                }
 
-                    groupChip(title: "비공개", id: BrowserModel.privateGroupID, icon: "hand.raised.fill")
-                    ForEach(model.profileGroups) { group in
-                        groupChip(title: group.name, id: group.id, icon: "folder")
+                Spacer()
+
+                Button {
+                    if selectionMode {
+                        if selectedTabIDs.count == model.visibleTabs.count {
+                            selectedTabIDs.removeAll()
+                        } else {
+                            selectedTabIDs = Set(model.visibleTabs.map(\.id))
+                        }
+                    } else {
+                        withAnimation(.easeInOut(duration: 0.18)) {
+                            searchMode = true
+                        }
+                        searchFieldFocused = true
                     }
-                    Button { showingNewGroup = true } label: {
-                        Label("그룹", systemImage: "plus")
-                            .font(.caption.weight(.semibold))
-                            .padding(.horizontal, 10)
-                            .padding(.vertical, 7)
-                            .background(Color(red: 0.16, green: 0.16, blue: 0.18), in: Capsule())
+                } label: {
+                    Image(systemName: selectionMode ? "checkmark" : "magnifyingglass")
+                        .font(.system(size: 17, weight: .semibold))
+                        .foregroundStyle(overviewOnSurface)
+                        .frame(width: 44, height: 44)
+                        .background(overviewControlBg, in: Circle())
+                }
+                .buttonStyle(.plain)
+            }
+            .opacity(searchMode && !selectionMode ? 0 : 1)
+
+            if searchMode && !selectionMode {
+                HStack(spacing: 8) {
+                    Button {
+                        withAnimation(.easeInOut(duration: 0.18)) {
+                            searchMode = false
+                            searchQuery = ""
+                            searchFieldFocused = false
+                        }
+                    } label: {
+                        Image(systemName: "chevron.left")
+                            .font(.system(size: 17, weight: .semibold))
+                            .foregroundStyle(overviewOnSurface)
+                            .frame(width: 44, height: 44)
+                            .background(overviewControlBg, in: Circle())
+                    }
+                    .buttonStyle(.plain)
+
+                    TextField("탭 제목 또는 주소 검색", text: $searchQuery)
+                        .font(.subheadline)
+                        .foregroundStyle(overviewOnSurface)
+                        .focused($searchFieldFocused)
+                        .padding(.horizontal, 16)
+                        .frame(height: 42)
+                        .background(overviewControlBg, in: Capsule())
+
+                    Button {
+                        if !searchQuery.isEmpty {
+                            searchQuery = ""
+                        } else {
+                            withAnimation(.easeInOut(duration: 0.18)) {
+                                searchMode = false
+                                searchFieldFocused = false
+                            }
+                        }
+                    } label: {
+                        Image(systemName: "xmark")
+                            .font(.system(size: 16, weight: .semibold))
+                            .foregroundStyle(overviewOnSurface)
+                            .frame(width: 44, height: 44)
+                            .background(overviewControlBg, in: Circle())
                     }
                     .buttonStyle(.plain)
                 }
-                .padding(.horizontal, 12)
+                .transition(.opacity)
             }
-
-            HStack(spacing: 8) {
-                Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
-                TextField("탭 제목 또는 주소 검색", text: $searchQuery).font(.subheadline)
-                if !searchQuery.isEmpty {
-                    Button { searchQuery = "" } label: {
-                        Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary)
-                    }
-                }
-            }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 7)
-            .background(Color(red: 0.14, green: 0.14, blue: 0.16), in: RoundedRectangle(cornerRadius: 10))
-            .padding(.horizontal, 12)
         }
-        .padding(.vertical, 8)
-        .background(Color(red: 0.10, green: 0.10, blue: 0.12))
-    }
-
-    private func groupChip(title: String, id: UUID, icon: String) -> some View {
-        let active = model.activeGroupID == id
-        return Button {
-            withAnimation(.easeInOut(duration: 0.18)) { model.selectGroup(id) }
-        } label: {
-            HStack(spacing: 4) {
-                Image(systemName: icon).font(.caption2)
-                Text(title).font(.caption.weight(.semibold))
-            }
-            .foregroundStyle(active ? .white : .primary)
-            .padding(.horizontal, 12)
-            .padding(.vertical, 7)
-            .background(active ? Color.blue : Color(red: 0.16, green: 0.16, blue: 0.18), in: Capsule())
-        }
-        .buttonStyle(.plain)
+        .padding(.horizontal, 12)
+        .padding(.top, 12)
+        .padding(.bottom, 8)
     }
 
     private var gridTabBody: some View {
@@ -970,18 +1426,32 @@ struct TabOverview: View {
             let thumbHeight = min(280, max(64, cellWidth * ratio))
             ScrollViewReader { proxy in
                 ScrollView {
-                    LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 10), count: colCount), spacing: 10) {
-                        ForEach(filteredTabs) { tab in
-                            tabGridCard(tab: tab, thumbHeight: thumbHeight, outerGeo: outerGeo, scrollProxy: proxy)
-                                .id(tab.id)
-                                .transition(.asymmetric(
-                                    insertion: .scale(scale: 0.92).combined(with: .opacity),
-                                    removal: .scale(scale: 0.78).combined(with: .opacity)
-                                ))
+                    if filteredTabs.isEmpty {
+                        Text(searchQuery.isEmpty ? "열려 있는 탭이 없습니다." : "일치하는 탭이 없습니다.")
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                            .frame(maxWidth: .infinity)
+                            .padding(.top, 80)
+                    } else {
+                        VStack {
+                            if model.preferences.tabsStartFromBottom {
+                                Spacer(minLength: 0)
+                            }
+                            LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 10), count: colCount), spacing: 10) {
+                                ForEach(filteredTabs) { tab in
+                                    tabGridCard(tab: tab, thumbHeight: thumbHeight, outerGeo: outerGeo, scrollProxy: proxy)
+                                        .id(tab.id)
+                                        .transition(.asymmetric(
+                                            insertion: .scale(scale: 0.92).combined(with: .opacity),
+                                            removal: .scale(scale: 0.78).combined(with: .opacity)
+                                        ))
+                                }
+                            }
+                            .padding(10)
+                            .animation(.spring(response: 0.28, dampingFraction: 0.82), value: model.tabs.map(\.id))
                         }
+                        .frame(minHeight: outerGeo.size.height)
                     }
-                    .padding(10)
-                    .animation(.spring(response: 0.28, dampingFraction: 0.82), value: model.tabs.map(\.id))
                 }
             }
         }
@@ -989,30 +1459,39 @@ struct TabOverview: View {
 
     private func tabGridCard(tab: BrowserTab, thumbHeight: CGFloat, outerGeo: GeometryProxy, scrollProxy: ScrollViewProxy) -> some View {
         let isActive = tab.id == model.activeID
+        let isSelected = selectedTabIDs.contains(tab.id)
         return VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 4) {
-                Circle()
-                    .fill(isActive ? Color.blue : Color.secondary.opacity(0.5))
-                    .frame(width: 7, height: 7)
-                Text(tab.title).font(.caption2.weight(.semibold)).lineLimit(1)
-                Spacer(minLength: 2)
-                Button {
-                    withAnimation(.spring(response: 0.28, dampingFraction: 0.82)) {
-                        model.close(tab.id)
-                    }
-                } label: {
-                    Image(systemName: "xmark.circle.fill")
+                if selectionMode {
+                    Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
                         .font(.caption)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(isSelected ? Color.blue : Color.secondary)
+                } else {
+                    Circle()
+                        .fill(isActive ? Color(red: 0.545, green: 0.671, blue: 1.0) : Color.secondary.opacity(0.5))
+                        .frame(width: 7, height: 7)
                 }
-                .buttonStyle(.plain)
+                Text(tab.title).font(.caption2.weight(.semibold)).foregroundStyle(overviewOnSurface).lineLimit(1)
+                Spacer(minLength: 2)
+                if !selectionMode {
+                    Button {
+                        withAnimation(.spring(response: 0.28, dampingFraction: 0.82)) {
+                            model.close(tab.id)
+                        }
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                }
             }
             .padding(.horizontal, 8)
             .padding(.vertical, 6)
-            .background(Color(red: 0.16, green: 0.16, blue: 0.19))
+            .background(Color(red: 0.16, green: 0.18, blue: 0.21))
 
             ZStack {
-                Color(red: 0.12, green: 0.12, blue: 0.14)
+                Color(red: 0.11, green: 0.13, blue: 0.15)
                 if let snap = model.tabSnapshots[tab.id] {
                     Image(uiImage: snap)
                         .resizable()
@@ -1034,16 +1513,29 @@ struct TabOverview: View {
                 }
             }
         }
-        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
         .overlay(
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .strokeBorder(isActive ? Color.blue : Color.white.opacity(0.10), lineWidth: isActive ? 2 : 1)
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .strokeBorder(
+                    (selectionMode && isSelected) ? Color.blue : (isActive ? Color(red: 0.545, green: 0.671, blue: 1.0) : Color.white.opacity(0.10)),
+                    lineWidth: (isActive || (selectionMode && isSelected)) ? 2 : 1
+                )
         )
         .onTapGesture {
-            model.select(tab.id)
-            dismiss()
+            if selectionMode {
+                if !selectedTabIDs.insert(tab.id).inserted {
+                    selectedTabIDs.remove(tab.id)
+                }
+            } else {
+                model.select(tab.id)
+                dismiss()
+            }
         }
         .contextMenu {
+            Button {
+                UIPasteboard.general.string = tab.url
+                model.status = "탭 링크를 복사했습니다."
+            } label: { Label("링크 복사", systemImage: "doc.on.doc") }
             Button {
                 withAnimation(.spring(response: 0.28, dampingFraction: 0.82)) {
                     model.duplicateTab(tab.id)
@@ -1051,7 +1543,18 @@ struct TabOverview: View {
             } label: {
                 Label("탭 복제 (바로 뒤에 생성)", systemImage: "plus.square.on.square")
             }
-            Button { UIPasteboard.general.string = tab.url } label: { Label("링크 복사", systemImage: "doc.on.doc") }
+            Button {
+                selectionMode = true
+                selectedTabIDs.insert(tab.id)
+            } label: {
+                Label("탭 선택", systemImage: "checkmark.circle")
+            }
+            Button {
+                batchMoveIDs = [tab.id]
+                showingBatchMove = true
+            } label: {
+                Label("다른 그룹·프로필로 이동", systemImage: "folder.badge.gearshape")
+            }
             Divider()
             Button(role: .destructive) {
                 withAnimation(.spring(response: 0.28, dampingFraction: 0.82)) { model.close(tab.id) }
@@ -1064,6 +1567,7 @@ struct TabOverview: View {
             LongPressGesture(minimumDuration: 0.35)
                 .sequenced(before: DragGesture(coordinateSpace: .global))
                 .onChanged { value in
+                    guard !selectionMode && !searchMode else { return }
                     if case let .second(true, drag?) = value {
                         draggingTabID = tab.id
                         let y = drag.location.y
@@ -1092,51 +1596,153 @@ struct TabOverview: View {
         List {
             ForEach(filteredTabs) { tab in
                 HStack(spacing: 10) {
-                    Circle()
-                        .fill(tab.id == model.activeID ? Color.blue : Color.secondary.opacity(0.4))
-                        .frame(width: 8, height: 8)
+                    if selectionMode {
+                        Image(systemName: selectedTabIDs.contains(tab.id) ? "checkmark.circle.fill" : "circle")
+                            .foregroundStyle(selectedTabIDs.contains(tab.id) ? .blue : .secondary)
+                    } else {
+                        Circle()
+                            .fill(tab.id == model.activeID ? Color.blue : Color.secondary.opacity(0.4))
+                            .frame(width: 8, height: 8)
+                    }
                     VStack(alignment: .leading, spacing: 2) {
                         Text(tab.title).font(.subheadline.weight(.semibold)).lineLimit(1)
                         Text(tab.url).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
                     }
                     Spacer()
-                    Button {
-                        withAnimation(.spring(response: 0.28, dampingFraction: 0.82)) { model.duplicateTab(tab.id) }
-                    } label: { Image(systemName: "plus.square.on.square").foregroundStyle(.secondary) }
-                    .buttonStyle(.plain)
-                    Button {
-                        withAnimation(.spring(response: 0.28, dampingFraction: 0.82)) { model.close(tab.id) }
-                    } label: { Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary) }
-                    .buttonStyle(.plain)
+                    if !selectionMode {
+                        Button {
+                            withAnimation(.spring(response: 0.28, dampingFraction: 0.82)) { model.duplicateTab(tab.id) }
+                        } label: { Image(systemName: "plus.square.on.square").foregroundStyle(.secondary) }
+                        .buttonStyle(.plain)
+                        Button {
+                            withAnimation(.spring(response: 0.28, dampingFraction: 0.82)) { model.close(tab.id) }
+                        } label: { Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary) }
+                        .buttonStyle(.plain)
+                    }
                 }
                 .contentShape(Rectangle())
-                .onTapGesture { model.select(tab.id); dismiss() }
+                .onTapGesture {
+                    if selectionMode {
+                        if !selectedTabIDs.insert(tab.id).inserted { selectedTabIDs.remove(tab.id) }
+                    } else {
+                        model.select(tab.id)
+                        dismiss()
+                    }
+                }
             }
             .onMove(perform: model.reorder)
         }
         .listStyle(.plain)
-        .environment(\.editMode, .constant(.active))
+        .scrollContentBackground(.hidden)
+        .environment(\.editMode, .constant(selectionMode ? .inactive : .active))
     }
 
-    private var bottomOverviewBar: some View {
+    // Bottom Bar (Exact Android showTabSwitcher): [＋ New Tab] — [Group · N개 (Swipe Left/Right!)] — [✓ Done]
+    private var androidOverviewBottomBar: some View {
         HStack {
-            Button {
-                withAnimation(.spring(response: 0.28, dampingFraction: 0.82)) { model.restoreClosedTab() }
-            } label: {
-                Label("닫은 탭 복원 (\(model.closedTabs.count))", systemImage: "arrow.uturn.backward")
-                    .font(.caption.weight(.semibold))
+            if selectionMode {
+                Button {
+                    guard !selectedTabIDs.isEmpty else { return }
+                    batchMoveIDs = selectedTabIDs
+                    showingBatchMove = true
+                } label: {
+                    Image(systemName: "folder.badge.gearshape")
+                        .font(.system(size: 18, weight: .semibold))
+                        .foregroundStyle(overviewOnSurface)
+                        .frame(width: 48, height: 48)
+                        .background(overviewControlBg, in: Circle())
+                }
+                .buttonStyle(.plain)
+                .disabled(selectedTabIDs.isEmpty)
+            } else {
+                Button {
+                    withAnimation(.spring(response: 0.28, dampingFraction: 0.82)) {
+                        _ = model.newTab()
+                    }
+                    dismiss()
+                } label: {
+                    Image(systemName: "plus")
+                        .font(.system(size: 20, weight: .semibold))
+                        .foregroundStyle(overviewOnSurface)
+                        .frame(width: 48, height: 48)
+                        .background(overviewControlBg, in: Circle())
+                }
+                .buttonStyle(.plain)
             }
-            .disabled(model.closedTabs.isEmpty)
+
             Spacer()
-            Button(role: .destructive) {
-                withAnimation(.spring(response: 0.28, dampingFraction: 0.82)) { model.closeAllVisibleTabs() }
+
+            // Center Group Pill — Tap opens TabGroupManagerSheet; Swipe Left/Right switches Private <-> Default <-> Custom Groups!
+            Button {
+                if !selectionMode && !searchMode {
+                    showingGroupManager = true
+                }
             } label: {
-                Label("모두 닫기", systemImage: "trash").font(.caption.weight(.semibold))
+                HStack(spacing: 6) {
+                    if model.activeGroupID == BrowserModel.privateGroupID {
+                        Image(systemName: "hand.raised.fill")
+                            .font(.caption)
+                            .foregroundStyle(.purple)
+                    }
+                    Text(selectionMode
+                        ? "\(selectedTabIDs.count)개 선택됨"
+                        : "\(model.activeGroupDisplayName) · \(filteredTabs.count)개")
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(overviewOnSurface)
+                }
+                .padding(.horizontal, 18)
+                .frame(height: 44)
+                .background(overviewControlBg, in: Capsule())
+                .offset(x: groupPillSwipeOffset)
             }
+            .buttonStyle(.plain)
+            .simultaneousGesture(
+                DragGesture(minimumDistance: 16)
+                    .onChanged { value in
+                        guard !selectionMode && !searchMode else { return }
+                        if abs(value.translation.width) > abs(value.translation.height) {
+                            groupPillSwipeOffset = max(-24, min(24, value.translation.width * 0.32))
+                        }
+                    }
+                    .onEnded { value in
+                        guard !selectionMode && !searchMode else {
+                            groupPillSwipeOffset = 0
+                            return
+                        }
+                        let dx = value.translation.width
+                        let dy = value.translation.height
+                        withAnimation(.spring(response: 0.24, dampingFraction: 0.82)) {
+                            groupPillSwipeOffset = 0
+                            if abs(dx) >= 40 && abs(dx) > abs(dy) * 1.2 {
+                                let direction = dx < 0 ? 1 : -1
+                                if model.switchWorkspaceGroup(direction: direction) {
+                                    UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                                }
+                            }
+                        }
+                    }
+            )
+
+            Spacer()
+
+            Button {
+                if selectionMode {
+                    selectionMode = false
+                    selectedTabIDs.removeAll()
+                } else {
+                    dismiss()
+                }
+            } label: {
+                Image(systemName: "checkmark")
+                    .font(.system(size: 18, weight: .bold))
+                    .foregroundStyle(.white)
+                    .frame(width: 48, height: 48)
+                    .background(Color(red: 0.35, green: 0.56, blue: 0.96), in: Circle())
+            }
+            .buttonStyle(.plain)
         }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 12)
-        .background(Color(red: 0.11, green: 0.11, blue: 0.13))
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
     }
 }
 

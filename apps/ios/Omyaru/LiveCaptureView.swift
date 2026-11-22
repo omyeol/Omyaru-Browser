@@ -555,6 +555,7 @@ struct CaptureFolderPickerSheet: View {
     @Environment(\.dismiss) private var dismiss
     @ObservedObject var shelf: ShelfModel
     @Binding var selectedFolder: String
+    var onConfirm: ((String) -> Void)? = nil
     @State private var pendingFolder: String = ""
     @State private var showNewFolder = false
     @State private var newFolderName = ""
@@ -585,6 +586,7 @@ struct CaptureFolderPickerSheet: View {
 
                         Button("선택") {
                             selectedFolder = folder
+                            onConfirm?(folder)
                             dismiss()
                         }
                         .buttonStyle(.borderedProminent)
@@ -605,8 +607,10 @@ struct CaptureFolderPickerSheet: View {
                     .buttonStyle(.bordered)
 
                     Button {
-                        if !pendingFolder.isEmpty {
-                            selectedFolder = pendingFolder
+                        let chosen = pendingFolder.isEmpty ? selectedFolder : pendingFolder
+                        if !chosen.isEmpty {
+                            selectedFolder = chosen
+                            onConfirm?(chosen)
                         }
                         dismiss()
                     } label: {
@@ -630,7 +634,11 @@ struct CaptureFolderPickerSheet: View {
                 }
                 ToolbarItem(placement: .confirmationAction) {
                     Button("확인") {
-                        if !pendingFolder.isEmpty { selectedFolder = pendingFolder }
+                        let chosen = pendingFolder.isEmpty ? selectedFolder : pendingFolder
+                        if !chosen.isEmpty {
+                            selectedFolder = chosen
+                            onConfirm?(chosen)
+                        }
                         dismiss()
                     }
                 }

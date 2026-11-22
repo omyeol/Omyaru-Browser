@@ -57,12 +57,13 @@ def main() -> None:
                 "buildVersion": build_version,
                 "date": date.today().isoformat(),
                 "localizedDescription": (
-                    f"v{version} (build {build_version}): Full Android v{version} parity — "
-                    "top/bottom address bar, Liquid Glass UI, Page Tools, 20 customizable toolbar shortcuts, "
-                    "tab overview grid (1~10 cols & aspect ratios), hierarchical bookmarks & date-grouped history, "
-                    "download confirmation to Bookshelf, incremental scroll-stitch capture, dual-mode watermark remover, "
-                    "bookshelf multi-select & storage manager, PIN/Password/Face ID app lock with black shield, "
-                    "DoH DNS & WireGuard manager, and full chunked Google Drive E2EE sync with sync tab reset."
+                    f"v{version} (build {build_version}): Exact Android floating bottom/top Liquid Glass URL island "
+                    "(2-row address + scrollable 20-shortcut nav bar, compact translucent scroll-collapse pill, long-press toolbar editor, "
+                    "profile-isolated URL suggestions, bookmark editor), right-edge FastScrollBar scrubber, web element long-press context menu "
+                    "(save image to Bookshelf, open in background tab, share), Android-exact Tab Overview (multi-select batch move/close, "
+                    "bottom group pill left/right swipe, group manager), webpage error panel, highlight Find in Page, media PiP & seek controls, "
+                    "5-second close-all safety countdown, live scroll-stitch capture, dual-mode watermark remover, hierarchical bookshelf, "
+                    "and full chunked Google Drive E2EE sync."
                 ),
                 "downloadURL": download_url,
                 "size": ipa.stat().st_size,

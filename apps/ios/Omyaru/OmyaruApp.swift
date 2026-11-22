@@ -2,6 +2,7 @@ import SwiftUI
 import WebKit
 import UniformTypeIdentifiers
 import UIKit
+import AVFoundation
 
 @main
 struct OmyaruApp: App {
@@ -111,6 +112,40 @@ struct PendingDownloadPrompt: Identifiable {
     let mimeType: String
     let isImage: Bool
     let tempFileURL: URL
+}
+
+struct UrlSuggestionRecord: Codable, Hashable {
+    var url: String
+    var title: String
+    var visits: Int
+    var lastVisit: Double
+}
+
+struct WebContextElement: Identifiable {
+    enum Kind: String {
+        case image
+        case video
+        case link
+    }
+    let id = UUID()
+    let kind: Kind
+    let mediaURL: String?
+    let linkURL: String?
+    let title: String
+}
+
+private final class WeakScriptMessageHandler: NSObject, WKScriptMessageHandler {
+    weak var owner: BrowserModel?
+    init(owner: BrowserModel) {
+        self.owner = owner
+    }
+    func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+        let name = message.name
+        let body = message.body
+        Task { @MainActor [weak owner] in
+            owner?.handleScriptMessage(name: name, body: body)
+        }
+    }
 }
 
 // MARK: - Settings Enums (Exact Android BrowserSettings.kt Parity)
@@ -339,7 +374,7 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
     static let defaultProfileID = UUID(uuidString: "00000000-0000-0000-0000-000000000010")!
     static let defaultGroupID = UUID(uuidString: "00000000-0000-0000-0000-000000000002")!
     static let appVersionName = "0.15.18"
-    static let appBuildNumber = 76
+    static let appBuildNumber = 77
 
     @Published var profiles: [BrowserProfile]
     @Published var groups: [BrowserGroup]
@@ -361,19 +396,40 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
     @Published var estimatedProgress: Double = 0.0
     @Published var isLoading: Bool = false
     @Published var isChromeCollapsed: Bool = false
+    @Published var failedLoadURL: String? = nil
+    @Published var failedLoadMessage: String? = nil
+    @Published var scrollFraction: Double = 0.0
+    @Published var scrollViewportRatio: Double = 1.0
+    @Published var isScrollable: Bool = false
+    @Published var lastScrollActivity: Date = .distantPast
+    @Published var activeContextElement: WebContextElement? = nil
     @Published var findQuery: String = ""
     @Published var findMatchCount: Int = 0
     @Published var findCurrentIndex: Int = 0
-    @Published var status: String = ""
+    @Published var status: String = "" {
+        didSet {
+            guard !status.isEmpty else { return }
+            statusDismissTask?.cancel()
+            statusDismissTask = Task { @MainActor [weak self] in
+                try? await Task.sleep(nanoseconds: 2_800_000_000)
+                guard !Task.isCancelled else { return }
+                self?.status = ""
+            }
+        }
+    }
 
     private var webViews: [UUID: WKWebView] = [:]
     private var loadedTabIDs: Set<UUID> = []
     private var compiledContentRuleList: WKContentRuleList? = nil
     private var lastScrollOffsetY: CGFloat = 0
+    private var toolbarScrollAccumulator: CGFloat = 0
+    private var visitRecordsByProfile: [UUID: [UrlSuggestionRecord]] = [:]
     private var activeDownloadTempInfo: (url: URL, suggestedName: String, mimeType: String)? = nil
+    private var statusDismissTask: Task<Void, Never>? = nil
 
     private static let stateKey = "omyaru.ios.browser.v3"
     private static let prefsKey = "omyaru.ios.preferences.v3"
+    private static let visitsKey = "omyaru.ios.url_suggestions.v1"
 
     private struct PersistedState: Codable {
         var profiles: [BrowserProfile]
@@ -441,9 +497,28 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
             blockedTrackerCount = 0
         }
         super.init()
+        if let vData = UserDefaults.standard.data(forKey: Self.visitsKey),
+           let decodedVisits = try? JSONDecoder().decode([String: [UrlSuggestionRecord]].self, from: vData) {
+            var map: [UUID: [UrlSuggestionRecord]] = [:]
+            for (k, v) in decodedVisits {
+                if let uuid = UUID(uuidString: k) { map[uuid] = v }
+            }
+            visitRecordsByProfile = map
+        }
+        configureAudioSession()
         refreshDownloadsList()
         loadPersistedSnapshotsAsync()
         compileTrackerBlockerRules()
+    }
+
+    func configureAudioSession() {
+        let session = AVAudioSession.sharedInstance()
+        if preferences.backgroundAudio {
+            try? session.setCategory(.playback, mode: .default, options: [.mixWithOthers])
+            try? session.setActive(true)
+        } else {
+            try? session.setCategory(.ambient, mode: .default, options: [.mixWithOthers])
+        }
     }
 
     // MARK: - Computed Properties
@@ -469,6 +544,27 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
 
     var profileGroups: [BrowserGroup] {
         groups.filter { $0.profileID == activeProfileID }
+    }
+
+    var workspaceGroupIDs: [UUID] {
+        [Self.privateGroupID] + profileGroups.map(\.id)
+    }
+
+    var activeGroupDisplayName: String {
+        if activeGroupID == Self.privateGroupID { return "비공개" }
+        if let g = groups.first(where: { $0.id == activeGroupID }) {
+            return g.name == "기본" ? activeProfile.name : g.name
+        }
+        return activeProfile.name
+    }
+
+    var collapsedPillTitle: String {
+        if let t = activeTab?.title.trimmingCharacters(in: .whitespacesAndNewlines),
+           !t.isEmpty, t != "새 탭" {
+            return t
+        }
+        let host = URL(string: currentURL)?.host?.replacingOccurrences(of: "^www\\.", with: "", options: .regularExpression)
+        return host ?? currentURL
     }
 
     var visibleTabs: [BrowserTab] {
@@ -510,6 +606,7 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
         if let data = try? JSONEncoder().encode(preferences) {
             UserDefaults.standard.set(data, forKey: Self.prefsKey)
         }
+        updateAllWebViewContentInsets()
     }
 
     func resetAllPreferences() {
@@ -616,6 +713,7 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
         config.preferences.javaScriptCanOpenWindowsAutomatically = !preferences.blockPopups
 
         let controller = WKUserContentController()
+        controller.add(WeakScriptMessageHandler(owner: self), name: "omyaruContext")
         let host = URL(string: tab?.url ?? "")?.host?.lowercased() ?? ""
         let blockingEnabled = preferences.trackingProtection != .off && !preferences.contentBlockingExceptions.contains(host)
         if blockingEnabled, let ruleList = compiledContentRuleList {
@@ -629,8 +727,10 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
         view.navigationDelegate = self
         view.uiDelegate = self
         view.scrollView.delegate = self
+        view.scrollView.showsVerticalScrollIndicator = false
         view.isOpaque = false
-        view.backgroundColor = UIColor(red: 0.07, green: 0.07, blue: 0.08, alpha: 1.0)
+        view.backgroundColor = UIColor(red: 0.09, green: 0.075, blue: 0.067, alpha: 1.0)
+        applyContentInsets(to: view)
         if tab?.isDesktopMode == true || preferences.desktopModeDefault {
             view.customUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15"
         }
@@ -647,7 +747,31 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
         return view
     }
 
+    func applyContentInsets(to webView: WKWebView) {
+        let bottomInset: CGFloat
+        let topInset: CGFloat
+        if preferences.addressBarPosition == .bottom {
+            topInset = 0
+            bottomInset = isChromeCollapsed ? 58 : 126
+        } else {
+            topInset = isChromeCollapsed ? 56 : 124
+            bottomInset = 0
+        }
+        if abs(webView.scrollView.contentInset.bottom - bottomInset) > 1 ||
+           abs(webView.scrollView.contentInset.top - topInset) > 1 {
+            webView.scrollView.contentInset = UIEdgeInsets(top: topInset, left: 0, bottom: bottomInset, right: 0)
+            webView.scrollView.verticalScrollIndicatorInsets = webView.scrollView.contentInset
+        }
+    }
+
+    func updateAllWebViewContentInsets() {
+        for view in webViews.values {
+            applyContentInsets(to: view)
+        }
+    }
+
     func applyUserScriptsToAllWebViews() {
+        configureAudioSession()
         for (tid, view) in webViews {
             let tab = tabs.first(where: { $0.id == tid })
             let host = URL(string: tab?.url ?? "")?.host?.lowercased() ?? ""
@@ -662,24 +786,94 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
             }
             installUserScripts(into: controller, blockingEnabled: blockingEnabled)
             view.pageZoom = CGFloat(tab?.pageZoom ?? preferences.fontScale)
+            applyContentInsets(to: view)
         }
     }
 
+    func scrollToFraction(_ fraction: Double) {
+        guard let view = webViews[activeID] else { return }
+        let sv = view.scrollView
+        let viewportH = max(1, sv.bounds.height - sv.adjustedContentInset.top - sv.adjustedContentInset.bottom)
+        let maxY = max(0, sv.contentSize.height - viewportH)
+        let targetY = -sv.adjustedContentInset.top + CGFloat(min(1, max(0, fraction))) * maxY
+        sv.setContentOffset(CGPoint(x: sv.contentOffset.x, y: targetY), animated: false)
+        scrollFraction = min(1, max(0, fraction))
+        lastScrollActivity = Date()
+    }
+
     func scrollViewDidScroll(_ scrollView: UIScrollView) {
+        let viewportH = max(1, scrollView.bounds.height)
+        let contentH = scrollView.contentSize.height
+        let scrollable = contentH - viewportH
+        if scrollable > 40 {
+            let adjustedY = max(0, scrollView.contentOffset.y + scrollView.adjustedContentInset.top)
+            isScrollable = true
+            scrollViewportRatio = min(1.0, max(0.12, Double(viewportH / max(contentH, 1))))
+            scrollFraction = min(1.0, max(0.0, Double(adjustedY / max(scrollable, 1))))
+            lastScrollActivity = Date()
+        } else {
+            isScrollable = false
+        }
+
         guard preferences.hideToolbarOnScroll else {
-            if isChromeCollapsed { isChromeCollapsed = false }
+            if isChromeCollapsed {
+                isChromeCollapsed = false
+                updateAllWebViewContentInsets()
+            }
             return
         }
-        let y = scrollView.contentOffset.y
+        let y = scrollView.contentOffset.y + scrollView.adjustedContentInset.top
         let delta = y - lastScrollOffsetY
         lastScrollOffsetY = y
-        if y <= 24 {
-            if isChromeCollapsed { isChromeCollapsed = false }
-        } else if delta > 14 && !isChromeCollapsed {
-            isChromeCollapsed = true
-        } else if delta < -10 && preferences.expandToolbarOnScrollUp && isChromeCollapsed {
-            isChromeCollapsed = false
+        if y <= 8 {
+            toolbarScrollAccumulator = 0
+            if preferences.expandToolbarOnScrollUp && isChromeCollapsed {
+                isChromeCollapsed = false
+                updateAllWebViewContentInsets()
+            }
+            return
         }
+        if delta == 0 || abs(delta) > viewportH { return }
+
+        if delta > 0 {
+            if toolbarScrollAccumulator < 0 { toolbarScrollAccumulator = 0 }
+            toolbarScrollAccumulator += delta
+            if !isChromeCollapsed && toolbarScrollAccumulator >= 24 {
+                toolbarScrollAccumulator = 0
+                isChromeCollapsed = true
+                updateAllWebViewContentInsets()
+            }
+        } else {
+            guard preferences.expandToolbarOnScrollUp else {
+                toolbarScrollAccumulator = 0
+                return
+            }
+            if toolbarScrollAccumulator > 0 { toolbarScrollAccumulator = 0 }
+            toolbarScrollAccumulator += delta
+            if isChromeCollapsed && toolbarScrollAccumulator <= -14 {
+                toolbarScrollAccumulator = 0
+                isChromeCollapsed = false
+                updateAllWebViewContentInsets()
+            }
+        }
+    }
+
+    func handleScriptMessage(name: String, body: Any) {
+        guard name == "omyaruContext", let dict = body as? [String: Any] else { return }
+        let kindStr = (dict["kind"] as? String) ?? "link"
+        let mediaURL = (dict["mediaUrl"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let linkURL = (dict["linkUrl"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let title = ((dict["title"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)).flatMap { $0.isEmpty ? nil : $0 }
+            ?? mediaURL ?? linkURL ?? "항목"
+        let kind: WebContextElement.Kind = kindStr == "image" ? .image : (kindStr == "video" ? .video : .link)
+        guard (mediaURL?.isEmpty == false) || (linkURL?.isEmpty == false) else { return }
+        UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+        activeContextElement = WebContextElement(
+            kind: kind,
+            mediaURL: mediaURL?.isEmpty == true ? nil : mediaURL,
+            linkURL: linkURL?.isEmpty == true ? nil : linkURL,
+            title: String(title.prefix(64))
+        )
     }
 
     private func installUserScripts(into controller: WKUserContentController, blockingEnabled: Bool) {
@@ -841,6 +1035,49 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
                 forMainFrameOnly: false
             ))
         }
+
+        // 7. Android-Style Long-Press Context Menu Bridge (Images / Videos / Links -> Save to Bookshelf, Background Tab, Copy, Download)
+        let contextBridgeJS = """
+        (() => {
+          if (window.__omyaruContextInstalled) return;
+          window.__omyaruContextInstalled = true;
+          let timer = null, startX = 0, startY = 0;
+          const findInfo = (el) => {
+            if (!el) return null;
+            const img = el.closest ? el.closest('img') : null;
+            const vid = el.closest ? el.closest('video, audio') : null;
+            const link = el.closest ? el.closest('a[href]') : null;
+            const mediaUrl = img ? (img.currentSrc || img.src || '') : (vid ? (vid.currentSrc || vid.src || (vid.querySelector('source') ? vid.querySelector('source').src : '')) : '');
+            const linkUrl = link ? link.href : '';
+            if (!mediaUrl && !linkUrl) return null;
+            const kind = img ? 'image' : (vid ? 'video' : 'link');
+            const title = (img && (img.alt || img.title)) || (link && (link.innerText || link.title)) || mediaUrl || linkUrl;
+            return { kind, mediaUrl, linkUrl, title: (title || '').trim().slice(0, 80) };
+          };
+          const cancel = () => { if (timer) { clearTimeout(timer); timer = null; } };
+          document.addEventListener('touchstart', (e) => {
+            if (e.touches.length !== 1) { cancel(); return; }
+            const t = e.touches[0];
+            startX = t.clientX; startY = t.clientY;
+            const target = e.target;
+            const info = findInfo(target);
+            if (!info) return;
+            cancel();
+            timer = setTimeout(() => {
+              timer = null;
+              try { window.webkit.messageHandlers.omyaruContext.postMessage(info); } catch (_) {}
+            }, 520);
+          }, { passive: true });
+          document.addEventListener('touchmove', (e) => {
+            if (!timer || !e.touches.length) return;
+            const t = e.touches[0];
+            if (Math.abs(t.clientX - startX) > 10 || Math.abs(t.clientY - startY) > 10) cancel();
+          }, { passive: true });
+          document.addEventListener('touchend', cancel, { passive: true });
+          document.addEventListener('touchcancel', cancel, { passive: true });
+        })();
+        """
+        controller.addUserScript(WKUserScript(source: contextBridgeJS, injectionTime: .atDocumentEnd, forMainFrameOnly: false))
     }
 
     private func compileTrackerBlockerRules() {
@@ -905,20 +1142,67 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
         setTab(activeID) { $0.url = url.absoluteString }
     }
 
+    func recordVisitSuggestion(profileID: UUID, url: String, title: String) {
+        guard url.lowercased().hasPrefix("http://") || url.lowercased().hasPrefix("https://") else { return }
+        var rows = visitRecordsByProfile[profileID] ?? []
+        let now = Date().timeIntervalSince1970
+        if let idx = rows.firstIndex(where: { $0.url.caseInsensitiveCompare(url) == .orderedSame }) {
+            var item = rows.remove(at: idx)
+            item.title = title.isEmpty ? item.title : title
+            item.visits += 1
+            item.lastVisit = now
+            rows.insert(item, at: 0)
+        } else {
+            rows.insert(UrlSuggestionRecord(url: url, title: title.isEmpty ? url : title, visits: 1, lastVisit: now), at: 0)
+        }
+        visitRecordsByProfile[profileID] = Array(rows.prefix(200))
+        var rawMap: [String: [UrlSuggestionRecord]] = [:]
+        for (k, v) in visitRecordsByProfile { rawMap[k.uuidString] = v }
+        if let data = try? JSONEncoder().encode(rawMap) {
+            UserDefaults.standard.set(data, forKey: Self.visitsKey)
+        }
+    }
+
     func urlSuggestions(for input: String) -> [BrowserBookmark] {
         let query = input.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard !query.isEmpty else { return [] }
+        // Private tabs neither read nor write profile visit ranking (exact UrlSuggestions.kt parity!)
+        let isPrivate = activeTab?.isPrivate ?? (activeGroupID == Self.privateGroupID)
         var seen = Set<String>()
         var results: [BrowserBookmark] = []
+
+        if !isPrivate {
+            let ranked = (visitRecordsByProfile[activeProfileID] ?? [])
+                .filter { $0.url.lowercased().contains(query) || $0.title.lowercased().contains(query) }
+                .sorted { a, b in
+                    if a.visits != b.visits { return a.visits > b.visits }
+                    return a.lastVisit > b.lastVisit
+                }
+            for row in ranked {
+                if seen.insert(row.url.lowercased()).inserted {
+                    results.append(BrowserBookmark(title: row.title, url: row.url))
+                }
+                if results.count >= 6 { return results }
+            }
+        }
+
         for bm in bookmarks where bm.title.lowercased().contains(query) || bm.url.lowercased().contains(query) {
             if seen.insert(bm.url.lowercased()).inserted { results.append(bm) }
             if results.count >= 6 { return results }
         }
-        for h in history where h.title.lowercased().contains(query) || h.url.lowercased().contains(query) {
-            if seen.insert(h.url.lowercased()).inserted { results.append(BrowserBookmark(title: h.title, url: h.url)) }
-            if results.count >= 6 { return results }
+        if !isPrivate {
+            for h in history where h.title.lowercased().contains(query) || h.url.lowercased().contains(query) {
+                if seen.insert(h.url.lowercased()).inserted { results.append(BrowserBookmark(title: h.title, url: h.url)) }
+                if results.count >= 6 { return results }
+            }
         }
         return results
+    }
+
+    func openInBackgroundTab(_ rawURL: String) {
+        guard let url = URL(string: rawURL) else { return }
+        _ = newTab(url: url, afterTabID: activeID, background: true)
+        status = "백그라운드 탭을 열었습니다."
     }
 
     // MARK: - Tab Operations (Including Duplicate Right After Source Tab!)
@@ -943,6 +1227,9 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
         if !background {
             activeID = tab.id
             isChromeCollapsed = false
+            failedLoadURL = nil
+            failedLoadMessage = nil
+            updateAllWebViewContentInsets()
         }
         if let url {
             loadedTabIDs.insert(tab.id)
@@ -978,6 +1265,9 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
         captureSnapshot(for: activeID)
         activeID = id
         isChromeCollapsed = false
+        failedLoadURL = nil
+        failedLoadMessage = nil
+        updateAllWebViewContentInsets()
         if tab.isPrivate {
             activeGroupID = Self.privateGroupID
         } else {
@@ -1120,18 +1410,161 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
         selectGroup(group.id)
     }
 
-    // MARK: - Page Controls, Find in Page, Zoom, Desktop Mode
+    func renameGroup(_ id: UUID, to newName: String) {
+        let trimmed = newName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, let idx = groups.firstIndex(where: { $0.id == id }) else { return }
+        groups[idx].name = trimmed
+        persist()
+        status = "탭 그룹 이름을 '\(trimmed)'(으)로 변경했습니다."
+    }
+
+    func deleteGroup(_ id: UUID) {
+        guard id != Self.privateGroupID else { return }
+        let siblings = profileGroups
+        guard siblings.count > 1, let targetGroup = siblings.first(where: { $0.id != id }) else {
+            status = "기본 탭 그룹은 삭제할 수 없습니다."
+            return
+        }
+        for i in tabs.indices where tabs[i].groupID == id && !tabs[i].isPrivate {
+            tabs[i].groupID = targetGroup.id
+        }
+        groups.removeAll { $0.id == id }
+        if activeGroupID == id {
+            selectGroup(targetGroup.id)
+        } else {
+            persist()
+        }
+        status = "탭 그룹을 삭제하고 탭을 이동했습니다."
+    }
+
+    func moveGroup(_ groupID: UUID, toProfile targetProfileID: UUID) {
+        guard groupID != Self.privateGroupID,
+              profiles.contains(where: { $0.id == targetProfileID }),
+              let idx = groups.firstIndex(where: { $0.id == groupID }) else { return }
+        let oldProfileID = groups[idx].profileID
+        guard oldProfileID != targetProfileID else { return }
+        groups[idx].profileID = targetProfileID
+        for i in tabs.indices where tabs[i].groupID == groupID && !tabs[i].isPrivate {
+            tabs[i].profileID = targetProfileID
+        }
+        if groups.filter({ $0.profileID == oldProfileID }).isEmpty {
+            groups.append(BrowserGroup(profileID: oldProfileID, name: "기본"))
+        }
+        activeProfileID = targetProfileID
+        selectGroup(groupID)
+        status = "탭 그룹을 다른 프로필로 이동했습니다."
+    }
+
+    func switchWorkspaceGroup(direction: Int) -> Bool {
+        let order = workspaceGroupIDs
+        guard let currentIdx = order.firstIndex(of: activeGroupID) else { return false }
+        let targetIdx = currentIdx + direction
+        guard targetIdx >= 0 && targetIdx < order.count else { return false }
+        selectGroup(order[targetIdx])
+        return true
+    }
+
+    func moveTabs(_ tabIDs: Set<UUID>, toProfile profileID: UUID, groupID: UUID) {
+        guard !tabIDs.isEmpty else { return }
+        let isPriv = groupID == Self.privateGroupID
+        for i in tabs.indices where tabIDs.contains(tabs[i].id) {
+            tabs[i].profileID = profileID
+            tabs[i].groupID = groupID
+            tabs[i].isPrivate = isPriv
+        }
+        if visibleTabs.isEmpty {
+            _ = newTab()
+        } else if !visibleTabs.contains(where: { $0.id == activeID }) {
+            activeID = visibleTabs.first!.id
+        }
+        persist()
+        status = "\(tabIDs.count)개의 탭을 이동했습니다."
+    }
+
+    func closeTabs(_ tabIDs: Set<UUID>) {
+        guard !tabIDs.isEmpty else { return }
+        for id in tabIDs {
+            if let tab = tabs.first(where: { $0.id == id }), !tab.isPrivate, tab.url != "about:blank" {
+                closedTabs.insert(tab, at: 0)
+            }
+            webViews.removeValue(forKey: id)?.stopLoading()
+            loadedTabIDs.remove(id)
+        }
+        if closedTabs.count > 25 { closedTabs = Array(closedTabs.prefix(25)) }
+        tabs.removeAll { tabIDs.contains($0.id) }
+        if visibleTabs.isEmpty {
+            _ = newTab()
+        } else if tabIDs.contains(activeID) {
+            activeID = visibleTabs.last!.id
+        }
+        persist()
+    }
+
+    // MARK: - Page Controls, Find in Page, Zoom, Desktop Mode, Media PiP/Seek
 
     func back() { webViews[activeID]?.goBack() }
     func forward() { webViews[activeID]?.goForward() }
-    func reload() { webViews[activeID]?.reload() }
+    func reload() {
+        failedLoadURL = nil
+        failedLoadMessage = nil
+        webViews[activeID]?.reload()
+    }
+    func stopLoading() {
+        webViews[activeID]?.stopLoading()
+        isLoading = false
+    }
+    func retryFailedLoad() {
+        let target = failedLoadURL ?? currentURL
+        failedLoadURL = nil
+        failedLoadMessage = nil
+        if let url = URL(string: target), target != "about:blank" {
+            webView(for: activeID, loadIfNeeded: false).load(URLRequest(url: url))
+        } else {
+            reload()
+        }
+    }
     func home() {
         isChromeCollapsed = false
+        failedLoadURL = nil
+        failedLoadMessage = nil
+        updateAllWebViewContentInsets()
         if preferences.homePage == "about:blank" || preferences.homePage.isEmpty {
             setTab(activeID) { $0.url = "about:blank"; $0.title = "새 탭" }
         } else {
             open(preferences.homePage)
         }
+    }
+
+    func findBookmark(for url: String) -> BrowserBookmark? {
+        bookmarks.first { $0.url.caseInsensitiveCompare(url) == .orderedSame }
+    }
+
+    func saveBookmark(editingID: UUID?, title: String, url: String, folderID: String?) {
+        var cleanURL = url.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleanURL.isEmpty else { return }
+        if !cleanURL.contains("://") { cleanURL = "https://" + cleanURL }
+        let cleanTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        let resolvedTitle = cleanTitle.isEmpty ? (URL(string: cleanURL)?.host ?? cleanURL) : cleanTitle
+        if let editID = editingID, let idx = bookmarks.firstIndex(where: { $0.id == editID }) {
+            bookmarks[idx].title = resolvedTitle
+            bookmarks[idx].url = cleanURL
+            bookmarks[idx].folderID = folderID
+            status = "북마크를 수정했습니다."
+        } else if let idx = bookmarks.firstIndex(where: { $0.url.caseInsensitiveCompare(cleanURL) == .orderedSame }) {
+            bookmarks[idx].title = resolvedTitle
+            bookmarks[idx].folderID = folderID
+            status = "북마크를 업데이트했습니다."
+        } else {
+            bookmarks.append(BrowserBookmark(title: resolvedTitle, url: cleanURL, folderID: folderID))
+            status = "북마크에 추가했습니다."
+        }
+        persist()
+    }
+
+    func deleteBookmark(_ id: UUID) {
+        bookmarks.removeAll { $0.id == id }
+        persist()
+        status = "북마크를 삭제했습니다."
     }
 
     func toggleBookmark(folderID: String? = nil) {
@@ -1144,6 +1577,93 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
             status = "북마크에 추가됨"
         }
         persist()
+    }
+
+    func seekActiveMedia(by seconds: Int) {
+        guard let view = webViews[activeID] else { return }
+        let js = """
+        (() => {
+          const media = Array.from(document.querySelectorAll('video, audio')).find(m => !m.paused)
+            || document.querySelector('video, audio');
+          if (!media) return false;
+          const dur = Number.isFinite(media.duration) ? media.duration : 1e9;
+          media.currentTime = Math.max(0, Math.min(dur, (media.currentTime || 0) + (\(seconds))));
+          return true;
+        })();
+        """
+        view.evaluateJavaScript(js) { [weak self] result, _ in
+            Task { @MainActor in
+                if (result as? Bool) == true {
+                    self?.status = seconds > 0 ? "\(seconds)초 앞으로 이동" : "\(-seconds)초 뒤로 이동"
+                } else {
+                    self?.status = "현재 페이지에 제어할 미디어가 없습니다."
+                }
+            }
+        }
+    }
+
+    func enterActiveVideoPiP() {
+        guard let view = webViews[activeID] else { return }
+        let js = """
+        (() => {
+          const v = Array.from(document.querySelectorAll('video')).find(m => !m.paused) || document.querySelector('video');
+          if (!v) return false;
+          if (typeof v.webkitSetPresentationMode === 'function') {
+            v.webkitSetPresentationMode(v.webkitPresentationMode === 'picture-in-picture' ? 'inline' : 'picture-in-picture');
+            return true;
+          }
+          if (document.pictureInPictureEnabled && typeof v.requestPictureInPicture === 'function') {
+            v.requestPictureInPicture().catch(() => {});
+            return true;
+          }
+          return false;
+        })();
+        """
+        view.evaluateJavaScript(js) { [weak self] result, _ in
+            Task { @MainActor in
+                if (result as? Bool) != true {
+                    self?.status = "이 페이지에서 PiP 동영상을 찾지 못했습니다."
+                }
+            }
+        }
+    }
+
+    func downloadRemoteURL(_ rawURL: String, saveToBookshelfFolder: String? = nil) async {
+        guard let url = URL(string: rawURL), let scheme = url.scheme?.lowercased(), (scheme == "http" || scheme == "https") else {
+            status = "이 주소는 직접 다운로드할 수 없습니다."
+            return
+        }
+        status = "다운로드 중…"
+        var req = URLRequest(url: url)
+        if !isStartPage && currentURL.hasPrefix("http") {
+            req.setValue(currentURL, forHTTPHeaderField: "Referer")
+        }
+        do {
+            let (data, response) = try await URLSession.shared.data(for: req)
+            let mime = (response as? HTTPURLResponse)?.mimeType ?? "application/octet-stream"
+            let suggested = response.suggestedFilename ?? (url.lastPathComponent.isEmpty ? "download.bin" : url.lastPathComponent)
+            let ext = (suggested as NSString).pathExtension.lowercased()
+            let isImg = mime.lowercased().hasPrefix("image/") || ["png", "jpg", "jpeg", "webp", "gif", "heic", "bmp"].contains(ext)
+            if let shelfFolder = saveToBookshelfFolder {
+                let targetExt = ext.isEmpty ? "png" : ext
+                if ShelfModel.shared.addImageData(data, fileExtension: targetExt, toFolder: shelfFolder, sourceUrl: currentURL) != nil {
+                    status = "‘\(BookshelfPath.leaf(shelfFolder))’ 책장에 이미지를 저장했습니다."
+                } else {
+                    status = "책장 이미지 저장에 실패했습니다."
+                }
+                return
+            }
+            let temp = FileManager.default.temporaryDirectory.appendingPathComponent("dl-\(UUID().uuidString)-\(suggested)")
+            try data.write(to: temp, options: .atomic)
+            pendingDownload = PendingDownloadPrompt(
+                suggestedFilename: suggested,
+                mimeType: mime,
+                isImage: isImg,
+                tempFileURL: temp
+            )
+        } catch {
+            status = "다운로드 실패: \(error.localizedDescription)"
+        }
     }
 
     func toggleDesktopMode() {
@@ -1167,35 +1687,86 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
     }
 
     func findInPage(_ query: String, forward: Bool = true) async {
+        let isSameQuery = (query == findQuery && findMatchCount > 0)
         findQuery = query
         guard let view = webViews[activeID] else { return }
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else {
-            _ = try? await view.evaluateJavaScript("window.getSelection()?.removeAllRanges();")
+        if trimmed.isEmpty {
+            let clearJS = """
+            (() => {
+              document.querySelectorAll('mark.__omyaru_find_hl').forEach(el => {
+                const parent = el.parentNode;
+                if (parent) { parent.replaceChild(document.createTextNode(el.textContent || ''), el); parent.normalize(); }
+              });
+              window.__omyaruFindIdx = -1;
+            })();
+            """
+            _ = try? await view.evaluateJavaScript(clearJS)
             findMatchCount = 0
             findCurrentIndex = 0
             return
         }
         let escaped = (try? JSONEncoder().encode(trimmed)).flatMap { String(data: $0, encoding: .utf8) } ?? "\"\""
-        let dir = forward ? "false" : "true"
+        let stepDelta = isSameQuery ? (forward ? 1 : -1) : 0
         let js = """
         (() => {
           const q = \(escaped);
-          const text = document.body?.innerText || '';
-          const matches = text.toLowerCase().split(q.toLowerCase()).length - 1;
-          window.find(q, false, \(dir), true, false, true, false);
-          return Math.max(0, matches);
+          const step = \(stepDelta);
+          const rebuild = (step === 0 || window.__omyaruFindQuery !== q);
+          if (rebuild) {
+            document.querySelectorAll('mark.__omyaru_find_hl').forEach(el => {
+              const p = el.parentNode;
+              if (p) { p.replaceChild(document.createTextNode(el.textContent || ''), el); p.normalize(); }
+            });
+            window.__omyaruFindQuery = q;
+            window.__omyaruFindIdx = 0;
+            const lowerQ = q.toLowerCase();
+            const walker = document.createTreeWalker(document.body || document.documentElement, NodeFilter.SHOW_TEXT, {
+              acceptNode(node) {
+                if (!node.nodeValue || !node.nodeValue.trim()) return NodeFilter.FILTER_REJECT;
+                const tag = node.parentElement ? node.parentElement.tagName : '';
+                if (tag === 'SCRIPT' || tag === 'STYLE' || tag === 'NOSCRIPT' || tag === 'TEXTAREA') return NodeFilter.FILTER_REJECT;
+                return node.nodeValue.toLowerCase().includes(lowerQ) ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_SKIP;
+              }
+            });
+            const nodes = [];
+            while (walker.nextNode() && nodes.length < 400) nodes.push(walker.currentNode);
+            for (const textNode of nodes) {
+              const text = textNode.nodeValue || '';
+              const lower = text.toLowerCase();
+              let pos = 0, idx = lower.indexOf(lowerQ, pos);
+              if (idx < 0) continue;
+              const frag = document.createDocumentFragment();
+              while (idx >= 0) {
+                if (idx > pos) frag.appendChild(document.createTextNode(text.slice(pos, idx)));
+                const mark = document.createElement('mark');
+                mark.className = '__omyaru_find_hl';
+                mark.style.cssText = 'background:#FFE066;color:#111;border-radius:2px;padding:0 1px;';
+                mark.textContent = text.slice(idx, idx + q.length);
+                frag.appendChild(mark);
+                pos = idx + q.length;
+                idx = lower.indexOf(lowerQ, pos);
+              }
+              if (pos < text.length) frag.appendChild(document.createTextNode(text.slice(pos)));
+              textNode.parentNode?.replaceChild(frag, textNode);
+            }
+          }
+          const marks = Array.from(document.querySelectorAll('mark.__omyaru_find_hl'));
+          if (!marks.length) return [0, 0];
+          let cur = typeof window.__omyaruFindIdx === 'number' ? window.__omyaruFindIdx : 0;
+          if (!rebuild) cur = (cur + step + marks.length) % marks.length;
+          window.__omyaruFindIdx = cur;
+          marks.forEach((m, i) => {
+            m.style.background = i === cur ? '#FF8A2B' : '#FFE066';
+            m.style.color = '#111';
+          });
+          marks[cur].scrollIntoView({ behavior: 'smooth', block: 'center' });
+          return [cur + 1, marks.length];
         })();
         """
-        if let count = try? await view.evaluateJavaScript(js) as? Int {
-            findMatchCount = count
-            if count > 0 {
-                findCurrentIndex = forward
-                    ? (findCurrentIndex % count) + 1
-                    : ((findCurrentIndex - 2 + count) % count) + 1
-            } else {
-                findCurrentIndex = 0
-            }
+        if let pair = try? await view.evaluateJavaScript(js) as? [Int], pair.count == 2 {
+            findCurrentIndex = pair[0]
+            findMatchCount = pair[1]
         }
     }
 
@@ -1264,12 +1835,20 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
         if id(for: webView) == activeID {
             isLoading = true
             estimatedProgress = 0.15
+            failedLoadURL = nil
+            failedLoadMessage = nil
+            if isChromeCollapsed {
+                isChromeCollapsed = false
+                updateAllWebViewContentInsets()
+            }
         }
     }
 
     func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
         if id(for: webView) == activeID {
             estimatedProgress = max(0.45, webView.estimatedProgress)
+            failedLoadURL = nil
+            failedLoadMessage = nil
         }
     }
 
@@ -1278,6 +1857,8 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
         if id == activeID {
             isLoading = false
             estimatedProgress = 1.0
+            failedLoadURL = nil
+            failedLoadMessage = nil
         }
         let url = webView.url?.absoluteString ?? "about:blank"
         let title = (webView.title?.isEmpty == false) ? webView.title! : url
@@ -1285,7 +1866,8 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
             tab.url = url
             tab.title = title
         }
-        if tabs.first(where: { $0.id == id })?.isPrivate != true && url != "about:blank" {
+        if let tab = tabs.first(where: { $0.id == id }), !tab.isPrivate && url != "about:blank" {
+            recordVisitSuggestion(profileID: tab.profileID, url: url, title: title)
             history.removeAll { $0.url == url }
             history.insert(HistoryEntry(title: title, url: url), at: 0)
             persist()
@@ -1298,6 +1880,11 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
         if id(for: webView) == activeID { isLoading = false }
         let nsErr = error as NSError
         if nsErr.code == NSURLErrorCancelled { return }
+        if id(for: webView) == activeID {
+            let failing = (nsErr.userInfo[NSURLErrorFailingURLStringErrorKey] as? String) ?? webView.url?.absoluteString ?? currentURL
+            failedLoadURL = failing
+            failedLoadMessage = error.localizedDescription
+        }
         status = error.localizedDescription
     }
 
