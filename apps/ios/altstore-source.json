@@ -11,18 +11,18 @@
       "bundleIdentifier": "cuttan.omyaru.app",
       "developerName": "Omyeol",
       "subtitle": "Privacy browser and bookshelf",
-      "localizedDescription": "Browser tabs, private group, bookmarks, downloads, bookshelf and manual update checks. Preview build; Android feature parity is still in progress.",
+      "localizedDescription": "Omyaru iOS Browser with full Android feature parity: profiles, tab groups, private tabs, tab duplication after source, drag auto-scroll, animated tab close, web image preloader, tracker/ad blocker, userscripts (.user.js), live multi-viewport region capture, watermark remover, hierarchical folder tree bookshelf with PDF export, Face ID/PIN app lock, DoH encrypted DNS, and Google Drive / AES-256-GCM encrypted sync.",
       "iconURL": "https://raw.githubusercontent.com/omyeol/Omyaru-Browser/main/apps/ios/Omyaru/Assets.xcassets/AppIcon.appiconset/AppIcon.png",
       "tintColor": "#5D97FF",
       "category": "utilities",
       "versions": [
         {
-          "version": "0.1.0",
-          "buildVersion": "1",
+          "version": "0.2.0",
+          "buildVersion": "2",
           "date": "2026-11-22",
-          "localizedDescription": "First iOS preview build.",
+          "localizedDescription": "v0.2.0: Full Android feature parity (hierarchical bookshelf tree, live scroll-stitch capture, watermark remover, Google Drive & AES-256-GCM sync, image preloader, userscripts, DoH DNS, Face ID app lock).",
           "downloadURL": "https://github.com/omyeol/Omyaru-Browser/releases/download/ios-latest/Omyaru.ipa",
-          "size": 225140,
+          "size": 1094128,
           "minOSVersion": "16.0"
         }
       ],
