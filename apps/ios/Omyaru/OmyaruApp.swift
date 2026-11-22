@@ -21,21 +21,27 @@ struct OmyaruApp: App {
                         .transition(.opacity)
                 }
 
-                if scenePhase != .active && appLock.isEnabled {
-                    Color(red: 0.05, green: 0.05, blue: 0.06)
+                if scenePhase != .active && (appLock.isEnabled || appLock.appSwitchBlackShield) {
+                    Color.black
                         .ignoresSafeArea()
                         .overlay {
-                            Image(systemName: "lock.shield.fill")
-                                .font(.system(size: 56))
-                                .foregroundStyle(.blue)
+                            if !appLock.appSwitchBlackShield {
+                                Image(systemName: "lock.shield.fill")
+                                    .font(.system(size: 56))
+                                    .foregroundStyle(.blue)
+                            }
                         }
                 }
             }
+            .preferredColorScheme(browser.preferences.pageColorScheme.swiftUIColorScheme)
             .onChange(of: scenePhase) { phase in
                 switch phase {
                 case .background:
                     appLock.lockIfNeeded()
                     browser.persist()
+                    if browser.preferences.clearDataOnExit {
+                        Task { await browser.clearBrowsingData() }
+                    }
                 case .active:
                     if driveSync.autoSyncEnabled && driveSync.isConnected {
                         Task {
@@ -53,7 +59,7 @@ struct OmyaruApp: App {
     }
 }
 
-// MARK: - Core Browser Models (Android & Windows Parity)
+// MARK: - Core Models (100% Android v0.15.18 Parity)
 
 struct BrowserProfile: Codable, Identifiable, Hashable {
     var id: UUID = UUID()
@@ -79,11 +85,17 @@ struct BrowserTab: Codable, Identifiable, Hashable {
     var pageZoom: Double = 1.0
 }
 
+struct BookmarkFolder: Codable, Identifiable, Hashable {
+    var id: String = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
+    var name: String
+    var parentID: String? = nil
+}
+
 struct BrowserBookmark: Codable, Identifiable, Hashable {
     var id: UUID = UUID()
     var title: String
     var url: String
-    var folder: String = ""
+    var folderID: String? = nil
 }
 
 struct HistoryEntry: Codable, Identifiable, Hashable {
@@ -93,102 +105,241 @@ struct HistoryEntry: Codable, Identifiable, Hashable {
     var visitedAtEpochMs: Int64 = Int64(Date().timeIntervalSince1970 * 1000)
 }
 
+struct PendingDownloadPrompt: Identifiable {
+    let id = UUID()
+    let suggestedFilename: String
+    let mimeType: String
+    let isImage: Bool
+    let tempFileURL: URL
+}
+
+// MARK: - Settings Enums (Exact Android BrowserSettings.kt Parity)
+
 enum SearchEngineChoice: String, CaseIterable, Codable, Identifiable {
-    case duckduckgo = "DuckDuckGo"
     case google = "Google"
+    case duckduckgo = "DuckDuckGo"
+    case brave = "Brave Search"
+    case startpage = "Startpage"
     case naver = "Naver"
     case bing = "Bing"
+    case custom = "사용자 지정"
 
     var id: String { rawValue }
 
-    func searchURL(for query: String) -> URL? {
+    func searchURL(for query: String, customTemplate: String) -> URL? {
         let encoded = query.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? query
         switch self {
-        case .duckduckgo: return URL(string: "https://duckduckgo.com/?q=\(encoded)")
         case .google: return URL(string: "https://www.google.com/search?q=\(encoded)")
+        case .duckduckgo: return URL(string: "https://duckduckgo.com/?q=\(encoded)")
+        case .brave: return URL(string: "https://search.brave.com/search?q=\(encoded)")
+        case .startpage: return URL(string: "https://www.startpage.com/sp/search?query=\(encoded)")
         case .naver: return URL(string: "https://search.naver.com/search.naver?query=\(encoded)")
         case .bing: return URL(string: "https://www.bing.com/search?q=\(encoded)")
+        case .custom:
+            let tpl = customTemplate.contains("%s") ? customTemplate : "https://duckduckgo.com/?q=%s"
+            return URL(string: tpl.replacingOccurrences(of: "%s", with: encoded))
         }
     }
 }
 
+enum TrackingProtectionLevel: String, CaseIterable, Codable, Identifiable {
+    case off = "끄기"
+    case standard = "표준"
+    case strict = "엄격"
+    var id: String { rawValue }
+}
+
+enum CookiePolicyLevel: String, CaseIterable, Codable, Identifiable {
+    case isolateCrossSite = "교차 사이트 쿠키 격리"
+    case firstPartyOnly = "자사 쿠키만 허용"
+    case blockAll = "모든 쿠키 차단"
+    var id: String { rawValue }
+}
+
+enum PageColorSchemeChoice: String, CaseIterable, Codable, Identifiable {
+    case system = "시스템 설정"
+    case light = "라이트 모드"
+    case dark = "다크 모드"
+    var id: String { rawValue }
+
+    var swiftUIColorScheme: ColorScheme? {
+        switch self {
+        case .system: return nil
+        case .light: return .light
+        case .dark: return .dark
+        }
+    }
+}
+
+enum AddressBarPositionChoice: String, CaseIterable, Codable, Identifiable {
+    case bottom = "하단"
+    case top = "상단"
+    var id: String { rawValue }
+}
+
+enum TabAspectRatioChoice: String, CaseIterable, Codable, Identifiable {
+    case square = "1:1"
+    case portrait = "3:4"
+    case wide = "16:9"
+    var id: String { rawValue }
+
+    var heightRatio: CGFloat {
+        switch self {
+        case .square: return 1.0
+        case .portrait: return 4.0 / 3.0
+        case .wide: return 9.0 / 16.0
+        }
+    }
+}
+
+/// Exact 20-item parity with Android `ToolbarShortcuts.kt`!
 enum ToolbarShortcutAction: String, CaseIterable, Codable, Identifiable {
+    case back = "back"
+    case forward = "forward"
+    case home = "home"
     case newTab = "new_tab"
     case tabs = "tabs"
+    case menu = "menu"
+    case findInPage = "find"
+    case contentBlocking = "blocking"
+    case desktopSite = "desktop"
+    case extensions = "extensions"
     case capture = "capture"
     case watermark = "watermark"
     case bookshelf = "bookshelf"
+    case vpn = "vpn"
+    case history = "history"
     case bookmarks = "bookmarks"
-    case downloads = "downloads"
-    case sync = "sync"
     case share = "share"
+    case copyAddress = "copy"
+    case reopenClosedTab = "restore"
+    case closeAllTabs = "close_all"
     case settings = "settings"
 
     var id: String { rawValue }
 
     var title: String {
         switch self {
+        case .back: return "뒤로"
+        case .forward: return "앞으로"
+        case .home: return "홈"
         case .newTab: return "새 탭"
         case .tabs: return "탭 목록"
+        case .menu: return "메뉴"
+        case .findInPage: return "페이지에서 찾기"
+        case .contentBlocking: return "콘텐츠 차단"
+        case .desktopSite: return "데스크톱 사이트"
+        case .extensions: return "확장 프로그램"
         case .capture: return "화면 캡처"
-        case .watermark: return "워터마크 제거"
+        case .watermark: return "워터마크 삭제"
         case .bookshelf: return "책장"
+        case .vpn: return "VPN · 보안 DNS"
+        case .history: return "방문 기록"
         case .bookmarks: return "북마크"
-        case .downloads: return "다운로드"
-        case .sync: return "동기화"
         case .share: return "공유"
+        case .copyAddress: return "주소 복사"
+        case .reopenClosedTab: return "닫은 탭 복원"
+        case .closeAllTabs: return "모든 탭 닫기"
         case .settings: return "설정"
         }
     }
 
     var systemImage: String {
         switch self {
+        case .back: return "chevron.left"
+        case .forward: return "chevron.right"
+        case .home: return "house"
         case .newTab: return "plus"
         case .tabs: return "square.on.square"
+        case .menu: return "ellipsis.circle"
+        case .findInPage: return "magnifyingglass"
+        case .contentBlocking: return "shield.lefthalf.filled"
+        case .desktopSite: return "desktopcomputer"
+        case .extensions: return "puzzlepiece.extension"
         case .capture: return "viewfinder"
         case .watermark: return "wand.and.stars"
         case .bookshelf: return "books.vertical"
+        case .vpn: return "network.badge.shield.half.filled"
+        case .history: return "clock"
         case .bookmarks: return "book"
-        case .downloads: return "arrow.down.circle"
-        case .sync: return "arrow.triangle.2.circlepath.icloud"
         case .share: return "square.and.arrow.up"
+        case .copyAddress: return "doc.on.doc"
+        case .reopenClosedTab: return "arrow.uturn.backward"
+        case .closeAllTabs: return "xmark.square"
         case .settings: return "gearshape"
         }
     }
+
+    static let defaultOrder: [ToolbarShortcutAction] = [.back, .forward, .home, .capture, .bookshelf, .tabs, .menu]
 }
 
 struct BrowserPreferences: Codable, Equatable {
-    var searchEngine: SearchEngineChoice = .duckduckgo
+    // General
+    var searchEngine: SearchEngineChoice = .google
+    var customSearchTemplate: String = "https://duckduckgo.com/?q=%s"
     var homePage: String = "about:blank"
-    var automaticHTTPS: Bool = true
-    var showFullURL: Bool = false
+    var pipSeekSeconds: Int = 10
+
+    // Appearance
+    var pageColorScheme: PageColorSchemeChoice = .dark
+    var liquidGlassUi: Bool = false
+    var addressBarPosition: AddressBarPositionChoice = .bottom
+    var hideToolbarOnScroll: Bool = true
+    var expandToolbarOnScrollUp: Bool = true
+    var captureSideMargins: Bool = true
+    var fontScale: Double = 1.0
+    var compactToolbar: Bool = false
+    var toolbarShortcuts: [ToolbarShortcutAction] = ToolbarShortcutAction.defaultOrder
+
+    // Tabs
+    var tabThumbnailAspectRatio: TabAspectRatioChoice = .portrait
+    var tabGridColumns: Int = 2
+    var tabsStartFromBottom: Bool = true
+    var showKeyboardOnNewTab: Bool = false
+    var keepKeyboardAcrossTabSwitch: Bool = false
+    var restoreTabs: Bool = true
     var openLinksInNewTab: Bool = true
     var showTabThumbnails: Bool = true
-    var compactToolbar: Bool = false
-    var confirmBeforeDownload: Bool = false
-    var blockTrackers: Bool = true
+
+    // Privacy & Security
+    var trackingProtection: TrackingProtectionLevel = .strict
+    var cookiePolicy: CookiePolicyLevel = .isolateCrossSite
+    var globalPrivacyControl: Bool = true
+    var automaticHTTPS: Bool = true
+    var clearDataOnExit: Bool = false
     var blockPopups: Bool = true
+    var contentBlockingExceptions: [String] = []
+
+    // Advanced & Extensions
+    var showFullURL: Bool = true
+    var backgroundAudio: Bool = true
+    var javaScriptEnabled: Bool = true
+    var desktopModeDefault: Bool = false
+    var watermarkRemoverUrl: String = ""
     var enableImagePreloader: Bool = true
     var hideCookieNotices: Bool = true
     var unlockCopyAndContextMenu: Bool = true
     var enableMediaPiPHelper: Bool = true
     var forceWebDarkMode: Bool = false
-    var dnsPreset: DnsProviderPreset = .cloudflare
+
+    // DNS & Proxy
+    var dnsPreset: DnsProviderPreset = .system
     var customDoHURL: String = "https://cloudflare-dns.com/dns-query"
     var proxyEnabled: Bool = false
     var proxyIsSOCKS5: Bool = true
     var proxyHost: String = "127.0.0.1"
     var proxyPort: Int = 1080
-    var toolbarShortcuts: [ToolbarShortcutAction] = [.capture, .bookshelf, .tabs]
 }
 
 // MARK: - Main Browser ViewModel & WebKit Controller
 
 @MainActor
-final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDelegate {
+final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDelegate, UIScrollViewDelegate {
     static let privateGroupID = UUID(uuidString: "00000000-0000-0000-0000-000000000001")!
     static let defaultProfileID = UUID(uuidString: "00000000-0000-0000-0000-000000000010")!
     static let defaultGroupID = UUID(uuidString: "00000000-0000-0000-0000-000000000002")!
+    static let appVersionName = "0.15.18"
+    static let appBuildNumber = 76
 
     @Published var profiles: [BrowserProfile]
     @Published var groups: [BrowserGroup]
@@ -197,16 +348,19 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
     @Published var activeProfileID: UUID
     @Published var activeGroupID: UUID
     @Published var activeID: UUID
-    @Published var bookmarkFolders: [String]
+    @Published var bookmarkFolders: [BookmarkFolder]
     @Published var bookmarks: [BrowserBookmark]
     @Published var history: [HistoryEntry]
     @Published var userScripts: [UserScriptExtension]
+    @Published var wireGuardProfiles: [WireGuardProfile]
     @Published var preferences: BrowserPreferences
     @Published var downloads: [URL] = []
+    @Published var pendingDownload: PendingDownloadPrompt? = nil
     @Published var tabSnapshots: [UUID: UIImage] = [:]
     @Published var blockedTrackerCount: Int = 0
     @Published var estimatedProgress: Double = 0.0
     @Published var isLoading: Bool = false
+    @Published var isChromeCollapsed: Bool = false
     @Published var findQuery: String = ""
     @Published var findMatchCount: Int = 0
     @Published var findCurrentIndex: Int = 0
@@ -215,9 +369,11 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
     private var webViews: [UUID: WKWebView] = [:]
     private var loadedTabIDs: Set<UUID> = []
     private var compiledContentRuleList: WKContentRuleList? = nil
+    private var lastScrollOffsetY: CGFloat = 0
+    private var activeDownloadTempInfo: (url: URL, suggestedName: String, mimeType: String)? = nil
 
-    private static let stateKey = "omyaru.ios.browser.v2"
-    private static let prefsKey = "omyaru.ios.preferences.v2"
+    private static let stateKey = "omyaru.ios.browser.v3"
+    private static let prefsKey = "omyaru.ios.preferences.v3"
 
     private struct PersistedState: Codable {
         var profiles: [BrowserProfile]
@@ -226,10 +382,11 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
         var activeProfileID: UUID
         var activeGroupID: UUID
         var activeID: UUID
-        var bookmarkFolders: [String]
+        var bookmarkFolders: [BookmarkFolder]
         var bookmarks: [BrowserBookmark]
         var history: [HistoryEntry]
         var userScripts: [UserScriptExtension]
+        var wireGuardProfiles: [WireGuardProfile]
         var blockedTrackerCount: Int
     }
 
@@ -253,7 +410,7 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
            let saved = try? JSONDecoder().decode(PersistedState.self, from: data) {
             let resolvedProfiles = saved.profiles.isEmpty ? [defaultProfile] : saved.profiles
             let resolvedGroups = saved.groups.isEmpty ? [defaultGroup] : saved.groups
-            let regularTabs = saved.tabs.filter { !$0.isPrivate }
+            let regularTabs = savedPrefs.restoreTabs ? saved.tabs.filter { !$0.isPrivate } : []
             let initialTab = BrowserTab(profileID: resolvedProfiles[0].id, groupID: resolvedGroups[0].id)
             let resolvedTabs = regularTabs.isEmpty ? [initialTab] : regularTabs
             profiles = resolvedProfiles
@@ -266,6 +423,7 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
             bookmarks = saved.bookmarks.isEmpty ? defaultBookmarks : saved.bookmarks
             history = saved.history
             userScripts = saved.userScripts
+            wireGuardProfiles = saved.wireGuardProfiles
             blockedTrackerCount = saved.blockedTrackerCount
         } else {
             let initialTab = BrowserTab(profileID: Self.defaultProfileID, groupID: Self.defaultGroupID)
@@ -275,10 +433,11 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
             activeProfileID = Self.defaultProfileID
             activeGroupID = Self.defaultGroupID
             activeID = initialTab.id
-            bookmarkFolders = ["즐겨찾기", "읽을거리"]
+            bookmarkFolders = [BookmarkFolder(name: "즐겨찾기"), BookmarkFolder(name: "읽을거리")]
             bookmarks = defaultBookmarks
             history = []
             userScripts = []
+            wireGuardProfiles = []
             blockedTrackerCount = 0
         }
         super.init()
@@ -292,12 +451,20 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
     var activeTab: BrowserTab? { tabs.first { $0.id == activeID } }
     var activeProfile: BrowserProfile { profiles.first { $0.id == activeProfileID } ?? profiles[0] }
     var currentURL: String { activeTab?.url ?? "about:blank" }
+    var currentHost: String { URL(string: currentURL)?.host?.lowercased() ?? "" }
     var isStartPage: Bool { currentURL == "about:blank" || currentURL.isEmpty }
     var canGoBack: Bool { webViews[activeID]?.canGoBack ?? false }
     var canGoForward: Bool { webViews[activeID]?.canGoForward ?? false }
+
     var isCurrentBookmarked: Bool {
         guard !isStartPage else { return false }
         return bookmarks.contains { $0.url.caseInsensitiveCompare(currentURL) == .orderedSame }
+    }
+
+    var isContentBlockingDisabledForCurrentHost: Bool {
+        let host = currentHost
+        guard !host.isEmpty else { return false }
+        return preferences.contentBlockingExceptions.contains(host)
     }
 
     var profileGroups: [BrowserGroup] {
@@ -316,7 +483,7 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
         return webView(for: tab.id)
     }
 
-    // MARK: - Persistence
+    // MARK: - Persistence & Cache Management
 
     func persist() {
         let regularTabs = tabs.filter { !$0.isPrivate }
@@ -331,6 +498,7 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
             bookmarks: bookmarks,
             history: Array(history.prefix(600)),
             userScripts: userScripts,
+            wireGuardProfiles: wireGuardProfiles,
             blockedTrackerCount: blockedTrackerCount
         )
         if let data = try? JSONEncoder().encode(state) {
@@ -344,11 +512,26 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
         }
     }
 
+    func resetAllPreferences() {
+        preferences = BrowserPreferences()
+        savePreferences()
+        applyUserScriptsToAllWebViews()
+        status = "모든 설정을 기본값으로 초기화했습니다."
+    }
+
     private var snapshotsDirectory: URL {
         let dir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("TabSnapshots", isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         return dir
+    }
+
+    func clearTabPreviews() {
+        tabSnapshots.removeAll()
+        if let files = try? FileManager.default.contentsOfDirectory(at: snapshotsDirectory, includingPropertiesForKeys: nil) {
+            for f in files { try? FileManager.default.removeItem(at: f) }
+        }
+        status = "저장된 모든 탭 미리보기 이미지를 삭제했습니다."
     }
 
     private func loadPersistedSnapshotsAsync() {
@@ -387,7 +570,31 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
         }
     }
 
-    // MARK: - WebKit Configuration, Image Preloader (v0.15.18 Parity), Tracker Blocker
+    // MARK: - Per-Site Content Blocking Toggle (Android PageToolsDialog Parity!)
+
+    func toggleContentBlockingForCurrentHost() {
+        let host = currentHost
+        guard !host.isEmpty else { return }
+        if let idx = preferences.contentBlockingExceptions.firstIndex(of: host) {
+            preferences.contentBlockingExceptions.remove(at: idx)
+            status = "\(host) 콘텐츠 차단을 다시 켰습니다."
+        } else {
+            preferences.contentBlockingExceptions.append(host)
+            status = "\(host) 사이트에서 콘텐츠 차단을 껐습니다."
+        }
+        savePreferences()
+        applyUserScriptsToAllWebViews()
+        webViews[activeID]?.reload()
+    }
+
+    func clearContentBlockingExceptions() {
+        preferences.contentBlockingExceptions.removeAll()
+        savePreferences()
+        applyUserScriptsToAllWebViews()
+        status = "모든 사이트별 콘텐츠 차단 예외를 초기화했습니다."
+    }
+
+    // MARK: - WebKit Engine (Lazy Restore, Image Preloader, GPC, Scroll Toolbar Hide/Show)
 
     func webView(for id: UUID, loadIfNeeded: Bool = true) -> WKWebView {
         if let existing = webViews[id] {
@@ -402,38 +609,37 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
 
         let tab = tabs.first(where: { $0.id == id })
         let config = WKWebViewConfiguration()
-        if tab?.isPrivate == true {
-            config.websiteDataStore = .nonPersistent()
-        } else {
-            config.websiteDataStore = .default()
-        }
+        config.websiteDataStore = tab?.isPrivate == true ? .nonPersistent() : .default()
         config.allowsInlineMediaPlayback = true
         config.allowsPictureInPictureMediaPlayback = true
-        config.defaultWebpagePreferences.allowsContentJavaScript = true
+        config.defaultWebpagePreferences.allowsContentJavaScript = preferences.javaScriptEnabled
         config.preferences.javaScriptCanOpenWindowsAutomatically = !preferences.blockPopups
 
         let controller = WKUserContentController()
-        if preferences.blockTrackers, let ruleList = compiledContentRuleList {
+        let host = URL(string: tab?.url ?? "")?.host?.lowercased() ?? ""
+        let blockingEnabled = preferences.trackingProtection != .off && !preferences.contentBlockingExceptions.contains(host)
+        if blockingEnabled, let ruleList = compiledContentRuleList {
             controller.add(ruleList)
         }
-        installUserScripts(into: controller)
+        installUserScripts(into: controller, blockingEnabled: blockingEnabled)
         config.userContentController = controller
 
         let view = WKWebView(frame: .zero, configuration: config)
         view.allowsBackForwardNavigationGestures = true
         view.navigationDelegate = self
         view.uiDelegate = self
+        view.scrollView.delegate = self
         view.isOpaque = false
         view.backgroundColor = UIColor(red: 0.07, green: 0.07, blue: 0.08, alpha: 1.0)
-        if tab?.isDesktopMode == true {
+        if tab?.isDesktopMode == true || preferences.desktopModeDefault {
             view.customUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15"
         }
-        if let zoom = tab?.pageZoom, abs(zoom - 1.0) > 0.01 {
+        let zoom = tab?.pageZoom ?? preferences.fontScale
+        if abs(zoom - 1.0) > 0.01 {
             view.pageZoom = CGFloat(zoom)
         }
         webViews[id] = view
 
-        // Lazy background tab restoration (Android v0.15.18 parity): only load immediately if requested or active!
         if (loadIfNeeded || id == activeID), let tab, tab.url != "about:blank", let url = URL(string: tab.url) {
             loadedTabIDs.insert(id)
             view.load(URLRequest(url: url))
@@ -442,28 +648,53 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
     }
 
     func applyUserScriptsToAllWebViews() {
-        for (_, view) in webViews {
+        for (tid, view) in webViews {
+            let tab = tabs.first(where: { $0.id == tid })
+            let host = URL(string: tab?.url ?? "")?.host?.lowercased() ?? ""
+            let blockingEnabled = preferences.trackingProtection != .off && !preferences.contentBlockingExceptions.contains(host)
+            view.configuration.defaultWebpagePreferences.allowsContentJavaScript = preferences.javaScriptEnabled
+            view.configuration.preferences.javaScriptCanOpenWindowsAutomatically = !preferences.blockPopups
             let controller = view.configuration.userContentController
             controller.removeAllUserScripts()
             controller.removeAllContentRuleLists()
-            if preferences.blockTrackers, let ruleList = compiledContentRuleList {
+            if blockingEnabled, let ruleList = compiledContentRuleList {
                 controller.add(ruleList)
             }
-            installUserScripts(into: controller)
+            installUserScripts(into: controller, blockingEnabled: blockingEnabled)
+            view.pageZoom = CGFloat(tab?.pageZoom ?? preferences.fontScale)
         }
     }
 
-    func rebuildAllWebViewsConfiguration() {
-        let activeURL = currentURL
-        webViews.removeAll()
-        loadedTabIDs.removeAll()
-        if activeURL != "about:blank" {
-            _ = webView(for: activeID, loadIfNeeded: true)
+    func scrollViewDidScroll(_ scrollView: UIScrollView) {
+        guard preferences.hideToolbarOnScroll else {
+            if isChromeCollapsed { isChromeCollapsed = false }
+            return
         }
-        objectWillChange.send()
+        let y = scrollView.contentOffset.y
+        let delta = y - lastScrollOffsetY
+        lastScrollOffsetY = y
+        if y <= 24 {
+            if isChromeCollapsed { isChromeCollapsed = false }
+        } else if delta > 14 && !isChromeCollapsed {
+            isChromeCollapsed = true
+        } else if delta < -10 && preferences.expandToolbarOnScrollUp && isChromeCollapsed {
+            isChromeCollapsed = false
+        }
     }
 
-    private func installUserScripts(into controller: WKUserContentController) {
+    private func installUserScripts(into controller: WKUserContentController, blockingEnabled: Bool) {
+        // 0. Global Privacy Control (GPC) Header/Navigator API
+        if preferences.globalPrivacyControl {
+            let gpcJS = """
+            (() => {
+              try {
+                Object.defineProperty(Navigator.prototype, 'globalPrivacyControl', { get: () => true, configurable: true });
+              } catch (_) {}
+            })();
+            """
+            controller.addUserScript(WKUserScript(source: gpcJS, injectionTime: .atDocumentStart, forMainFrameOnly: false))
+        }
+
         // 1. Web Image Preloader (Android v0.15.17 / v0.15.18 exact parity!)
         if preferences.enableImagePreloader {
             let preloadStartJS = """
@@ -534,7 +765,7 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
         }
 
         // 2. Cosmetic Ad & Tracker Banner Hider
-        if preferences.blockTrackers {
+        if blockingEnabled {
             let adHideJS = """
             (() => {
               const style = document.createElement('style');
@@ -643,11 +874,12 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
         }
     }
 
-    // MARK: - Navigation & URL Resolution
+    // MARK: - Navigation & URL Suggestions
 
     func open(_ rawEntry: String) {
         let value = rawEntry.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !value.isEmpty else { return }
+        isChromeCollapsed = false
         if value == "about:blank" {
             setTab(activeID) { $0.url = "about:blank"; $0.title = "새 탭" }
             return
@@ -655,7 +887,7 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
 
         let resolved: URL?
         if value.contains(" ") || (!value.contains(".") && !value.contains("://")) {
-            resolved = preferences.searchEngine.searchURL(for: value)
+            resolved = preferences.searchEngine.searchURL(for: value, customTemplate: preferences.customSearchTemplate)
         } else if value.contains("://") {
             if preferences.automaticHTTPS && value.lowercased().hasPrefix("http://") {
                 resolved = URL(string: "https://" + value.dropFirst(7)) ?? URL(string: value)
@@ -679,21 +911,17 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
         var seen = Set<String>()
         var results: [BrowserBookmark] = []
         for bm in bookmarks where bm.title.lowercased().contains(query) || bm.url.lowercased().contains(query) {
-            if seen.insert(bm.url.lowercased()).inserted {
-                results.append(bm)
-            }
+            if seen.insert(bm.url.lowercased()).inserted { results.append(bm) }
             if results.count >= 6 { return results }
         }
         for h in history where h.title.lowercased().contains(query) || h.url.lowercased().contains(query) {
-            if seen.insert(h.url.lowercased()).inserted {
-                results.append(BrowserBookmark(title: h.title, url: h.url))
-            }
+            if seen.insert(h.url.lowercased()).inserted { results.append(BrowserBookmark(title: h.title, url: h.url)) }
             if results.count >= 6 { return results }
         }
         return results
     }
 
-    // MARK: - Tab Operations (Including Duplicate Immediately After Source Tab!)
+    // MARK: - Tab Operations (Including Duplicate Right After Source Tab!)
 
     @discardableResult
     func newTab(url: URL? = nil, afterTabID: UUID? = nil, background: Bool = false) -> UUID {
@@ -703,7 +931,9 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
             url: url?.absoluteString ?? "about:blank",
             profileID: activeProfileID,
             groupID: activeGroupID,
-            isPrivate: isPriv
+            isPrivate: isPriv,
+            isDesktopMode: preferences.desktopModeDefault,
+            pageZoom: preferences.fontScale
         )
         if let anchorID = afterTabID, let anchorIdx = tabs.firstIndex(where: { $0.id == anchorID }) {
             tabs.insert(tab, at: anchorIdx + 1)
@@ -712,6 +942,7 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
         }
         if !background {
             activeID = tab.id
+            isChromeCollapsed = false
         }
         if let url {
             loadedTabIDs.insert(tab.id)
@@ -721,7 +952,6 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
         return tab.id
     }
 
-    /// Duplicates `tabID` and inserts the duplicate IMMEDIATELY AFTER `tabID` (Android v0.15.17 parity!)
     func duplicateTab(_ tabID: UUID) {
         guard let source = tabs.first(where: { $0.id == tabID }),
               let sourceIdx = tabs.firstIndex(where: { $0.id == tabID }) else { return }
@@ -747,6 +977,7 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
         guard let tab = tabs.first(where: { $0.id == id }) else { return }
         captureSnapshot(for: activeID)
         activeID = id
+        isChromeCollapsed = false
         if tab.isPrivate {
             activeGroupID = Self.privateGroupID
         } else {
@@ -845,19 +1076,19 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
         selectGroup(targetGroup)
     }
 
-    func addProfile(name: String, icon: String = "person.fill", colorHex: String = "#0A84FF") {
-        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
-        let profile = BrowserProfile(name: trimmed, icon: icon, colorHex: colorHex)
-        let group = BrowserGroup(profileID: profile.id, name: "기본")
-        profiles.append(profile)
-        groups.append(group)
-        selectProfile(profile.id)
+    func saveProfile(_ profile: BrowserProfile) {
+        if let idx = profiles.firstIndex(where: { $0.id == profile.id }) {
+            profiles[idx] = profile
+        } else if profiles.count < 8 {
+            profiles.append(profile)
+            groups.append(BrowserGroup(profileID: profile.id, name: "기본"))
+        }
+        persist()
     }
 
     func deleteProfile(_ id: UUID) {
-        guard profiles.count > 1 else {
-            status = "마지막 프로필은 삭제할 수 없습니다."
+        guard profiles.count > 1, id != Self.defaultProfileID else {
+            status = "기본 프로필은 삭제할 수 없습니다."
             return
         }
         let removingTabs = tabs.filter { $0.profileID == id }.map(\.id)
@@ -895,6 +1126,7 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
     func forward() { webViews[activeID]?.goForward() }
     func reload() { webViews[activeID]?.reload() }
     func home() {
+        isChromeCollapsed = false
         if preferences.homePage == "about:blank" || preferences.homePage.isEmpty {
             setTab(activeID) { $0.url = "about:blank"; $0.title = "새 탭" }
         } else {
@@ -902,13 +1134,13 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
         }
     }
 
-    func toggleBookmark() {
+    func toggleBookmark(folderID: String? = nil) {
         guard let tab = activeTab, tab.url != "about:blank" else { return }
         if let idx = bookmarks.firstIndex(where: { $0.url.caseInsensitiveCompare(tab.url) == .orderedSame }) {
             bookmarks.remove(at: idx)
             status = "북마크에서 제거됨"
         } else {
-            bookmarks.append(BrowserBookmark(title: tab.title, url: tab.url))
+            bookmarks.append(BrowserBookmark(title: tab.title, url: tab.url, folderID: folderID))
             status = "북마크에 추가됨"
         }
         persist()
@@ -927,8 +1159,10 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
     }
 
     func setPageZoom(_ zoom: Double) {
-        let clamped = min(2.0, max(0.5, zoom))
+        let clamped = min(2.0, max(0.5, (zoom * 20).rounded() / 20.0))
         setTab(activeID) { $0.pageZoom = clamped }
+        preferences.fontScale = clamped
+        savePreferences()
         webViews[activeID]?.pageZoom = CGFloat(clamped)
     }
 
@@ -969,8 +1203,49 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
         let types = WKWebsiteDataStore.allWebsiteDataTypes()
         await WKWebsiteDataStore.default().removeData(ofTypes: types, modifiedSince: .distantPast)
         history.removeAll()
+        clearTabPreviews()
         persist()
-        status = "모든 방문 기록·쿠키·캐시를 삭제했습니다."
+        status = "모든 방문 기록·쿠키·캐시·미리보기를 삭제했습니다."
+    }
+
+    // MARK: - Downloads & Confirmation Dialog (Android DownloadConfirmationDialog Parity!)
+
+    func commitPendingDownload(fileName: String, saveToBookshelfFolder: String?) {
+        guard let pending = pendingDownload else { return }
+        defer {
+            try? FileManager.default.removeItem(at: pending.tempFileURL)
+            pendingDownload = nil
+        }
+        let safeName = URL(fileURLWithPath: fileName.trimmingCharacters(in: .whitespacesAndNewlines)).lastPathComponent
+        let resolvedName = safeName.isEmpty ? pending.suggestedFilename : safeName
+        if let shelfFolder = saveToBookshelfFolder,
+           let data = try? Data(contentsOf: pending.tempFileURL) {
+            let ext = (resolvedName as NSString).pathExtension
+            _ = ShelfModel.shared.addImageData(data, fileExtension: ext.isEmpty ? "png" : ext, toFolder: shelfFolder, sourceUrl: currentURL)
+            status = "‘\(BookshelfPath.leaf(shelfFolder))’ 책장에 이미지를 저장했습니다."
+            return
+        }
+        let directory = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("Downloads", isDirectory: true)
+        do {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            var destination = directory.appendingPathComponent(resolvedName)
+            if FileManager.default.fileExists(atPath: destination.path) {
+                destination = directory.appendingPathComponent("\(Int(Date().timeIntervalSince1970))-" + resolvedName)
+            }
+            try FileManager.default.copyItem(at: pending.tempFileURL, to: destination)
+            refreshDownloadsList()
+            status = "다운로드 저장 완료: \(destination.lastPathComponent)"
+        } catch {
+            status = "다운로드 저장 실패: \(error.localizedDescription)"
+        }
+    }
+
+    func cancelPendingDownload() {
+        if let pending = pendingDownload {
+            try? FileManager.default.removeItem(at: pending.tempFileURL)
+        }
+        pendingDownload = nil
     }
 
     // MARK: - WebKit Delegates
@@ -1020,9 +1295,7 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
     }
 
     func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
-        if id(for: webView) == activeID {
-            isLoading = false
-        }
+        if id(for: webView) == activeID { isLoading = false }
         let nsErr = error as NSError
         if nsErr.code == NSURLErrorCancelled { return }
         status = error.localizedDescription
@@ -1049,8 +1322,9 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
         decidePolicyFor navigationAction: WKNavigationAction,
         decisionHandler: @escaping (WKNavigationActionPolicy) -> Void
     ) {
-        if let host = navigationAction.request.url?.host?.lowercased(),
-           preferences.blockTrackers,
+        let host = navigationAction.request.url?.host?.lowercased() ?? ""
+        if preferences.trackingProtection != .off,
+           !preferences.contentBlockingExceptions.contains(currentHost),
            (host.contains("doubleclick.net") || host.contains("googlesyndication.com") ||
             host.contains("adnxs.com") || host.contains("taboola.com")) {
             blockedTrackerCount += 1
@@ -1074,25 +1348,23 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
         suggestedFilename: String,
         completionHandler: @escaping (URL?) -> Void
     ) {
-        let directory = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("Downloads", isDirectory: true)
-        do {
-            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-            let name = URL(fileURLWithPath: suggestedFilename).lastPathComponent
-            var destination = directory.appendingPathComponent(name)
-            if FileManager.default.fileExists(atPath: destination.path) {
-                destination = directory.appendingPathComponent("\(Int(Date().timeIntervalSince1970))-" + name)
-            }
-            completionHandler(destination)
-        } catch {
-            completionHandler(nil)
-            status = error.localizedDescription
-        }
+        let safe = URL(fileURLWithPath: suggestedFilename).lastPathComponent
+        let temp = FileManager.default.temporaryDirectory.appendingPathComponent("dl-\(UUID().uuidString)-\(safe)")
+        activeDownloadTempInfo = (temp, safe, response.mimeType ?? "application/octet-stream")
+        completionHandler(temp)
     }
 
     func downloadDidFinish(_ download: WKDownload) {
-        refreshDownloadsList()
-        status = "파일 다운로드 완료"
+        guard let info = activeDownloadTempInfo else { return }
+        activeDownloadTempInfo = nil
+        let ext = (info.suggestedName as NSString).pathExtension.lowercased()
+        let isImg = info.mimeType.lowercased().hasPrefix("image/") || ["png", "jpg", "jpeg", "webp", "gif", "heic", "bmp"].contains(ext)
+        pendingDownload = PendingDownloadPrompt(
+            suggestedFilename: info.suggestedName,
+            mimeType: info.mimeType,
+            isImage: isImg,
+            tempFileURL: info.url
+        )
     }
 
     func refreshDownloadsList() {

@@ -17,6 +17,14 @@ jobs:
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
+      - name: Read iOS version metadata
+        id: meta
+        run: |
+          VERSION=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" apps/ios/Omyaru/Info.plist)
+          BUILD=$(/usr/libexec/PlistBuddy -c "Print :CFBundleVersion" apps/ios/Omyaru/Info.plist)
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "build=$BUILD" >> "$GITHUB_OUTPUT"
+          echo "Building Omyaru iOS v${VERSION} (build ${BUILD})"
       - name: Install XcodeGen
         run: brew install xcodegen
       - name: Generate Xcode project
@@ -34,27 +42,57 @@ jobs:
             "$RUNNER_TEMP/omyaru-package/Payload/Omyaru.app"
           cd "$RUNNER_TEMP/omyaru-package"
           zip -qry "$RUNNER_TEMP/Omyaru.ipa" Payload
+          cp "$RUNNER_TEMP/Omyaru.ipa" "$RUNNER_TEMP/Omyaru-v${{ steps.meta.outputs.version }}-ios.ipa"
           test -s "$RUNNER_TEMP/Omyaru.ipa"
+      - name: Determine AltStore download URL
+        id: download_url
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="${{ steps.meta.outputs.version }}"
+          TAG="v${VERSION}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "has_version_release=true" >> "$GITHUB_OUTPUT"
+            echo "url=https://github.com/omyeol/Omyaru-Browser/releases/download/${TAG}/Omyaru-v${VERSION}-ios.ipa" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_version_release=false" >> "$GITHUB_OUTPUT"
+            echo "url=https://github.com/omyeol/Omyaru-Browser/releases/download/ios-latest/Omyaru.ipa" >> "$GITHUB_OUTPUT"
+          fi
       - name: Generate AltStore source
-        run: python3 apps/ios/make_altstore_source.py "$RUNNER_TEMP/Omyaru.ipa" "$RUNNER_TEMP/altstore-source.json"
+        run: |
+          python3 apps/ios/make_altstore_source.py \
+            "$RUNNER_TEMP/Omyaru.ipa" \
+            "$RUNNER_TEMP/altstore-source.json" \
+            "${{ steps.download_url.outputs.url }}"
       - uses: actions/upload-artifact@v4
         with:
           name: Omyaru-iOS-AltStore
           path: |
             ${{ runner.temp }}/Omyaru.ipa
+            ${{ runner.temp }}/Omyaru-v${{ steps.meta.outputs.version }}-ios.ipa
             ${{ runner.temp }}/altstore-source.json
-      - name: Publish preview IPA and stable AltStore source
+      - name: Publish IPA to unified release and ios-latest
         if: github.ref == 'refs/heads/main'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          VERSION="${{ steps.meta.outputs.version }}"
+          BUILD="${{ steps.meta.outputs.build }}"
+          TAG="v${VERSION}"
+          if [ "${{ steps.download_url.outputs.has_version_release }}" = "true" ]; then
+            gh release upload "$TAG" "$RUNNER_TEMP/Omyaru-v${VERSION}-ios.ipa" --clobber
+          fi
           gh release view ios-latest >/dev/null 2>&1 || \
-            gh release create ios-latest --title 'Omyaru iOS v0.2.0' \
-              --notes 'Omyaru iOS v0.2.0 build for AltStore Classic with Android feature parity.' \
+            gh release create ios-latest --title "Omyaru iOS v${VERSION}" \
+              --notes "Omyaru iOS v${VERSION} (build ${BUILD}) for AltStore Classic — full Android v${VERSION} feature parity." \
               --prerelease
-          gh release upload ios-latest "$RUNNER_TEMP/Omyaru.ipa" \
+          gh release upload ios-latest \
+            "$RUNNER_TEMP/Omyaru.ipa" \
+            "$RUNNER_TEMP/Omyaru-v${VERSION}-ios.ipa" \
             "$RUNNER_TEMP/altstore-source.json" --clobber
-          gh release edit ios-latest --title 'Omyaru iOS v0.2.0'
+          gh release edit ios-latest \
+            --title "Omyaru iOS v${VERSION}" \
+            --notes "Omyaru iOS v${VERSION} (build ${BUILD}) for AltStore Classic — full Android v${VERSION} feature parity."
       - name: Refresh raw AltStore source
         if: github.ref == 'refs/heads/main'
         run: |
@@ -63,6 +101,6 @@ jobs:
           if ! git diff --cached --quiet; then
             git -c user.name='github-actions[bot]' \
               -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
-              commit -m 'Update AltStore source for latest iOS IPA'
+              commit -m "Update AltStore source for Omyaru iOS v${{ steps.meta.outputs.version }}"
             git push origin HEAD:main
           fi

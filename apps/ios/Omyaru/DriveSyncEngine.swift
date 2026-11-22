@@ -14,6 +14,14 @@ enum OmyaruSyncCrypto {
     static let aad = Data("privacy-browser-sync-v1".utf8)
     static let defaultIterations = 210_000
 
+    static func sha256Hex(_ data: Data) -> String {
+        SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    }
+
+    static func compactUUID(_ id: UUID = UUID()) -> String {
+        id.uuidString.replacingOccurrences(of: "-", with: "").lowercased()
+    }
+
     static func encrypt(_ plain: Data, password: String, accountKeyID: String? = nil) throws -> Data {
         var salt = [UInt8](repeating: 0, count: 16)
         guard SecRandomCopyBytes(kSecRandomDefault, 16, &salt) == errSecSuccess else {
@@ -93,25 +101,85 @@ enum OmyaruSyncCrypto {
     }
 }
 
-// MARK: - Unified Portable Sync Snapshot (Tabs, Profiles, Groups, Bookmarks, History, Bookshelf)
+// MARK: - KeyRing Supporting Multiple Account Keys & Legacy Passphrase Envelopes
+
+struct OmyaruDriveKeyRing {
+    var keys: [String: String] = [:]
+    var legacyPasswords: [String] = []
+
+    var primaryKey: (id: String, secret: String)? {
+        guard let firstID = keys.keys.sorted().first, let secret = keys[firstID] else { return nil }
+        return (firstID, secret)
+    }
+
+    mutating func addRecord(_ data: Data, expectedID: String) throws {
+        guard let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              obj["format"] as? String == "omyaru-account-key",
+              obj["version"] as? Int == 1,
+              obj["id"] as? String == expectedID,
+              let secret = obj["secret"] as? String,
+              Data(base64Encoded: secret)?.count == 32 else {
+            return
+        }
+        keys[expectedID] = secret
+        if let legacyText = obj["legacyEnvelope"] as? String,
+           let legacyData = legacyText.data(using: .utf8),
+           let plain = try? OmyaruSyncCrypto.decrypt(legacyData, password: secret),
+           let legacyObj = try? JSONSerialization.jsonObject(with: plain) as? [String: Any],
+           let pass = legacyObj["passphrase"] as? String, pass.count >= 6 {
+            if !legacyPasswords.contains(pass) {
+                legacyPasswords.append(pass)
+            }
+        }
+    }
+
+    func encrypt(_ plain: Data) throws -> Data {
+        guard let primary = primaryKey else {
+            throw NSError(domain: "OmyaruSync", code: -10, userInfo: [NSLocalizedDescriptionKey: "동기화 계정 키가 없습니다."])
+        }
+        return try OmyaruSyncCrypto.encrypt(plain, password: primary.secret, accountKeyID: primary.id)
+    }
+
+    func decrypt(_ envelopeData: Data) throws -> Data {
+        if let obj = try? JSONSerialization.jsonObject(with: envelopeData) as? [String: Any],
+           let keyID = obj["accountKeyId"] as? String,
+           let secret = keys[keyID] {
+            return try OmyaruSyncCrypto.decrypt(envelopeData, password: secret)
+        }
+        for pass in legacyPasswords {
+            if let plain = try? OmyaruSyncCrypto.decrypt(envelopeData, password: pass) {
+                return plain
+            }
+        }
+        if let primary = primaryKey, let plain = try? OmyaruSyncCrypto.decrypt(envelopeData, password: primary.secret) {
+            return plain
+        }
+        throw NSError(domain: "OmyaruSync", code: -11, userInfo: [NSLocalizedDescriptionKey: "암호화된 동기화 레코드를 복호화할 수 없습니다."])
+    }
+}
+
+// MARK: - Unified Portable Sync Bundle (Offline / AirDrop / Files)
 
 struct OmyaruFullSyncBundle: Codable {
-    var version: Int = 1
+    var version: Int = 2
     var exportedAtEpochMs: Int64 = Int64(Date().timeIntervalSince1970 * 1000)
     var profiles: [BrowserProfile]
     var groups: [BrowserGroup]
     var tabs: [BrowserTab]
+    var bookmarkFolders: [BookmarkFolder] = []
     var bookmarks: [BrowserBookmark]
     var history: [HistoryEntry]
     var bookshelf: BookshelfCatalogData
     var bookshelfImagesBase64: [String: String] = [:]
 }
 
-// MARK: - Google Drive AppData & Encrypted File Sync Coordinator
+// MARK: - Google Drive AppData & Chunked Bookshelf Sync Coordinator
 
 @MainActor
 final class DriveSyncManager: NSObject, ObservableObject, ASWebAuthenticationPresentationContextProviding {
     static let shared = DriveSyncManager()
+    static let tabResetConfirmationPhrase = "동기화 탭 초기화"
+    static let chunkSize = 1024 * 1024
 
     @Published var clientID: String {
         didSet { UserDefaults.standard.set(clientID, forKey: "omyaru.ios.drive.clientId") }
@@ -136,6 +204,15 @@ final class DriveSyncManager: NSObject, ObservableObject, ASWebAuthenticationPre
     @Published var progress: Double? = nil
     @Published var lastSyncedAt: Date? = nil
 
+    private var cachedKeyRing: OmyaruDriveKeyRing? = nil
+
+    private var syncStateDirectory: URL {
+        let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("OmyaruDriveSync", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir
+    }
+
     override init() {
         let d = UserDefaults.standard
         let plistClient = (Bundle.main.object(forInfoDictionaryKey: "GIDClientID") as? String) ?? ""
@@ -157,7 +234,7 @@ final class DriveSyncManager: NSObject, ObservableObject, ASWebAuthenticationPre
             .first(where: \.isKeyWindow) ?? ASPresentationAnchor()
     }
 
-    // MARK: - Google OAuth 2.0 PKCE Sign-In via ASWebAuthenticationSession
+    // MARK: - Google OAuth 2.0 PKCE Sign-In & Refresh
 
     func signInWithGoogle() async {
         let trimmedClient = clientID.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -231,16 +308,40 @@ final class DriveSyncManager: NSObject, ObservableObject, ASWebAuthenticationPre
             if let refresh = json["refresh_token"] as? String {
                 refreshToken = refresh
             }
+            cachedKeyRing = nil
             status = "Google Drive 연결 완료"
         } catch {
             status = "Google 로그인 취소 또는 실패: \(error.localizedDescription)"
         }
     }
 
+    private func refreshAccessTokenIfPossible() async -> Bool {
+        let trimmedClient = clientID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedClient.isEmpty, !refreshToken.isEmpty else { return false }
+        var req = URLRequest(url: URL(string: "https://oauth2.googleapis.com/token")!)
+        req.httpMethod = "POST"
+        req.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+        let body = [
+            "client_id=\(trimmedClient)",
+            "refresh_token=\(refreshToken)",
+            "grant_type=refresh_token"
+        ].joined(separator: "&")
+        req.httpBody = body.data(using: .utf8)
+        guard let (data, resp) = try? await URLSession.shared.data(for: req),
+              let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let newToken = json["access_token"] as? String else {
+            return false
+        }
+        accessToken = newToken
+        return true
+    }
+
     func disconnectGoogle() {
         accessToken = ""
         refreshToken = ""
         autoSyncEnabled = false
+        cachedKeyRing = nil
         status = "Google Drive 연결 해제됨"
     }
 
@@ -261,7 +362,7 @@ final class DriveSyncManager: NSObject, ObservableObject, ASWebAuthenticationPre
             .replacingOccurrences(of: "=", with: "")
     }
 
-    // MARK: - Google Drive AppData Sync (Wire-Compatible with Android & Windows)
+    // MARK: - Full Google Drive Sync (Tabs, Profiles, Groups, Resets, Bookmarks, History, Bookshelf + Chunks!)
 
     func syncWithGoogleDrive(browser: BrowserModel?, shelf: ShelfModel) async {
         guard !busy else { return }
@@ -271,80 +372,138 @@ final class DriveSyncManager: NSObject, ObservableObject, ASWebAuthenticationPre
         }
         busy = true
         progress = 0.05
-        status = "Google Drive appDataFolder 확인 중..."
+        status = "Google Drive 계정 키 확인 중..."
         defer {
             busy = false
             progress = nil
         }
 
         do {
-            // 1. Load or create account key (omyaru-account-key-v1-<id>.json)
-            let (accountKeyID, secret) = try await ensureAccountKey()
-            progress = 0.20
+            let keyRing = try await loadOrCreateKeyRing()
+            cachedKeyRing = keyRing
+            progress = 0.15
 
-            // 2. Sync UserData (Bookmarks & History: omyaru-userdata-v1-*.json)
             if let browser {
                 status = "북마크·방문 기록 동기화 중..."
-                try await syncUserData(browser: browser, keyID: accountKeyID, secret: secret)
-            }
-            progress = 0.45
+                try await syncUserData(browser: browser, keys: keyRing)
+                progress = 0.35
 
-            // 3. Sync Tabs/Profiles/Groups (omyaru-tabs-v2-*.json)
-            if let browser {
-                status = "프로필·탭 그룹·열린 탭 동기화 중..."
-                try await syncTabsAndProfiles(browser: browser, keyID: accountKeyID, secret: secret)
+                status = "프로필·탭 그룹·열린 탭 및 초기화 기록 확인 중..."
+                try await syncTabsAndResets(browser: browser, keys: keyRing)
+                progress = 0.55
             }
-            progress = 0.70
 
-            // 4. Sync Bookshelf Catalog & Images (omyaru-shelf-v1-*.json / omyaru-shelf-chunk-v1-*.json)
-            status = "책장 폴더 및 이미지 동기화 중..."
-            try await syncBookshelf(shelf: shelf, keyID: accountKeyID, secret: secret)
+            status = "책장 폴더·메모·이미지 조각 동기화 중..."
+            try await syncBookshelfWithChunks(shelf: shelf, keys: keyRing)
 
             progress = 1.0
             lastSyncedAt = Date()
-            status = "Google Drive 동기화 완료 (탭·북마크·책장)"
+            status = "Google Drive 동기화 완료 (프로필·탭·북마크·책장 이미지)"
         } catch {
             status = "동기화 실패: \(error.localizedDescription)"
         }
     }
+
+    /// Publishes an `omyaru-tab-reset-v1-<id>.json` record (Android `DriveTabReset` exact wire parity!)
+    func publishTabReset(confirmation: String, browser: BrowserModel?) async throws {
+        guard confirmation == Self.tabResetConfirmationPhrase else {
+            throw NSError(domain: "OmyaruDrive", code: -20, userInfo: [NSLocalizedDescriptionKey: "‘\(Self.tabResetConfirmationPhrase)’를 정확히 입력해야 합니다."])
+        }
+        let keys = try await loadOrCreateKeyRing()
+        let resetID = OmyaruSyncCrypto.compactUUID()
+        let payloadObj: [String: Any] = [
+            "format": "omyaru-tab-reset",
+            "version": 1,
+            "id": resetID
+        ]
+        let plain = try JSONSerialization.data(withJSONObject: payloadObj, options: [.sortedKeys])
+        let encrypted = try keys.encrypt(plain)
+        _ = try await uploadDriveFile(name: "omyaru-tab-reset-v1-\(resetID).json", payload: encrypted)
+        var seenResets = loadSeenSet(name: "seen-tab-resets.json")
+        seenResets.insert(resetID)
+        saveSeenSet(seenResets, name: "seen-tab-resets.json")
+        browser?.closeAllVisibleTabs()
+        status = "모든 기기의 동기화 탭 초기화 요청을 기록했습니다."
+    }
+
+    /// On-demand download of a cloud bookshelf photo's encrypted 1MB chunks (`omyaru-shelf-chunk-v1-*.json`)!
+    func downloadCloudImageIfNeeded(item: BookshelfItem, shelf: ShelfModel) async -> URL? {
+        let localURL = shelf.imageURL(for: item)
+        if FileManager.default.fileExists(atPath: localURL.path) {
+            return localURL
+        }
+        guard let manifest = item.cloud, !accessToken.isEmpty else { return nil }
+        do {
+            let keys: OmyaruDriveKeyRing
+            if let cached = cachedKeyRing {
+                keys = cached
+            } else {
+                keys = try await loadOrCreateKeyRing()
+                cachedKeyRing = keys
+            }
+            let assembled = try await downloadChunkedImage(manifest: manifest, keys: keys)
+            try FileManager.default.createDirectory(at: shelf.root, withIntermediateDirectories: true)
+            try assembled.write(to: localURL, options: .atomic)
+            return localURL
+        } catch {
+            return nil
+        }
+    }
+
+    // MARK: - Low-Level Drive REST Helpers
 
     private struct DriveFileEntry: Decodable {
         let id: String
         let name: String
     }
 
+    private func driveDataRequest(_ req: URLRequest, retried: Bool = false) async throws -> Data {
+        var signed = req
+        signed.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+        let (data, resp) = try await URLSession.shared.data(for: signed)
+        guard let http = resp as? HTTPURLResponse else {
+            throw NSError(domain: "OmyaruDrive", code: -1, userInfo: [NSLocalizedDescriptionKey: "잘못된 응답"])
+        }
+        if http.statusCode == 401 && !retried {
+            if await refreshAccessTokenIfPossible() {
+                return try await driveDataRequest(req, retried: true)
+            }
+        }
+        guard (200..<300).contains(http.statusCode) else {
+            throw NSError(domain: "OmyaruDrive", code: http.statusCode, userInfo: [NSLocalizedDescriptionKey: "Google Drive 요청 실패 (HTTP \(http.statusCode))"])
+        }
+        return data
+    }
+
     private func listDriveFiles(prefix: String) async throws -> [DriveFileEntry] {
         struct FileListResponse: Decodable {
             let files: [DriveFileEntry]
+            let nextPageToken: String?
         }
-        var comps = URLComponents(string: "https://www.googleapis.com/drive/v3/files")!
-        comps.queryItems = [
-            URLQueryItem(name: "spaces", value: "appDataFolder"),
-            URLQueryItem(name: "pageSize", value: "500"),
-            URLQueryItem(name: "fields", value: "files(id,name)"),
-            URLQueryItem(name: "q", value: "trashed = false and name contains '\(prefix)'")
-        ]
-        var req = URLRequest(url: comps.url!, timeoutInterval: 25)
-        req.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
-        let (data, resp) = try await URLSession.shared.data(for: req)
-        guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
-            let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
-            throw NSError(domain: "OmyaruDrive", code: code, userInfo: [NSLocalizedDescriptionKey: "Google Drive 목록 요청 실패 (HTTP \(code))"])
-        }
-        return try JSONDecoder().decode(FileListResponse.self, from: data).files
+        var results: [DriveFileEntry] = []
+        var pageToken: String? = nil
+        repeat {
+            var comps = URLComponents(string: "https://www.googleapis.com/drive/v3/files")!
+            var query = [
+                URLQueryItem(name: "spaces", value: "appDataFolder"),
+                URLQueryItem(name: "pageSize", value: "1000"),
+                URLQueryItem(name: "fields", value: "nextPageToken,files(id,name)"),
+                URLQueryItem(name: "q", value: "trashed = false and name contains '\(prefix)'")
+            ]
+            if let pageToken { query.append(URLQueryItem(name: "pageToken", value: pageToken)) }
+            comps.queryItems = query
+            let data = try await driveDataRequest(URLRequest(url: comps.url!, timeoutInterval: 25))
+            let page = try JSONDecoder().decode(FileListResponse.self, from: data)
+            results.append(contentsOf: page.files)
+            pageToken = page.nextPageToken
+        } while pageToken != nil && results.count < 10_000
+        return results
     }
 
     private func readDriveFile(_ fileID: String) async throws -> Data {
         var comps = URLComponents(string: "https://www.googleapis.com/drive/v3/files/\(fileID)")!
         comps.queryItems = [URLQueryItem(name: "alt", value: "media")]
-        var req = URLRequest(url: comps.url!, timeoutInterval: 30)
-        req.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
-        let (data, resp) = try await URLSession.shared.data(for: req)
-        guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
-            let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
-            throw NSError(domain: "OmyaruDrive", code: code, userInfo: [NSLocalizedDescriptionKey: "Google Drive 파일 읽기 실패 (HTTP \(code))"])
-        }
-        return data
+        return try await driveDataRequest(URLRequest(url: comps.url!, timeoutInterval: 30))
     }
 
     @discardableResult
@@ -365,120 +524,196 @@ final class DriveSyncManager: NSObject, ObservableObject, ASWebAuthenticationPre
 
         var req = URLRequest(url: URL(string: "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id")!, timeoutInterval: 45)
         req.httpMethod = "POST"
-        req.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
         req.setValue("multipart/related; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
         req.httpBody = body
 
-        let (data, resp) = try await URLSession.shared.data(for: req)
-        guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode),
-              let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+        let data = try await driveDataRequest(req)
+        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
               let id = json["id"] as? String else {
-            let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
-            throw NSError(domain: "OmyaruDrive", code: code, userInfo: [NSLocalizedDescriptionKey: "Google Drive 업로드 실패 (HTTP \(code))"])
+            throw NSError(domain: "OmyaruDrive", code: -3, userInfo: [NSLocalizedDescriptionKey: "업로드 파일 ID를 확인하지 못했습니다."])
         }
         return id
     }
 
-    private func ensureAccountKey() async throws -> (id: String, secret: String) {
+    private func loadOrCreateKeyRing() async throws -> OmyaruDriveKeyRing {
+        var ring = OmyaruDriveKeyRing()
+        if syncPassphrase.count >= 6 {
+            ring.legacyPasswords.append(syncPassphrase)
+        }
         let keyFiles = try await listDriveFiles(prefix: "omyaru-account-key-v1-")
         for file in keyFiles.sorted(by: { $0.name < $1.name }) {
-            if let data = try? await readDriveFile(file.id),
-               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-               json["format"] as? String == "omyaru-account-key",
-               let id = json["id"] as? String,
-               let secret = json["secret"] as? String {
-                return (id, secret)
+            let expectedID = file.name
+                .replacingOccurrences(of: "omyaru-account-key-v1-", with: "")
+                .replacingOccurrences(of: ".json", with: "")
+            if let data = try? await readDriveFile(file.id) {
+                try? ring.addRecord(data, expectedID: expectedID)
             }
         }
-        let newID = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
-        var randomBytes = [UInt8](repeating: 0, count: 32)
-        _ = SecRandomCopyBytes(kSecRandomDefault, 32, &randomBytes)
-        let secret = Data(randomBytes).base64EncodedString()
-        let record: [String: Any] = [
-            "format": "omyaru-account-key",
-            "version": 1,
-            "id": newID,
-            "secret": secret,
-            "legacyEnvelope": NSNull()
-        ]
-        let payload = try JSONSerialization.data(withJSONObject: record, options: [.sortedKeys])
-        _ = try await uploadDriveFile(name: "omyaru-account-key-v1-\(newID).json", payload: payload)
-        return (newID, secret)
+        if ring.primaryKey == nil {
+            let newID = OmyaruSyncCrypto.compactUUID()
+            var randomBytes = [UInt8](repeating: 0, count: 32)
+            _ = SecRandomCopyBytes(kSecRandomDefault, 32, &randomBytes)
+            let secret = Data(randomBytes).base64EncodedString()
+            var record: [String: Any] = [
+                "format": "omyaru-account-key",
+                "version": 1,
+                "id": newID,
+                "secret": secret,
+                "legacyEnvelope": NSNull()
+            ]
+            if syncPassphrase.count >= 6,
+               let legacyPlain = try? JSONSerialization.data(withJSONObject: ["passphrase": syncPassphrase]),
+               let wrapped = try? OmyaruSyncCrypto.encrypt(legacyPlain, password: secret),
+               let wrappedText = String(data: wrapped, encoding: .utf8) {
+                record["legacyEnvelope"] = wrappedText
+            }
+            let payload = try JSONSerialization.data(withJSONObject: record, options: [.sortedKeys])
+            _ = try await uploadDriveFile(name: "omyaru-account-key-v1-\(newID).json", payload: payload)
+            try ring.addRecord(payload, expectedID: newID)
+        }
+        return ring
     }
 
-    private func syncUserData(browser: BrowserModel, keyID: String, secret: String) async throws {
+    // MARK: - Sync Sub-Protocols
+
+    private func syncUserData(browser: BrowserModel, keys: OmyaruDriveKeyRing) async throws {
+        var seen = loadSeenSet(name: "seen-userdata.json")
         let files = try await listDriveFiles(prefix: "omyaru-userdata-v1-")
-        for file in files {
+        for file in files where !seen.contains(file.id) {
             guard let encrypted = try? await readDriveFile(file.id),
-                  let plain = try? OmyaruSyncCrypto.decrypt(encrypted, password: secret),
+                  let plain = try? keys.decrypt(encrypted),
                   let doc = try? JSONSerialization.jsonObject(with: plain) as? [String: Any] else { continue }
-            if let bObj = doc["bookmarks"] as? [String: Any],
-               let items = bObj["items"] as? [[String: Any]] {
-                for row in items {
-                    guard let title = row["title"] as? String,
-                          let url = row["url"] as? String else { continue }
-                    let folder = (row["folder"] as? String) ?? ""
-                    if !browser.bookmarks.contains(where: { $0.url == url }) {
-                        browser.bookmarks.append(BrowserBookmark(title: title, url: url, folder: folder))
+            if let bObj = doc["bookmarks"] as? [String: Any] {
+                if let folderRows = bObj["folders"] as? [[String: Any]] {
+                    for row in folderRows {
+                        guard let name = row["name"] as? String else { continue }
+                        let idStr = row["id"] as? String ?? OmyaruSyncCrypto.compactUUID()
+                        let parentStr = row["parentId"] as? String
+                        if !browser.bookmarkFolders.contains(where: { $0.id == idStr || ($0.name == name && $0.parentID == parentStr) }) {
+                            browser.bookmarkFolders.append(BookmarkFolder(id: idStr, name: name, parentID: parentStr))
+                        }
+                    }
+                }
+                if let items = bObj["items"] as? [[String: Any]] {
+                    for row in items {
+                        guard let title = row["title"] as? String,
+                              let url = row["url"] as? String else { continue }
+                        let folderID = row["folderId"] as? String
+                        if !browser.bookmarks.contains(where: { $0.url == url }) {
+                            browser.bookmarks.append(BrowserBookmark(title: title, url: url, folderID: folderID))
+                        }
                     }
                 }
             }
             if let hArr = doc["history"] as? [[String: Any]] {
-                for row in hArr.prefix(300) {
+                for row in hArr.prefix(400) {
                     guard let title = row["title"] as? String,
                           let url = row["url"] as? String else { continue }
-                    let visited = (row["visitedAtEpochMs"] as? Int64) ?? Int64(Date().timeIntervalSince1970 * 1000)
+                    let visited = (row["visitedAtEpochMs"] as? NSNumber)?.int64Value ?? Int64(Date().timeIntervalSince1970 * 1000)
                     if !browser.history.contains(where: { $0.url == url }) {
                         browser.history.append(HistoryEntry(title: title, url: url, visitedAtEpochMs: visited))
                     }
                 }
             }
+            seen.insert(file.id)
         }
+        saveSeenSet(seen, name: "seen-userdata.json")
         browser.persist()
 
-        let opID = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
-        let bookmarkItems = browser.bookmarks.map { b -> [String: Any] in
-            ["id": b.id.uuidString.replacingOccurrences(of: "-", with: "").lowercased(),
-             "title": b.title,
-             "url": b.url,
-             "folder": b.folder]
+        let opID = OmyaruSyncCrypto.compactUUID()
+        let folderPayload = browser.bookmarkFolders.map { f -> [String: Any] in
+            var obj: [String: Any] = ["id": f.id, "name": f.name]
+            if let p = f.parentID { obj["parentId"] = p } else { obj["parentId"] = NSNull() }
+            return obj
         }
-        let historyItems = browser.history.prefix(300).map { h -> [String: Any] in
+        let bookmarkItems = browser.bookmarks.map { b -> [String: Any] in
+            var obj: [String: Any] = [
+                "id": OmyaruSyncCrypto.compactUUID(b.id),
+                "title": b.title,
+                "url": b.url
+            ]
+            if let f = b.folderID { obj["folderId"] = f } else { obj["folderId"] = NSNull() }
+            return obj
+        }
+        let historyItems = browser.history.prefix(400).map { h -> [String: Any] in
             ["title": h.title, "url": h.url, "visitedAtEpochMs": h.visitedAtEpochMs]
         }
         let payloadObj: [String: Any] = [
             "id": opID,
             "deviceId": UIDevice.current.identifierForVendor?.uuidString ?? "ios",
             "timestamp": Int64(Date().timeIntervalSince1970 * 1000),
-            "bookmarks": ["folders": browser.bookmarkFolders, "items": bookmarkItems],
+            "bookmarks": ["folders": folderPayload, "items": bookmarkItems],
             "history": historyItems
         ]
-        let plain = try JSONSerialization.data(withJSONObject: payloadObj)
-        let encrypted = try OmyaruSyncCrypto.encrypt(plain, password: secret, accountKeyID: keyID)
-        _ = try await uploadDriveFile(name: "omyaru-userdata-v1-\(opID).json", payload: encrypted)
+        let plain = try JSONSerialization.data(withJSONObject: payloadObj, options: [.sortedKeys])
+        let hash = OmyaruSyncCrypto.sha256Hex(plain)
+        let lastHash = UserDefaults.standard.string(forKey: "omyaru.ios.drive.lastUserDataHash") ?? ""
+        if hash != lastHash {
+            let encrypted = try keys.encrypt(plain)
+            let uploadedID = try await uploadDriveFile(name: "omyaru-userdata-v1-\(opID).json", payload: encrypted)
+            seen.insert(uploadedID)
+            saveSeenSet(seen, name: "seen-userdata.json")
+            UserDefaults.standard.set(hash, forKey: "omyaru.ios.drive.lastUserDataHash")
+        }
     }
 
-    private func syncTabsAndProfiles(browser: BrowserModel, keyID: String, secret: String) async throws {
-        let files = try await listDriveFiles(prefix: "omyaru-tabs-v")
-        for file in files {
-            guard let encrypted = try? await readDriveFile(file.id),
-                  let plain = try? OmyaruSyncCrypto.decrypt(encrypted, password: secret),
-                  let batch = try? JSONSerialization.jsonObject(with: plain) as? [String: Any] else { continue }
-            applyTabChanges(from: batch, to: browser)
+    private func syncTabsAndResets(browser: BrowserModel, keys: OmyaruDriveKeyRing) async throws {
+        // 1. Check remote DriveTabReset records first
+        var seenResets = loadSeenSet(name: "seen-tab-resets.json")
+        let resetFiles = try await listDriveFiles(prefix: "omyaru-tab-reset-v1-")
+        var triggeredReset = false
+        for file in resetFiles {
+            let resetID = file.name
+                .replacingOccurrences(of: "omyaru-tab-reset-v1-", with: "")
+                .replacingOccurrences(of: ".json", with: "")
+            if !seenResets.contains(resetID) {
+                if let encrypted = try? await readDriveFile(file.id),
+                   let plain = try? keys.decrypt(encrypted),
+                   let doc = try? JSONSerialization.jsonObject(with: plain) as? [String: Any],
+                   doc["format"] as? String == "omyaru-tab-reset" {
+                    seenResets.insert(resetID)
+                    triggeredReset = true
+                }
+            }
         }
+        saveSeenSet(seenResets, name: "seen-tab-resets.json")
+        if triggeredReset {
+            browser.tabs.removeAll { !$0.isPrivate }
+            if browser.tabs.isEmpty { _ = browser.newTab() }
+            browser.persist()
+        }
+
+        // 2. Pull unseen tab batches
+        var seenTabs = loadSeenSet(name: "seen-tabs.json")
+        let files = try await listDriveFiles(prefix: "omyaru-tabs-v")
+        for file in files where !seenTabs.contains(file.id) {
+            if let encrypted = try? await readDriveFile(file.id),
+               let plain = try? keys.decrypt(encrypted),
+               let batch = try? JSONSerialization.jsonObject(with: plain) as? [String: Any] {
+                applyRemoteTabBatch(batch, to: browser)
+            }
+            seenTabs.insert(file.id)
+        }
+        saveSeenSet(seenTabs, name: "seen-tabs.json")
         browser.persist()
 
-        // Push local tabs/groups/profiles batch
-        let batchID = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
+        // 3. Push local tabs/profiles/groups snapshot if changed
+        let batchID = OmyaruSyncCrypto.compactUUID()
         let actorID = (UIDevice.current.identifierForVendor?.uuidString ?? UUID().uuidString)
             .replacingOccurrences(of: "-", with: "").lowercased().padding(toLength: 32, withPad: "a", startingAt: 0)
         let clock = Int64(Date().timeIntervalSince1970 * 1000)
         var changes: [[String: Any]] = []
 
-        for (idx, tab) in browser.tabs.filter({ !$0.isPrivate }).enumerated() {
-            let tid = tab.id.uuidString.replacingOccurrences(of: "-", with: "").lowercased()
-            let pid = tab.profileID.uuidString.replacingOccurrences(of: "-", with: "").lowercased()
-            let gid = tab.groupID.uuidString.replacingOccurrences(of: "-", with: "").lowercased()
+        for (idx, profile) in browser.profiles.enumerated() {
+            let pid = profile.id == BrowserModel.defaultProfileID ? "default" : OmyaruSyncCrypto.compactUUID(profile.id)
+            changes.append(["kind": "profiles", "id": pid, "field": "name", "value": profile.name])
+            changes.append(["kind": "profiles", "id": pid, "field": "icon", "value": profile.icon])
+            changes.append(["kind": "profiles", "id": pid, "field": "order", "value": idx])
+        }
+        for (idx, tab) in browser.tabs.filter({ !$0.isPrivate }).prefix(30).enumerated() {
+            let tid = OmyaruSyncCrypto.compactUUID(tab.id)
+            let pid = tab.profileID == BrowserModel.defaultProfileID ? "default" : OmyaruSyncCrypto.compactUUID(tab.profileID)
+            let gid = OmyaruSyncCrypto.compactUUID(tab.groupID)
             changes.append(["kind": "tabs", "id": tid, "field": "title", "value": tab.title])
             changes.append(["kind": "tabs", "id": tid, "field": "url", "value": tab.url])
             changes.append(["kind": "tabs", "id": tid, "field": "profileId", "value": pid])
@@ -486,19 +721,27 @@ final class DriveSyncManager: NSObject, ObservableObject, ASWebAuthenticationPre
             changes.append(["kind": "tabs", "id": tid, "field": "order", "value": idx])
         }
         guard !changes.isEmpty else { return }
-        let batchObj: [String: Any] = [
-            "protocol": 1,
-            "id": batchID,
-            "actor": String(actorID.prefix(32)),
-            "clock": clock,
-            "changes": changes
-        ]
-        let plain = try JSONSerialization.data(withJSONObject: batchObj)
-        let encrypted = try OmyaruSyncCrypto.encrypt(plain, password: secret, accountKeyID: keyID)
-        _ = try await uploadDriveFile(name: "omyaru-tabs-v2-\(batchID).json", payload: encrypted)
+        let fingerprintData = try JSONSerialization.data(withJSONObject: changes, options: [.sortedKeys])
+        let hash = OmyaruSyncCrypto.sha256Hex(fingerprintData)
+        let lastHash = UserDefaults.standard.string(forKey: "omyaru.ios.drive.lastTabsHash") ?? ""
+        if hash != lastHash {
+            let batchObj: [String: Any] = [
+                "protocol": 1,
+                "id": batchID,
+                "actor": String(actorID.prefix(32)),
+                "clock": clock,
+                "changes": changes
+            ]
+            let plain = try JSONSerialization.data(withJSONObject: batchObj, options: [.sortedKeys])
+            let encrypted = try keys.encrypt(plain)
+            let uploadedID = try await uploadDriveFile(name: "omyaru-tabs-v2-\(batchID).json", payload: encrypted)
+            seenTabs.insert(uploadedID)
+            saveSeenSet(seenTabs, name: "seen-tabs.json")
+            UserDefaults.standard.set(hash, forKey: "omyaru.ios.drive.lastTabsHash")
+        }
     }
 
-    private func applyTabChanges(from batch: [String: Any], to browser: BrowserModel) {
+    private func applyRemoteTabBatch(_ batch: [String: Any], to browser: BrowserModel) {
         let rows: [[String: Any]]
         if let direct = batch["changes"] as? [[String: Any]] {
             rows = direct
@@ -520,9 +763,8 @@ final class DriveSyncManager: NSObject, ObservableObject, ASWebAuthenticationPre
         }
         for (id, url) in tabURLs where !deletedTabs.contains(id) && url != "about:blank" {
             if !browser.tabs.contains(where: { $0.url == url }) && browser.tabs.count < 30 {
-                let title = tabTitles[id] ?? url
                 browser.tabs.append(BrowserTab(
-                    title: title,
+                    title: tabTitles[id] ?? url,
                     url: url,
                     profileID: browser.activeProfileID,
                     groupID: browser.activeGroupID,
@@ -532,64 +774,240 @@ final class DriveSyncManager: NSObject, ObservableObject, ASWebAuthenticationPre
         }
     }
 
-    private func syncBookshelf(shelf: ShelfModel, keyID: String, secret: String) async throws {
+    // MARK: - Full Bookshelf Sync With 1MB Encrypted Image Chunks (omyaru-shelf-v1- & omyaru-shelf-chunk-v1-)
+
+    private func syncBookshelfWithChunks(shelf: ShelfModel, keys: OmyaruDriveKeyRing) async throws {
+        // 1. Upload local images that don't yet have a cloud manifest
+        for i in shelf.catalog.items.indices {
+            if shelf.catalog.items[i].cloud != nil { continue }
+            let item = shelf.catalog.items[i]
+            let localURL = shelf.imageURL(for: item)
+            guard let imageBytes = try? Data(contentsOf: localURL), !imageBytes.isEmpty else { continue }
+            status = "책장 사진 업로드 중 (\(i + 1)/\(shelf.catalog.items.count))..."
+            let manifest = try await uploadChunkedImage(data: imageBytes, keys: keys)
+            shelf.catalog.items[i].cloud = manifest
+        }
+        shelf.save()
+
+        // 2. Pull unseen remote shelf metadata batches
+        var seenShelf = loadSeenSet(name: "seen-shelf.json")
         let shelfFiles = try await listDriveFiles(prefix: "omyaru-shelf-v1-")
         var folderNames: [String: String] = [:]
         var folderNotes: [String: String] = [:]
         var folderCols: [String: Int] = [:]
-        for file in shelfFiles {
+        var deletedFolders = Set<String>()
+        var remoteImages: [String: [String: Any]] = [:]
+        var deletedImages = Set<String>()
+
+        for (idx, file) in shelfFiles.enumerated() where !seenShelf.contains(file.id) {
+            progress = 0.55 + 0.20 * Double(idx + 1) / Double(max(1, shelfFiles.count))
             guard let encrypted = try? await readDriveFile(file.id),
-                  let plain = try? OmyaruSyncCrypto.decrypt(encrypted, password: secret),
+                  let plain = try? keys.decrypt(encrypted),
                   let batch = try? JSONSerialization.jsonObject(with: plain) as? [String: Any],
-                  let changes = batch["changes"] as? [[String: Any]] else { continue }
+                  let changes = batch["changes"] as? [[String: Any]] else {
+                seenShelf.insert(file.id)
+                continue
+            }
             for row in changes {
-                guard let kind = row["kind"] as? String, kind == "folders",
-                      let fid = row["id"] as? String,
+                guard let kind = row["kind"] as? String,
+                      let entityID = row["id"] as? String,
                       let field = row["field"] as? String else { continue }
-                if field == "name", let val = row["value"] as? String { folderNames[fid] = val }
-                else if field == "note", let val = row["value"] as? String { folderNotes[fid] = val }
-                else if field == "columns", let val = row["value"] as? Int { folderCols[fid] = val }
+                if kind == "folders" {
+                    if field == "$deleted" { deletedFolders.insert(entityID) }
+                    else if field == "name", let val = row["value"] as? String { folderNames[entityID] = val }
+                    else if field == "note", let val = row["value"] as? String { folderNotes[entityID] = val }
+                    else if field == "columns", let val = (row["value"] as? NSNumber)?.intValue { folderCols[entityID] = val }
+                } else if kind == "images" {
+                    if field == "$deleted" { deletedImages.insert(entityID) }
+                    else if let val = row["value"] {
+                        remoteImages[entityID, default: [:]][field] = val
+                    }
+                }
+            }
+            seenShelf.insert(file.id)
+        }
+        saveSeenSet(seenShelf, name: "seen-shelf.json")
+
+        // Apply remote folders
+        var folderIDToPath: [String: String] = [:]
+        for (path, fid) in shelf.catalog.folderIds {
+            folderIDToPath[fid.lowercased()] = path
+        }
+        for (fid, rawPath) in folderNames where !deletedFolders.contains(fid) {
+            if let norm = BookshelfPath.normalize(rawPath) {
+                _ = shelf.addFolder(norm, select: false)
+                shelf.catalog.folderIds[norm] = fid.lowercased()
+                folderIDToPath[fid.lowercased()] = norm
+                if let note = folderNotes[fid] { shelf.catalog.folderNotes[norm] = note }
+                if let col = folderCols[fid] { shelf.catalog.folderColumnCounts[norm] = min(6, max(1, col)) }
             }
         }
-        for (fid, path) in folderNames {
-            if let norm = BookshelfPath.normalize(path) {
-                _ = shelf.addFolder(norm, select: false)
-                if let note = folderNotes[fid], !note.isEmpty {
-                    shelf.catalog.folderNotes[norm] = note
-                }
-                if let col = folderCols[fid] {
-                    shelf.catalog.folderColumnCounts[norm] = min(6, max(1, col))
+
+        // Apply remote images (download chunks now if !onDemandCloudPhotos, or keep cloud manifest for instant on-demand loading!)
+        let imageIDs = Array(remoteImages.keys)
+        for (idx, imageID) in imageIDs.enumerated() where !deletedImages.contains(imageID) {
+            guard let row = remoteImages[imageID],
+                  let folderID = (row["folderId"] as? String)?.lowercased(),
+                  let folderPath = folderIDToPath[folderID],
+                  let manifestObj = row["manifest"] as? [String: Any],
+                  let manifestData = try? JSONSerialization.data(withJSONObject: manifestObj),
+                  let manifest = try? JSONDecoder().decode(ShelfCloudImage.self, from: manifestData) else { continue }
+
+            let width = (row["width"] as? NSNumber)?.intValue ?? 720
+            let height = (row["height"] as? NSNumber)?.intValue ?? 1024
+            let sourceUrl = (row["sourceUrl"] as? String) ?? ""
+            let created = (row["createdAt"] as? NSNumber)?.int64Value ?? Int64(Date().timeIntervalSince1970 * 1000)
+
+            if let existingIdx = shelf.catalog.items.firstIndex(where: { $0.id.caseInsensitiveCompare(imageID) == .orderedSame }) {
+                shelf.catalog.items[existingIdx].folder = folderPath
+                shelf.catalog.items[existingIdx].cloud = manifest
+            } else {
+                let fileName = "image-sync-\(imageID)-\(manifest.sha256.prefix(12)).png"
+                let newItem = BookshelfItem(
+                    id: imageID,
+                    folder: folderPath,
+                    fileName: fileName,
+                    sourceUrl: sourceUrl,
+                    width: max(1, width),
+                    height: max(1, height),
+                    createdAtEpochMs: created,
+                    cloud: manifest
+                )
+                shelf.catalog.items.append(newItem)
+                if !onDemandCloudPhotos {
+                    status = "책장 사진 내려받는 중 (\(idx + 1)/\(imageIDs.count))..."
+                    let localURL = shelf.imageURL(for: newItem)
+                    if !FileManager.default.fileExists(atPath: localURL.path),
+                       let bytes = try? await downloadChunkedImage(manifest: manifest, keys: keys) {
+                        try? bytes.write(to: localURL, options: .atomic)
+                    }
                 }
             }
         }
         shelf.save()
 
-        // Upload local shelf folders batch
-        let batchID = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
+        // 3. Push local folders & images metadata batch
+        let batchID = OmyaruSyncCrypto.compactUUID()
         let actorID = (UIDevice.current.identifierForVendor?.uuidString ?? UUID().uuidString)
             .replacingOccurrences(of: "-", with: "").lowercased().padding(toLength: 32, withPad: "b", startingAt: 0)
         let clock = Int64(Date().timeIntervalSince1970 * 1000)
         var changes: [[String: Any]] = []
+
         for (idx, folder) in shelf.allDisplayFolders.enumerated() {
-            let fid = (shelf.catalog.folderIds[folder] ?? UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased())
-                .lowercased().padding(toLength: 32, withPad: "0", startingAt: 0)
-            let cleanID = String(fid.prefix(32))
-            changes.append(["kind": "folders", "id": cleanID, "field": "name", "value": folder])
-            changes.append(["kind": "folders", "id": cleanID, "field": "note", "value": shelf.catalog.folderNotes[folder] ?? ""])
-            changes.append(["kind": "folders", "id": cleanID, "field": "columns", "value": shelf.catalog.folderColumnCounts[folder] ?? 2])
-            changes.append(["kind": "folders", "id": cleanID, "field": "order", "value": idx])
+            let fid = (shelf.catalog.folderIds[folder] ?? OmyaruSyncCrypto.compactUUID()).lowercased()
+            changes.append(["kind": "folders", "id": fid, "field": "name", "value": folder])
+            changes.append(["kind": "folders", "id": fid, "field": "note", "value": shelf.catalog.folderNotes[folder] ?? ""])
+            changes.append(["kind": "folders", "id": fid, "field": "columns", "value": shelf.catalog.folderColumnCounts[folder] ?? 2])
+            changes.append(["kind": "folders", "id": fid, "field": "order", "value": idx])
+        }
+        for (idx, item) in shelf.catalog.items.enumerated() {
+            guard let manifest = item.cloud,
+                  let manifestData = try? JSONEncoder().encode(manifest),
+                  let manifestObj = try? JSONSerialization.jsonObject(with: manifestData) else { continue }
+            let fid = (shelf.catalog.folderIds[item.folder] ?? OmyaruSyncCrypto.compactUUID()).lowercased()
+            changes.append(["kind": "images", "id": item.id.lowercased(), "field": "folderId", "value": fid])
+            changes.append(["kind": "images", "id": item.id.lowercased(), "field": "manifest", "value": manifestObj])
+            changes.append(["kind": "images", "id": item.id.lowercased(), "field": "sourceUrl", "value": item.sourceUrl])
+            changes.append(["kind": "images", "id": item.id.lowercased(), "field": "width", "value": item.width])
+            changes.append(["kind": "images", "id": item.id.lowercased(), "field": "height", "value": item.height])
+            changes.append(["kind": "images", "id": item.id.lowercased(), "field": "createdAt", "value": item.createdAtEpochMs])
+            changes.append(["kind": "images", "id": item.id.lowercased(), "field": "order", "value": idx])
         }
         guard !changes.isEmpty else { return }
-        let batchObj: [String: Any] = [
-            "protocol": 1,
-            "id": batchID,
-            "actor": String(actorID.prefix(32)),
-            "clock": clock,
-            "changes": changes
-        ]
-        let plain = try JSONSerialization.data(withJSONObject: batchObj)
-        let encrypted = try OmyaruSyncCrypto.encrypt(plain, password: secret, accountKeyID: keyID)
-        _ = try await uploadDriveFile(name: "omyaru-shelf-v1-\(batchID).json", payload: encrypted)
+
+        let fingerprintData = try JSONSerialization.data(withJSONObject: changes, options: [.sortedKeys])
+        let hash = OmyaruSyncCrypto.sha256Hex(fingerprintData)
+        let lastHash = UserDefaults.standard.string(forKey: "omyaru.ios.drive.lastShelfHash") ?? ""
+        if hash != lastHash {
+            // Split into batches of 128 changes to stay well under 4MB limit
+            for offset in stride(from: 0, to: changes.count, by: 128) {
+                let slice = Array(changes[offset..<min(changes.count, offset + 128)])
+                let subBatchID = OmyaruSyncCrypto.compactUUID()
+                let batchObj: [String: Any] = [
+                    "protocol": 1,
+                    "id": subBatchID,
+                    "actor": String(actorID.prefix(32)),
+                    "clock": clock + Int64(offset),
+                    "changes": slice
+                ]
+                let plain = try JSONSerialization.data(withJSONObject: batchObj, options: [.sortedKeys])
+                let encrypted = try keys.encrypt(plain)
+                let uploadedID = try await uploadDriveFile(name: "omyaru-shelf-v1-\(subBatchID).json", payload: encrypted)
+                seenShelf.insert(uploadedID)
+            }
+            saveSeenSet(seenShelf, name: "seen-shelf.json")
+            UserDefaults.standard.set(hash, forKey: "omyaru.ios.drive.lastShelfHash")
+        }
+    }
+
+    private func uploadChunkedImage(data: Data, keys: OmyaruDriveKeyRing) async throws -> ShelfCloudImage {
+        var hashes: [String] = []
+        var refs: [ShelfCloudImage.Reference] = []
+        let totalLength = data.count
+        var offset = 0
+        var chunkIndex = 0
+        while offset < totalLength {
+            let end = min(totalLength, offset + Self.chunkSize)
+            let chunk = data.subdata(in: offset..<end)
+            let chunkHash = OmyaruSyncCrypto.sha256Hex(chunk)
+            let row: [String: Any] = [
+                "version": 1,
+                "index": chunkIndex,
+                "sha256": chunkHash,
+                "data": chunk.base64EncodedString()
+            ]
+            let plain = try JSONSerialization.data(withJSONObject: row, options: [.sortedKeys])
+            let encrypted = try keys.encrypt(plain)
+            let opID = OmyaruSyncCrypto.compactUUID()
+            let fileName = "omyaru-shelf-chunk-v1-\(opID).json"
+            let cloudID = try await uploadDriveFile(name: fileName, payload: encrypted)
+            hashes.append(chunkHash)
+            refs.append(ShelfCloudImage.Reference(id: cloudID, name: fileName))
+            offset = end
+            chunkIndex += 1
+        }
+        return ShelfCloudImage(
+            version: 1,
+            length: totalLength,
+            sha256: OmyaruSyncCrypto.sha256Hex(data),
+            chunks: hashes,
+            files: refs
+        )
+    }
+
+    private func downloadChunkedImage(manifest: ShelfCloudImage, keys: OmyaruDriveKeyRing) async throws -> Data {
+        var output = Data(capacity: manifest.length)
+        for (idx, ref) in manifest.files.enumerated() {
+            let encrypted = try await readDriveFile(ref.id)
+            let plain = try keys.decrypt(encrypted)
+            guard let row = try JSONSerialization.jsonObject(with: plain) as? [String: Any],
+                  let b64 = row["data"] as? String,
+                  let chunk = Data(base64Encoded: b64) else {
+                throw NSError(domain: "OmyaruDrive", code: -30, userInfo: [NSLocalizedDescriptionKey: "이미지 조각 \(idx) 복호화 실패"])
+            }
+            if idx < manifest.chunks.count && OmyaruSyncCrypto.sha256Hex(chunk) != manifest.chunks[idx] {
+                throw NSError(domain: "OmyaruDrive", code: -31, userInfo: [NSLocalizedDescriptionKey: "이미지 조각 무결성 검증 실패"])
+            }
+            output.append(chunk)
+        }
+        guard OmyaruSyncCrypto.sha256Hex(output) == manifest.sha256 else {
+            throw NSError(domain: "OmyaruDrive", code: -32, userInfo: [NSLocalizedDescriptionKey: "전체 이미지 SHA-256 무결성 검증 실패"])
+        }
+        return output
+    }
+
+    private func loadSeenSet(name: String) -> Set<String> {
+        let url = syncStateDirectory.appendingPathComponent(name)
+        guard let data = try? Data(contentsOf: url),
+              let arr = try? JSONDecoder().decode([String].self, from: data) else { return [] }
+        return Set(arr)
+    }
+
+    private func saveSeenSet(_ set: Set<String>, name: String) {
+        let url = syncStateDirectory.appendingPathComponent(name)
+        if let data = try? JSONEncoder().encode(Array(set)) {
+            try? data.write(to: url, options: .atomic)
+        }
     }
 
     // MARK: - Portable Encrypted .omyarusync File Export & Import
@@ -606,6 +1024,7 @@ final class DriveSyncManager: NSObject, ObservableObject, ASWebAuthenticationPre
             profiles: browser?.profiles ?? [],
             groups: browser?.groups ?? [],
             tabs: browser?.tabs.filter { !$0.isPrivate } ?? [],
+            bookmarkFolders: browser?.bookmarkFolders ?? [],
             bookmarks: browser?.bookmarks ?? [],
             history: browser?.history ?? [],
             bookshelf: shelf.catalog,
@@ -630,6 +1049,9 @@ final class DriveSyncManager: NSObject, ObservableObject, ASWebAuthenticationPre
             }
             for t in bundle.tabs where !t.isPrivate && !browser.tabs.contains(where: { $0.url == t.url && $0.url != "about:blank" }) {
                 browser.tabs.append(t)
+            }
+            for f in bundle.bookmarkFolders where !browser.bookmarkFolders.contains(where: { $0.id == f.id }) {
+                browser.bookmarkFolders.append(f)
             }
             for b in bundle.bookmarks where !browser.bookmarks.contains(where: { $0.url == b.url }) {
                 browser.bookmarks.append(b)
@@ -667,7 +1089,7 @@ final class DriveSyncManager: NSObject, ObservableObject, ASWebAuthenticationPre
     }
 }
 
-// MARK: - Drive Sync Sheet UI
+// MARK: - Drive Sync Sheet UI (Includes Tab Reset Confirmation & Cloud Photo Mode)
 
 struct EncryptedSyncDocument: FileDocument {
     static var readableContentTypes: [UTType] { [.json, .data] }
@@ -690,12 +1112,14 @@ struct DriveSyncSheet: View {
     @State private var exportingBundle = false
     @State private var importingBundle = false
     @State private var exportDoc = EncryptedSyncDocument(data: Data())
+    @State private var showTabResetPrompt = false
+    @State private var tabResetInput = ""
     @State private var alertMessage: String? = nil
 
     var body: some View {
         NavigationStack {
             Form {
-                Section("Google Drive 클라우드 동기화 (Android · Windows · iOS 호환)") {
+                Section("Google Drive 클라우드 동기화 (Android · PC · iOS 완전 호환)") {
                     TextField("Google iOS OAuth Client ID (.apps.googleusercontent.com)", text: $sync.clientID)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
@@ -710,7 +1134,7 @@ struct DriveSyncSheet: View {
                         Button {
                             Task { await sync.signInWithGoogle() }
                         } label: {
-                            Label(sync.isConnected ? "Google 계정 재연결" : "Google 계정 로그인", systemImage: "person.badge.key.fill")
+                            Label(sync.isConnected ? "Google 재연결" : "Google 계정 연결", systemImage: "person.badge.key.fill")
                         }
                         .buttonStyle(.bordered)
                         .disabled(sync.busy)
@@ -728,10 +1152,7 @@ struct DriveSyncSheet: View {
                         Toggle("앱 활성화 시 자동 동기화", isOn: $sync.autoSyncEnabled)
                         Picker("책장 사진 저장 방식", selection: $sync.onDemandCloudPhotos) {
                             Text("기기에 원본 모두 저장").tag(false)
-                            Text("필요할 때 클라우드에서 로드").tag(true)
-                        }
-                        Button("Google Drive 연결 해제", role: .destructive) {
-                            sync.disconnectGoogle()
+                            Text("필요할 때 클라우드에서 불러오기").tag(true)
                         }
                     }
 
@@ -748,8 +1169,20 @@ struct DriveSyncSheet: View {
                     }
                 }
 
+                if sync.isConnected {
+                    Section("위험 구역 (동기화 제어)") {
+                        Button("모든 기기 동기화 탭 초기화...", role: .destructive) {
+                            tabResetInput = ""
+                            showTabResetPrompt = true
+                        }
+                        Button("Google Drive 연결 해제", role: .destructive) {
+                            sync.disconnectGoogle()
+                        }
+                    }
+                }
+
                 Section {
-                    SecureField("동기화 암호 (PBKDF2-SHA256 + AES-256-GCM)", text: $sync.syncPassphrase)
+                    SecureField("동기화 암호 (6자 이상 · PBKDF2 + AES-256-GCM)", text: $sync.syncPassphrase)
                     Button {
                         do {
                             let bytes = try sync.exportEncryptedBundle(browser: browser, shelf: shelf, password: sync.syncPassphrase)
@@ -769,7 +1202,7 @@ struct DriveSyncSheet: View {
                 } header: {
                     Text("파일 / AirDrop / iCloud Drive 종단간 암호화 동기화")
                 } footer: {
-                    Text("OAuth 설정 없이도 프로필·탭·북마크·방문 기록·책장 폴더와 사진을 AES-256-GCM으로 암호화해 기기 간 즉시 동기화할 수 있습니다.")
+                    Text("프로필·탭·북마크 폴더·방문 기록·책장 폴더와 이미지를 AES-256-GCM으로 종단간 암호화해 전송합니다.")
                 }
             }
             .navigationTitle("동기화")
@@ -778,6 +1211,21 @@ struct DriveSyncSheet: View {
                 ToolbarItem(placement: .confirmationAction) {
                     Button("완료") { dismiss() }
                 }
+            }
+            .alert("동기화 탭 초기화", isPresented: $showTabResetPrompt) {
+                TextField(DriveSyncManager.tabResetConfirmationPhrase, text: $tabResetInput)
+                Button("초기화", role: .destructive) {
+                    Task {
+                        do {
+                            try await sync.publishTabReset(confirmation: tabResetInput, browser: browser)
+                        } catch {
+                            alertMessage = error.localizedDescription
+                        }
+                    }
+                }
+                Button("취소", role: .cancel) {}
+            } message: {
+                Text("모든 연결 기기의 동기화 탭을 비웁니다. 프로필·책장·비공개 탭은 유지됩니다.\n\n‘\(DriveSyncManager.tabResetConfirmationPhrase)’를 정확히 입력하세요.")
             }
             .fileExporter(
                 isPresented: $exportingBundle,

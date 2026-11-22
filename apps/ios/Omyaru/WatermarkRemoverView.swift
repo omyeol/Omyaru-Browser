@@ -1,9 +1,10 @@
 import SwiftUI
 import PhotosUI
+import UniformTypeIdentifiers
 import WebKit
 import UIKit
 
-// MARK: - Watermark Remover & Inpainting Tool
+// MARK: - Dual-Mode Watermark Remover (Offline Inpainting + Android WatermarkRemoverDialog Web Injection Parity!)
 
 struct NormalizedBox: Identifiable, Equatable {
     var id = UUID()
@@ -13,12 +14,134 @@ struct NormalizedBox: Identifiable, Equatable {
     var bottom: Double
 }
 
+@MainActor
+final class WebWatermarkSession: NSObject, ObservableObject, WKNavigationDelegate, WKDownloadDelegate {
+    @Published var isLoading = false
+    @Published var statusMessage = "웹 워터마크 제거 사이트에 접속한 뒤 [⚡ 사진 주입]을 누르세요."
+    let webView: WKWebView
+    var onDownloadedImage: ((Data) -> Void)?
+
+    override init() {
+        let config = WKWebViewConfiguration()
+        config.websiteDataStore = .nonPersistent()
+        config.allowsInlineMediaPlayback = true
+        webView = WKWebView(frame: .zero, configuration: config)
+        super.init()
+        webView.navigationDelegate = self
+        webView.backgroundColor = UIColor(red: 0.07, green: 0.08, blue: 0.09, alpha: 1)
+    }
+
+    func load(urlString: String) {
+        let trimmed = urlString.trimmingCharacters(in: .whitespacesAndNewlines)
+        let target: String
+        if trimmed.isEmpty {
+            target = "https://www.watermarkremover.io/ko"
+        } else if trimmed.lowercased().hasPrefix("http://") || trimmed.lowercased().hasPrefix("https://") {
+            target = trimmed
+        } else {
+            target = "https://" + trimmed
+        }
+        if let url = URL(string: target) {
+            webView.load(URLRequest(url: url))
+        }
+    }
+
+    /// Universal DataTransfer File Injection (Exact parity with Android WatermarkRemoverDialog ⚡ 사진 주입!)
+    func injectCapturedImage(_ image: UIImage) {
+        guard let png = image.pngData() else {
+            statusMessage = "주입할 이미지가 없습니다."
+            return
+        }
+        let b64 = png.base64EncodedString()
+        let js = """
+        (() => {
+          try {
+            const b64 = "\(b64)";
+            const bin = atob(b64);
+            const bytes = new Uint8Array(bin.length);
+            for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+            const file = new File([bytes], "omyaru-capture.png", { type: "image/png" });
+            const dt = new DataTransfer();
+            dt.items.add(file);
+            let injected = 0;
+            for (const input of document.querySelectorAll('input[type="file"]')) {
+              try {
+                input.files = dt.files;
+                input.dispatchEvent(new Event('input', { bubbles: true }));
+                input.dispatchEvent(new Event('change', { bubbles: true }));
+                injected++;
+              } catch (_) {}
+            }
+            if (injected === 0) {
+              const target = document.querySelector('[class*="drop" i], [class*="upload" i], main, body');
+              if (target) {
+                const ev = new DragEvent('drop', { bubbles: true, cancelable: true, dataTransfer: dt });
+                target.dispatchEvent(ev);
+              }
+            }
+            return injected;
+          } catch (e) {
+            return -1;
+          }
+        })();
+        """
+        webView.evaluateJavaScript(js) { [weak self] result, _ in
+            let count = (result as? Int) ?? 0
+            Task { @MainActor in
+                if count > 0 {
+                    self?.statusMessage = "⚡ 업로드 입력창 \(count)곳에 캡처 이미지를 자동 주입했습니다."
+                } else {
+                    self?.statusMessage = "⚡ 드롭 영역에 이미지를 전달했습니다. 페이지의 업로드 버튼을 눌러보세요."
+                }
+            }
+        }
+    }
+
+    func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
+        isLoading = true
+    }
+
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        isLoading = false
+    }
+
+    func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction, decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
+        decisionHandler(navigationAction.shouldPerformDownload ? .download : .allow)
+    }
+
+    func webView(_ webView: WKWebView, navigationAction: WKNavigationAction, didBecome download: WKDownload) {
+        download.delegate = self
+    }
+
+    func webView(_ webView: WKWebView, navigationResponse: WKNavigationResponse, didBecome download: WKDownload) {
+        download.delegate = self
+    }
+
+    private var downloadTempURL: URL?
+
+    func download(_ download: WKDownload, decideDestinationUsing response: URLResponse, suggestedFilename: String, completionHandler: @escaping (URL?) -> Void) {
+        let temp = FileManager.default.temporaryDirectory.appendingPathComponent("wm-\(UUID().uuidString)-\(suggestedFilename)")
+        downloadTempURL = temp
+        completionHandler(temp)
+    }
+
+    func downloadDidFinish(_ download: WKDownload) {
+        guard let url = downloadTempURL, let data = try? Data(contentsOf: url) else { return }
+        try? FileManager.default.removeItem(at: url)
+        onDownloadedImage?(data)
+        statusMessage = "워터마크 제거 결과 이미지를 수신해 책장에 저장했습니다!"
+    }
+}
+
 struct WatermarkRemoverView: View {
     @Environment(\.dismiss) private var dismiss
     let webView: WKWebView?
     let sourceURL: String
+    var initialCapturedImage: UIImage? = nil
+    var configuredWebToolURL: String = ""
     @ObservedObject var shelf: ShelfModel = .shared
 
+    @State private var mode: Int = 0 // 0 = Offline Inpainting, 1 = Web Tool (⚡ 사진 주입)
     @State private var originalImage: UIImage? = nil
     @State private var processedImage: UIImage? = nil
     @State private var boxes: [NormalizedBox] = [
@@ -31,14 +154,29 @@ struct WatermarkRemoverView: View {
     @State private var showFileImporter = false
     @State private var targetFolder: String = ""
     @State private var showFolderPicker = false
-    @State private var statusMessage: String = "워터마크 영역을 드래그해 지정한 뒤 [워터마크 제거 실행]을 누르세요."
+    @State private var webToolURLInput: String = ""
+    @State private var statusMessage: String = "워터마크 영역을 지정한 뒤 [워터마크 제거 실행]을 누르거나 상단에서 웹 도구(⚡ 사진 주입)로 전환하세요."
+    @StateObject private var webSession = WebWatermarkSession()
 
     var body: some View {
         NavigationStack {
             VStack(spacing: 0) {
-                sourceToolbar
-                imageWorkspace
-                controlsBar
+                Picker("제거 방식", selection: $mode) {
+                    Text("내장 즉시 복원").tag(0)
+                    Text("웹 도구 (⚡ 사진 주입)").tag(1)
+                }
+                .pickerStyle(.segmented)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+                .background(Color(red: 0.11, green: 0.11, blue: 0.12))
+
+                if mode == 0 {
+                    offlineToolbar
+                    imageWorkspace
+                    offlineControlsBar
+                } else {
+                    webToolWorkspace
+                }
             }
             .background(Color(red: 0.06, green: 0.06, blue: 0.07))
             .navigationTitle("워터마크 제거")
@@ -60,12 +198,32 @@ struct WatermarkRemoverView: View {
             }
             .task {
                 if targetFolder.isEmpty { targetFolder = shelf.activeFolder }
-                if originalImage == nil, let webView {
+                if webToolURLInput.isEmpty {
+                    webToolURLInput = configuredWebToolURL.isEmpty ? "https://www.watermarkremover.io/ko" : configuredWebToolURL
+                }
+                if !configuredWebToolURL.isEmpty {
+                    mode = 1
+                }
+                webSession.onDownloadedImage = { data in
+                    let folder = targetFolder.isEmpty ? shelf.activeFolder : targetFolder
+                    _ = shelf.addImageData(data, fileExtension: "png", toFolder: folder, sourceUrl: sourceURL)
+                }
+                if let initial = initialCapturedImage {
+                    originalImage = initial
+                    selectedBoxID = boxes.first?.id
+                } else if originalImage == nil, let webView {
                     if let snap = await WebpageCaptureEngine.captureStitchedViewportPages(webView: webView, viewportCount: 1) {
                         originalImage = snap
-                        processedImage = nil
                         selectedBoxID = boxes.first?.id
                     }
+                }
+                if mode == 1 {
+                    webSession.load(urlString: webToolURLInput)
+                }
+            }
+            .onChange(of: mode) { newMode in
+                if newMode == 1 && webSession.webView.url == nil {
+                    webSession.load(urlString: webToolURLInput)
                 }
             }
             .onChange(of: selectedPhoto) { item in
@@ -75,7 +233,7 @@ struct WatermarkRemoverView: View {
                        let img = UIImage(data: data) {
                         originalImage = img
                         processedImage = nil
-                        statusMessage = "사진을 불러왔습니다. 워터마크 영역을 조정하세요."
+                        statusMessage = "사진을 불러왔습니다."
                     }
                     selectedPhoto = nil
                 }
@@ -98,7 +256,71 @@ struct WatermarkRemoverView: View {
         .preferredColorScheme(.dark)
     }
 
-    private var sourceToolbar: some View {
+    // MARK: - Mode 2: Web Watermark Remover Tool (Android WatermarkRemoverDialog Parity!)
+
+    private var webToolWorkspace: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 8) {
+                if let thumb = originalImage {
+                    Image(uiImage: thumb)
+                        .resizable()
+                        .scaledToFill()
+                        .frame(width: 32, height: 32)
+                        .clipShape(RoundedRectangle(cornerRadius: 6))
+                }
+                TextField("워터마크 삭제 사이트 주소", text: $webToolURLInput)
+                    .font(.caption)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    .keyboardType(.URL)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 7)
+                    .background(Color(red: 0.16, green: 0.16, blue: 0.18), in: RoundedRectangle(cornerRadius: 8))
+                    .onSubmit {
+                        webSession.load(urlString: webToolURLInput)
+                    }
+                Button("이동") {
+                    webSession.load(urlString: webToolURLInput)
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+
+                Button {
+                    if let img = originalImage {
+                        webSession.injectCapturedImage(img)
+                    }
+                } label: {
+                    Text("⚡ 사진 주입")
+                        .font(.caption.weight(.bold))
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+                .disabled(originalImage == nil)
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 8)
+            .background(Color(red: 0.12, green: 0.12, blue: 0.14))
+
+            if webSession.isLoading {
+                ProgressView()
+                    .progressViewStyle(.linear)
+            }
+
+            BrowserWebView(webView: webSession.webView)
+
+            Text(webSession.statusMessage)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 6)
+                .background(Color(red: 0.10, green: 0.10, blue: 0.12))
+        }
+    }
+
+    // MARK: - Mode 1: Built-in Offline Inpainting
+
+    private var offlineToolbar: some View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 8) {
                 Button {
@@ -138,7 +360,7 @@ struct WatermarkRemoverView: View {
                         selectedBoxID = boxes.first?.id
                         processedImage = nil
                     } label: {
-                        Label("선택 영역 삭제", systemImage: "trash")
+                        Label("영역 삭제", systemImage: "trash")
                             .font(.caption.weight(.semibold))
                             .foregroundStyle(.red)
                             .padding(.horizontal, 10)
@@ -155,7 +377,7 @@ struct WatermarkRemoverView: View {
                 }
             }
             .padding(.horizontal, 12)
-            .padding(.vertical, 8)
+            .padding(.bottom, 8)
         }
         .background(Color(red: 0.11, green: 0.11, blue: 0.12))
     }
@@ -208,7 +430,6 @@ struct WatermarkRemoverView: View {
                                                 }
                                         )
 
-                                    // Bottom-right resize handle
                                     Circle()
                                         .fill(Color.cyan)
                                         .frame(width: 18, height: 18)
@@ -249,7 +470,7 @@ struct WatermarkRemoverView: View {
         }
     }
 
-    private var controlsBar: some View {
+    private var offlineControlsBar: some View {
         VStack(spacing: 8) {
             Text(statusMessage)
                 .font(.caption)
@@ -275,7 +496,7 @@ struct WatermarkRemoverView: View {
                     UIPasteboard.general.image = out
                     statusMessage = "사진 앱 저장 및 클립보드 복사를 완료했습니다."
                 } label: {
-                    Label("저장/복사", systemImage: "square.and.arrow.down")
+                    Label("저장", systemImage: "square.and.arrow.down")
                         .font(.subheadline.weight(.semibold))
                         .padding(.vertical, 10)
                         .padding(.horizontal, 12)

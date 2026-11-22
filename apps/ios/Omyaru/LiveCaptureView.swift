@@ -3,16 +3,11 @@ import WebKit
 import UIKit
 import UniformTypeIdentifiers
 
-// MARK: - Live Webpage Region Capture & Multi-Viewport Scroll-and-Stitch
+// MARK: - Live Webpage Region Capture & Incremental Scroll-and-Stitch Engine (Android MobileCaptureRegionDialog Parity)
 
 @MainActor
 enum WebpageCaptureEngine {
-    static func captureStitchedViewportPages(
-        webView: WKWebView,
-        viewportCount: Int
-    ) async -> UIImage? {
-        let count = min(8, max(1, viewportCount))
-        // 1. Prepare page: hide thin fixed/sticky headers & ad banners, force eager loading
+    static func preparePageForCapture(webView: WKWebView) async {
         _ = try? await webView.evaluateJavaScript("""
             (() => {
               const detectScroller = () => {
@@ -32,19 +27,20 @@ enum WebpageCaptureEngine {
               };
               const scroller = detectScroller();
               window.__omyaruScroller = scroller;
-              const state = {
-                items: [],
-                scrollX: scroller ? scroller.scrollLeft : window.scrollX,
-                scrollY: scroller ? scroller.scrollTop : window.scrollY
-              };
-              window.__omyaruCapState = state;
+              if (!window.__omyaruCapState) {
+                window.__omyaruCapState = {
+                  items: [],
+                  scrollX: scroller ? scroller.scrollLeft : window.scrollX,
+                  scrollY: scroller ? scroller.scrollTop : window.scrollY
+                };
+              }
               for (const img of document.images) {
                 try { if (img.loading === 'lazy') img.loading = 'eager'; } catch (_) {}
               }
               const maxBarH = Math.min(160, window.innerHeight * 0.22);
               const maxSideW = Math.min(200, window.innerWidth * 0.22);
               for (const el of document.querySelectorAll('header, nav, footer, aside, [class*="header" i], [class*="footer" i], [class*="navbar" i], [class*="toolbar" i], [style*="fixed" i], [style*="sticky" i]')) {
-                if (!(el instanceof HTMLElement)) continue;
+                if (!(el instanceof HTMLElement) || el.dataset.omyaruCapHidden === '1') continue;
                 if (el === scroller || (scroller && el.contains(scroller))) continue;
                 const cs = getComputedStyle(el);
                 if (cs.position !== 'fixed' && cs.position !== 'sticky') continue;
@@ -57,72 +53,97 @@ enum WebpageCaptureEngine {
                   return mr.width >= 220 && mr.height >= 180;
                 });
                 if (hasLargeMedia) continue;
-                state.items.push({ el, style: el.getAttribute('style') });
+                el.dataset.omyaruCapHidden = '1';
+                window.__omyaruCapState.items.push({ el, style: el.getAttribute('style') });
                 el.style.setProperty('visibility', 'hidden', 'important');
               }
               return true;
             })();
             """)
+        try? await Task.sleep(nanoseconds: 55_000_000)
+    }
 
+    static func restorePageAfterCapture(webView: WKWebView) async {
+        _ = try? await webView.evaluateJavaScript("""
+            (() => {
+              const s = window.__omyaruCapState;
+              if (!s) return;
+              s.items?.forEach(({ el, style }) => {
+                if (!el) return;
+                delete el.dataset.omyaruCapHidden;
+                if (style === null) el.removeAttribute('style');
+                else el.setAttribute('style', style);
+              });
+              const scroller = window.__omyaruScroller;
+              if (scroller) { scroller.scrollLeft = s.scrollX || 0; scroller.scrollTop = s.scrollY || 0; }
+              else { window.scrollTo(s.scrollX || 0, s.scrollY || 0); }
+              delete window.__omyaruCapState;
+              delete window.__omyaruScroller;
+            })();
+            """)
+    }
+
+    static func scrollDownAndCaptureSlice(webView: WKWebView) async -> (image: UIImage, movedPoints: CGFloat)? {
+        let viewportHeight = max(1, webView.bounds.height)
+        let step = Double(viewportHeight * 0.85)
+        let movedAny = try? await webView.evaluateJavaScript("""
+            (() => {
+              const scroller = window.__omyaruScroller;
+              const before = scroller ? scroller.scrollTop : window.scrollY;
+              if (scroller) scroller.scrollBy(0, \(step));
+              else window.scrollBy(0, \(step));
+              const after = scroller ? scroller.scrollTop : window.scrollY;
+              return Math.max(0, after - before);
+            })();
+            """)
+        let moved = (movedAny as? NSNumber)?.doubleValue ?? 0
+        guard moved >= 4 else { return nil }
+        await preparePageForCapture(webView: webView)
+        try? await Task.sleep(nanoseconds: 140_000_000)
+        guard let snap = await takeSnapshot(of: webView) else { return nil }
+        return (snap, CGFloat(moved))
+    }
+
+    static func appendSlice(base: UIImage, next: UIImage, movedPoints: CGFloat) -> UIImage? {
+        let appendHeight = min(next.size.height, movedPoints)
+        guard appendHeight >= 2 else { return nil }
+        let width = base.size.width
+        let newTotalHeight = base.size.height + appendHeight
+        guard width * newTotalHeight * base.scale * base.scale <= 24_000_000 else { return nil }
+
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = base.scale
+        format.opaque = true
+        let renderer = UIGraphicsImageRenderer(size: CGSize(width: width, height: newTotalHeight), format: format)
+        return renderer.image { _ in
+            base.draw(in: CGRect(x: 0, y: 0, width: width, height: base.size.height))
+            if let cg = next.cgImage {
+                let scale = next.scale
+                let cropPxH = min(CGFloat(cg.height), appendHeight * scale)
+                let cropRect = CGRect(x: 0, y: CGFloat(cg.height) - cropPxH, width: CGFloat(cg.width), height: cropPxH)
+                if let sliceCG = cg.cropping(to: cropRect) {
+                    UIImage(cgImage: sliceCG, scale: scale, orientation: next.imageOrientation)
+                        .draw(in: CGRect(x: 0, y: base.size.height, width: width, height: appendHeight))
+                }
+            }
+        }
+    }
+
+    static func captureStitchedViewportPages(webView: WKWebView, viewportCount: Int) async -> UIImage? {
+        await preparePageForCapture(webView: webView)
         defer {
             Task { @MainActor in
-                _ = try? await webView.evaluateJavaScript("""
-                    (() => {
-                      const s = window.__omyaruCapState;
-                      if (!s) return;
-                      s.items?.forEach(({ el, style }) => {
-                        if (!el) return;
-                        if (style === null) el.removeAttribute('style');
-                        else el.setAttribute('style', style);
-                      });
-                      const scroller = window.__omyaruScroller;
-                      if (scroller) { scroller.scrollLeft = s.scrollX || 0; scroller.scrollTop = s.scrollY || 0; }
-                      else { window.scrollTo(s.scrollX || 0, s.scrollY || 0); }
-                      delete window.__omyaruCapState;
-                      delete window.__omyaruScroller;
-                    })();
-                    """)
+                await restorePageAfterCapture(webView: webView)
             }
         }
-
-        try? await Task.sleep(nanoseconds: 60_000_000)
-
-        var slices: [UIImage] = []
-        let viewportHeight = max(1, webView.bounds.height)
-
-        for index in 0..<count {
-            if index > 0 {
-                let delta = Double(viewportHeight)
-                _ = try? await webView.evaluateJavaScript("""
-                    (() => {
-                      const scroller = window.__omyaruScroller;
-                      if (scroller) scroller.scrollBy(0, \(delta));
-                      else window.scrollBy(0, \(delta));
-                    })();
-                    """)
-                try? await Task.sleep(nanoseconds: 140_000_000)
-            }
-            if let snapshot = await takeSnapshot(of: webView) {
-                slices.append(snapshot)
-            }
+        guard var current = await takeSnapshot(of: webView) else { return nil }
+        let extra = min(7, max(0, viewportCount - 1))
+        for _ in 0..<extra {
+            guard let (next, moved) = await scrollDownAndCaptureSlice(webView: webView),
+                  let combined = appendSlice(base: current, next: next, movedPoints: moved) else { break }
+            current = combined
         }
-
-        guard !slices.isEmpty else { return nil }
-        if slices.count == 1 { return slices[0] }
-
-        let width = slices[0].size.width
-        let totalHeight = slices.reduce(CGFloat.zero) { $0 + $1.size.height }
-        let format = UIGraphicsImageRendererFormat()
-        format.scale = slices[0].scale
-        format.opaque = true
-        let renderer = UIGraphicsImageRenderer(size: CGSize(width: width, height: totalHeight), format: format)
-        return renderer.image { _ in
-            var y: CGFloat = 0
-            for slice in slices {
-                slice.draw(in: CGRect(x: 0, y: y, width: width, height: slice.size.height))
-                y += slice.size.height
-            }
-        }
+        return current
     }
 
     static func takeSnapshot(of webView: WKWebView) async -> UIImage? {
@@ -141,11 +162,14 @@ struct LiveCaptureView: View {
     @Environment(\.dismiss) private var dismiss
     let webView: WKWebView?
     let sourceURL: String
+    var sideMargins: Bool = true
+    var onSendToWatermark: ((UIImage) -> Void)? = nil
     @ObservedObject var shelf: ShelfModel = .shared
 
-    @State private var viewportSpan: Int = 1
     @State private var capturedImage: UIImage? = nil
     @State private var loading: Bool = true
+    @State private var extending: Bool = false
+    @State private var extendedPagesCount: Int = 1
     @State private var cropLeft: Double = 0.04
     @State private var cropTop: Double = 0.04
     @State private var cropRight: Double = 0.96
@@ -162,6 +186,7 @@ struct LiveCaptureView: View {
             VStack(spacing: 0) {
                 topControlBar
                 captureCanvas
+                extendDownwardButton
                 bottomActionBar
             }
             .background(Color(red: 0.06, green: 0.06, blue: 0.07))
@@ -169,21 +194,30 @@ struct LiveCaptureView: View {
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
-                    Button("취소") { dismiss() }
+                    Button("취소") {
+                        cleanupAndDismiss()
+                    }
                 }
                 ToolbarItem(placement: .topBarTrailing) {
-                    Button {
+                    Button("전체 선택") {
                         cropLeft = 0.0
                         cropTop = 0.0
                         cropRight = 1.0
                         cropBottom = 1.0
-                    } label: {
-                        Text("전체 선택").font(.subheadline)
                     }
+                    .font(.subheadline)
                 }
             }
-            .task(id: viewportSpan) {
-                await refreshCapture()
+            .task {
+                if targetFolder.isEmpty { targetFolder = shelf.activeFolder }
+                await initialCapture()
+            }
+            .onDisappear {
+                if let webView {
+                    Task { @MainActor in
+                        await WebpageCaptureEngine.restorePageAfterCapture(webView: webView)
+                    }
+                }
             }
             .sheet(isPresented: $showFolderPicker) {
                 CaptureFolderPickerSheet(shelf: shelf, selectedFolder: $targetFolder)
@@ -203,32 +237,16 @@ struct LiveCaptureView: View {
             } message: {
                 Text(message ?? "")
             }
-            .onAppear {
-                if targetFolder.isEmpty {
-                    targetFolder = shelf.activeFolder
-                }
-            }
         }
         .preferredColorScheme(.dark)
     }
 
     private var topControlBar: some View {
-        HStack(spacing: 12) {
-            HStack(spacing: 6) {
-                Text("캡처 길이")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.secondary)
-                Stepper("\(viewportSpan)화면 연속", value: $viewportSpan, in: 1...6)
-                    .labelsHidden()
-                Text("\(viewportSpan)화면")
-                    .font(.caption.weight(.bold))
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 4)
-                    .background(Color.blue.opacity(0.22), in: Capsule())
-            }
-
+        HStack(spacing: 10) {
+            Text("모서리 손잡이로 조절 · \(extendedPagesCount)화면")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
             Spacer()
-
             Button {
                 showFolderPicker = true
             } label: {
@@ -255,139 +273,182 @@ struct LiveCaptureView: View {
             if loading {
                 VStack(spacing: 12) {
                     ProgressView()
-                    Text("웹페이지 고정 헤더를 숨기고 선명한 화면을 캡처하는 중...")
+                    Text("고정 헤더를 숨기고 선명한 웹 화면을 캡처하는 중...")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else if let img = capturedImage {
                 GeometryReader { geo in
-                    let fitted = fitSize(imageSize: img.size, in: geo.size)
-                    let originX = (geo.size.width - fitted.width) / 2
-                    let originY = (geo.size.height - fitted.height) / 2
-                    let selRect = CGRect(
-                        x: originX + fitted.width * cropLeft,
-                        y: originY + fitted.height * cropTop,
-                        width: fitted.width * (cropRight - cropLeft),
-                        height: fitted.height * (cropBottom - cropTop)
-                    )
+                    let hMargin: CGFloat = sideMargins ? 20 : 0
+                    let availW = max(60, geo.size.width - hMargin * 2)
+                    let displayH = max(120, availW * (img.size.height / max(1, img.size.width)))
+                    let displaySize = CGSize(width: availW, height: displayH)
 
-                    ZStack(alignment: .topLeading) {
-                        Image(uiImage: img)
-                            .resizable()
-                            .frame(width: fitted.width, height: fitted.height)
-                            .position(x: geo.size.width / 2, y: geo.size.height / 2)
+                    ScrollViewReader { proxy in
+                        ScrollView(.vertical, showsIndicators: true) {
+                            ZStack(alignment: .topLeading) {
+                                Image(uiImage: img)
+                                    .resizable()
+                                    .frame(width: displaySize.width, height: displaySize.height)
 
-                        // Dimmed mask outside selection
-                        Path { path in
-                            path.addRect(CGRect(origin: CGPoint(x: originX, y: originY), size: fitted))
-                            path.addRect(selRect)
+                                let selRect = CGRect(
+                                    x: displaySize.width * cropLeft,
+                                    y: displaySize.height * cropTop,
+                                    width: displaySize.width * (cropRight - cropLeft),
+                                    height: displaySize.height * (cropBottom - cropTop)
+                                )
+
+                                Path { path in
+                                    path.addRect(CGRect(origin: .zero, size: displaySize))
+                                    path.addRect(selRect)
+                                }
+                                .fill(Color.black.opacity(0.54), style: FillStyle(eoFill: true))
+
+                                Rectangle()
+                                    .strokeBorder(Color.cyan, lineWidth: 2)
+                                    .frame(width: max(4, selRect.width), height: max(4, selRect.height))
+                                    .position(x: selRect.midX, y: selRect.midY)
+
+                                let pxW = Int(img.size.width * img.scale * (cropRight - cropLeft))
+                                let pxH = Int(img.size.height * img.scale * (cropBottom - cropTop))
+                                Text("▣ \(pxW) × \(pxH)")
+                                    .font(.caption2.monospacedDigit().weight(.bold))
+                                    .padding(.horizontal, 8)
+                                    .padding(.vertical, 4)
+                                    .background(Color.black.opacity(0.8), in: Capsule())
+                                    .position(x: selRect.midX, y: max(18, selRect.minY - 14))
+
+                                cornerHandle(at: CGPoint(x: selRect.minX, y: selRect.minY)) { pt in
+                                    cropLeft = min(cropRight - 0.04, max(0, Double(pt.x / displaySize.width)))
+                                    cropTop = min(cropBottom - 0.04, max(0, Double(pt.y / displaySize.height)))
+                                    activeCornerPoint = pt
+                                }
+                                cornerHandle(at: CGPoint(x: selRect.maxX, y: selRect.minY)) { pt in
+                                    cropRight = max(cropLeft + 0.04, min(1, Double(pt.x / displaySize.width)))
+                                    cropTop = min(cropBottom - 0.04, max(0, Double(pt.y / displaySize.height)))
+                                    activeCornerPoint = pt
+                                }
+                                cornerHandle(at: CGPoint(x: selRect.minX, y: selRect.maxY)) { pt in
+                                    cropLeft = min(cropRight - 0.04, max(0, Double(pt.x / displaySize.width)))
+                                    cropBottom = max(cropTop + 0.04, min(1, Double(pt.y / displaySize.height)))
+                                    activeCornerPoint = pt
+                                }
+                                cornerHandle(at: CGPoint(x: selRect.maxX, y: selRect.maxY)) { pt in
+                                    cropRight = max(cropLeft + 0.04, min(1, Double(pt.x / displaySize.width)))
+                                    cropBottom = max(cropTop + 0.04, min(1, Double(pt.y / displaySize.height)))
+                                    activeCornerPoint = pt
+                                }
+
+                                if let pt = activeCornerPoint {
+                                    magnifierLens(image: img, displaySize: displaySize, focus: pt)
+                                }
+                            }
+                            .frame(width: displaySize.width, height: displaySize.height)
+                            .padding(.horizontal, hMargin)
+                            .padding(.vertical, 10)
+                            Color.clear.frame(height: 1).id("__capture_bottom__")
                         }
-                        .fill(Color.black.opacity(0.55), style: FillStyle(eoFill: true))
-
-                        // Selection border & handles
-                        Rectangle()
-                            .strokeBorder(Color.blue, lineWidth: 2)
-                            .frame(width: max(4, selRect.width), height: max(4, selRect.height))
-                            .position(x: selRect.midX, y: selRect.midY)
-
-                        // Pixel size badge
-                        let pxW = Int(img.size.width * img.scale * (cropRight - cropLeft))
-                        let pxH = Int(img.size.height * img.scale * (cropBottom - cropTop))
-                        Text("▣ \(pxW) × \(pxH)")
-                            .font(.caption2.monospacedDigit().weight(.bold))
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 4)
-                            .background(Color.black.opacity(0.8), in: Capsule())
-                            .position(x: selRect.midX, y: max(18, selRect.minY - 14))
-
-                        // Corner handles
-                        cornerHandle(at: CGPoint(x: selRect.minX, y: selRect.minY)) { pt in
-                            cropLeft = min(cropRight - 0.04, max(0, Double((pt.x - originX) / fitted.width)))
-                            cropTop = min(cropBottom - 0.04, max(0, Double((pt.y - originY) / fitted.height)))
-                            activeCornerPoint = pt
-                        }
-                        cornerHandle(at: CGPoint(x: selRect.maxX, y: selRect.minY)) { pt in
-                            cropRight = max(cropLeft + 0.04, min(1, Double((pt.x - originX) / fitted.width)))
-                            cropTop = min(cropBottom - 0.04, max(0, Double((pt.y - originY) / fitted.height)))
-                            activeCornerPoint = pt
-                        }
-                        cornerHandle(at: CGPoint(x: selRect.minX, y: selRect.maxY)) { pt in
-                            cropLeft = min(cropRight - 0.04, max(0, Double((pt.x - originX) / fitted.width)))
-                            cropBottom = max(cropTop + 0.04, min(1, Double((pt.y - originY) / fitted.height)))
-                            activeCornerPoint = pt
-                        }
-                        cornerHandle(at: CGPoint(x: selRect.maxX, y: selRect.maxY)) { pt in
-                            cropRight = max(cropLeft + 0.04, min(1, Double((pt.x - originX) / fitted.width)))
-                            cropBottom = max(cropTop + 0.04, min(1, Double((pt.y - originY) / fitted.height)))
-                            activeCornerPoint = pt
-                        }
-
-                        // Magnifier lens when dragging a corner
-                        if let pt = activeCornerPoint {
-                            magnifierLens(image: img, fitted: fitted, origin: CGPoint(x: originX, y: originY), focus: pt)
+                        .onChange(of: extendedPagesCount) { _ in
+                            withAnimation(.easeOut(duration: 0.25)) {
+                                proxy.scrollTo("__capture_bottom__", anchor: .bottom)
+                            }
                         }
                     }
                 }
-                .padding(12)
             } else {
                 VStack(spacing: 10) {
                     Image(systemName: "exclamationmark.triangle")
                         .font(.largeTitle)
                         .foregroundStyle(.orange)
                     Text("화면을 캡처하지 못했습니다.")
-                    Button("다시 시도") {
-                        Task { await refreshCapture() }
-                    }
-                    .buttonStyle(.borderedProminent)
+                    Button("다시 시도") { Task { await initialCapture() } }
+                        .buttonStyle(.borderedProminent)
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
     }
 
-    private var bottomActionBar: some View {
-        HStack(spacing: 10) {
-            Button {
-                guard let cropped = croppedUIImage() else { return }
-                UIPasteboard.general.image = cropped
-                message = "선택 영역을 클립보드에 복사했습니다."
-            } label: {
-                Label("복사", systemImage: "doc.on.doc")
-                    .font(.subheadline.weight(.semibold))
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 11)
-            }
-            .buttonStyle(.bordered)
-            .disabled(capturedImage == nil || loading)
-
-            Button {
-                guard let cropped = croppedUIImage(), let png = cropped.pngData() else { return }
-                UIImageWriteToSavedPhotosAlbum(cropped, nil, nil, nil)
-                exportDoc = CapturePNGDocument(data: png)
-                exportingPNG = true
-            } label: {
-                Label("PNG 저장", systemImage: "square.and.arrow.down")
-                    .font(.subheadline.weight(.semibold))
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 11)
-            }
-            .buttonStyle(.bordered)
-            .disabled(capturedImage == nil || loading)
-
-            Button {
-                guard let cropped = croppedUIImage(), let png = cropped.pngData() else { return }
-                let folder = targetFolder.isEmpty ? shelf.activeFolder : targetFolder
-                if shelf.addImageData(png, fileExtension: "png", toFolder: folder, sourceUrl: sourceURL) != nil {
-                    dismiss()
+    private var extendDownwardButton: some View {
+        Button {
+            Task { await extendDownward() }
+        } label: {
+            HStack(spacing: 8) {
+                if extending {
+                    ProgressView().scaleEffect(0.8)
+                } else {
+                    Image(systemName: "arrow.down.to.line")
                 }
-            } label: {
-                Label("책장에 추가", systemImage: "books.vertical.fill")
+                Text("↓ 아래로 확장 (페이지를 스크롤하여 이어 붙이기)")
                     .font(.subheadline.weight(.semibold))
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 11)
             }
-            .buttonStyle(.borderedProminent)
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 10)
+            .background(Color(red: 0.16, green: 0.16, blue: 0.19), in: RoundedRectangle(cornerRadius: 10))
+        }
+        .buttonStyle(.plain)
+        .disabled(loading || extending || capturedImage == nil || webView == nil)
+        .padding(.horizontal, 12)
+        .padding(.top, 8)
+    }
+
+    private var bottomActionBar: some View {
+        VStack(spacing: 8) {
+            HStack(spacing: 8) {
+                Button {
+                    guard let cropped = croppedUIImage() else { return }
+                    UIPasteboard.general.image = cropped
+                    message = "선택 영역을 클립보드에 복사했습니다."
+                } label: {
+                    Label("복사", systemImage: "doc.on.doc")
+                        .font(.caption.weight(.semibold))
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 10)
+                }
+                .buttonStyle(.bordered)
+
+                Button {
+                    guard let cropped = croppedUIImage(), let png = cropped.pngData() else { return }
+                    UIImageWriteToSavedPhotosAlbum(cropped, nil, nil, nil)
+                    exportDoc = CapturePNGDocument(data: png)
+                    exportingPNG = true
+                } label: {
+                    Label("PNG 저장", systemImage: "square.and.arrow.down")
+                        .font(.caption.weight(.semibold))
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 10)
+                }
+                .buttonStyle(.bordered)
+
+                if let onSendToWatermark {
+                    Button {
+                        guard let cropped = croppedUIImage() else { return }
+                        cleanupAndDismiss()
+                        onSendToWatermark(cropped)
+                    } label: {
+                        Label("워터마크", systemImage: "wand.and.stars")
+                            .font(.caption.weight(.semibold))
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 10)
+                    }
+                    .buttonStyle(.bordered)
+                }
+
+                Button {
+                    guard let cropped = croppedUIImage(), let png = cropped.pngData() else { return }
+                    let folder = targetFolder.isEmpty ? shelf.activeFolder : targetFolder
+                    if shelf.addImageData(png, fileExtension: "png", toFolder: folder, sourceUrl: sourceURL) != nil {
+                        cleanupAndDismiss()
+                    }
+                } label: {
+                    Label("책장 추가", systemImage: "books.vertical.fill")
+                        .font(.caption.weight(.semibold))
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 10)
+                }
+                .buttonStyle(.borderedProminent)
+            }
             .disabled(capturedImage == nil || loading)
         }
         .padding(12)
@@ -397,8 +458,8 @@ struct LiveCaptureView: View {
     private func cornerHandle(at position: CGPoint, onDrag: @escaping (CGPoint) -> Void) -> some View {
         Circle()
             .fill(Color.white)
-            .frame(width: 22, height: 22)
-            .overlay(Circle().stroke(Color.blue, lineWidth: 3))
+            .frame(width: 24, height: 24)
+            .overlay(Circle().stroke(Color.cyan, lineWidth: 3))
             .shadow(radius: 3)
             .position(position)
             .gesture(
@@ -408,18 +469,18 @@ struct LiveCaptureView: View {
             )
     }
 
-    private func magnifierLens(image: UIImage, fitted: CGSize, origin: CGPoint, focus: CGPoint) -> some View {
+    private func magnifierLens(image: UIImage, displaySize: CGSize, focus: CGPoint) -> some View {
         let lensSize: CGFloat = 104
         let zoom: CGFloat = 2.4
-        let relX = (focus.x - origin.x) / max(1, fitted.width)
-        let relY = (focus.y - origin.y) / max(1, fitted.height)
+        let relX = focus.x / max(1, displaySize.width)
+        let relY = focus.y / max(1, displaySize.height)
         return ZStack {
             Image(uiImage: image)
                 .resizable()
-                .frame(width: fitted.width * zoom, height: fitted.height * zoom)
+                .frame(width: displaySize.width * zoom, height: displaySize.height * zoom)
                 .offset(
-                    x: (0.5 - relX) * fitted.width * zoom,
-                    y: (0.5 - relY) * fitted.height * zoom
+                    x: (0.5 - relX) * displaySize.width * zoom,
+                    y: (0.5 - relY) * displaySize.height * zoom
                 )
             Circle().strokeBorder(Color.white, lineWidth: 2.5)
             Path { p in
@@ -428,20 +489,12 @@ struct LiveCaptureView: View {
                 p.move(to: CGPoint(x: 0, y: lensSize / 2))
                 p.addLine(to: CGPoint(x: lensSize, y: lensSize / 2))
             }
-            .stroke(Color.blue.opacity(0.8), lineWidth: 1)
+            .stroke(Color.cyan.opacity(0.85), lineWidth: 1)
         }
         .frame(width: lensSize, height: lensSize)
         .clipShape(Circle())
         .shadow(radius: 8)
-        .position(x: max(64, min(origin.x + fitted.width - 64, focus.x)), y: max(64, focus.y - 76))
-    }
-
-    private func fitSize(imageSize: CGSize, in container: CGSize) -> CGSize {
-        guard imageSize.width > 0, imageSize.height > 0, container.width > 0, container.height > 0 else {
-            return container
-        }
-        let scale = min(container.width / imageSize.width, container.height / imageSize.height)
-        return CGSize(width: imageSize.width * scale, height: imageSize.height * scale)
+        .position(x: max(60, min(displaySize.width - 60, focus.x)), y: max(60, focus.y - 76))
     }
 
     private func croppedUIImage() -> UIImage? {
@@ -458,11 +511,41 @@ struct LiveCaptureView: View {
         return UIImage(cgImage: croppedCG, scale: img.scale, orientation: img.imageOrientation)
     }
 
-    private func refreshCapture() async {
+    private func initialCapture() async {
         loading = true
         defer { loading = false }
         guard let webView else { return }
-        capturedImage = await WebpageCaptureEngine.captureStitchedViewportPages(webView: webView, viewportCount: viewportSpan)
+        await WebpageCaptureEngine.preparePageForCapture(webView: webView)
+        capturedImage = await WebpageCaptureEngine.takeSnapshot(of: webView)
+        extendedPagesCount = 1
+    }
+
+    private func extendDownward() async {
+        guard let webView, let base = capturedImage, !extending else { return }
+        extending = true
+        defer { extending = false }
+        guard let (next, moved) = await WebpageCaptureEngine.scrollDownAndCaptureSlice(webView: webView) else {
+            message = "페이지 최하단에 도달했거나 더 내려갈 수 없습니다."
+            return
+        }
+        guard let combined = WebpageCaptureEngine.appendSlice(base: base, next: next, movedPoints: moved) else {
+            message = "최대 캡처 크기 제한에 도달했습니다. 현재 영역을 먼저 저장해 주세요."
+            return
+        }
+        let ratio = Double(base.size.height / max(1, combined.size.height))
+        cropTop = cropTop * ratio
+        cropBottom = 0.98
+        capturedImage = combined
+        extendedPagesCount += 1
+    }
+
+    private func cleanupAndDismiss() {
+        if let webView {
+            Task { @MainActor in
+                await WebpageCaptureEngine.restorePageAfterCapture(webView: webView)
+            }
+        }
+        dismiss()
     }
 }
 

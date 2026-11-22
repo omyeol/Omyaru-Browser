@@ -491,6 +491,55 @@ final class ShelfModel: ObservableObject {
         save()
     }
 
+    func moveImages(_ ids: Set<String>, toFolder targetFolder: String) {
+        guard let norm = BookshelfPath.normalize(targetFolder), !ids.isEmpty else { return }
+        if !catalog.folders.contains(where: { $0.caseInsensitiveCompare(norm) == .orderedSame }) {
+            catalog.folders.append(norm)
+        }
+        var count = 0
+        for i in catalog.items.indices where ids.contains(catalog.items[i].id) {
+            catalog.items[i].folder = norm
+            count += 1
+        }
+        save()
+        status = "\(count)개 사진을 ‘\(BookshelfPath.leaf(norm))’ 폴더로 이동했습니다."
+    }
+
+    func removeImages(_ ids: Set<String>) {
+        guard !ids.isEmpty else { return }
+        let targets = catalog.items.filter { ids.contains($0.id) }
+        for item in targets {
+            try? FileManager.default.removeItem(at: imageURL(for: item))
+        }
+        catalog.items.removeAll { ids.contains($0.id) }
+        save()
+        status = "\(targets.count)개 사진을 삭제했습니다."
+    }
+
+    func diskUsageBytes() -> Int64 {
+        guard let files = try? FileManager.default.contentsOfDirectory(at: root, includingPropertiesForKeys: [.fileSizeKey]) else { return 0 }
+        return files.reduce(Int64(0)) { acc, url in
+            let size = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+            return acc + Int64(size)
+        }
+    }
+
+    func localOriginalCount() -> Int {
+        catalog.items.filter { FileManager.default.fileExists(atPath: imageURL(for: $0).path) }.count
+    }
+
+    func cleanupOrphanFiles() -> Int {
+        let referenced = Set(catalog.items.map(\.fileName) + ["catalog.json"])
+        guard let files = try? FileManager.default.contentsOfDirectory(atPath: root.path) else { return 0 }
+        var removed = 0
+        for name in files where !referenced.contains(name) {
+            try? FileManager.default.removeItem(at: root.appendingPathComponent(name))
+            removed += 1
+        }
+        status = removed > 0 ? "미사용 잔여 파일 \(removed)개를 정리했습니다." : "정리할 잔여 파일이 없습니다."
+        return removed
+    }
+
     func exportPDF(landscape: Bool) -> URL? {
         let items = visibleItems()
         guard !items.isEmpty else {
@@ -560,6 +609,10 @@ struct BookshelfView: View {
     @State private var pdfURL: URL? = nil
     @State private var showPDFOptions = false
     @State private var showSyncSheet = false
+    @State private var showStorageSheet = false
+    @State private var selectionMode = false
+    @State private var selectedItemIDs: Set<String> = []
+    @State private var showBatchMoveSheet = false
     @State private var noteText = ""
 
     var body: some View {
@@ -634,9 +687,20 @@ struct BookshelfView: View {
                             Label("전체 화면 보기", systemImage: "arrow.up.left.and.arrow.down.right")
                         }
                         Button {
+                            selectionMode.toggle()
+                            if !selectionMode { selectedItemIDs.removeAll() }
+                        } label: {
+                            Label(selectionMode ? "다중 선택 종료" : "사진 다중 선택 (이동/삭제)", systemImage: "checkmark.circle")
+                        }
+                        Button {
                             showPDFOptions = true
                         } label: {
                             Label("PDF로 내보내기", systemImage: "doc.richtext")
+                        }
+                        Button {
+                            showStorageSheet = true
+                        } label: {
+                            Label("책장 저장 공간 관리", systemImage: "externaldrive")
                         }
                         Divider()
                         Button(role: .destructive) {
@@ -717,6 +781,15 @@ struct BookshelfView: View {
             }
             .sheet(isPresented: $showSyncSheet) {
                 DriveSyncSheet(browser: nil, shelf: model)
+            }
+            .sheet(isPresented: $showStorageSheet) {
+                BookshelfStorageSheet(model: model)
+            }
+            .sheet(isPresented: $showBatchMoveSheet) {
+                BookshelfBatchMoveSheet(model: model, itemIDs: selectedItemIDs) {
+                    selectedItemIDs.removeAll()
+                    selectionMode = false
+                }
             }
             .fullScreenCover(isPresented: $showFullscreen) {
                 fullscreenGallery
@@ -912,7 +985,36 @@ struct BookshelfView: View {
     private var galleryBody: some View {
         let items = model.visibleItems()
         let cols = model.activeColumns
-        return Group {
+        return VStack(spacing: 0) {
+            if selectionMode {
+                HStack(spacing: 10) {
+                    Text("\(selectedItemIDs.count)개 선택됨")
+                        .font(.subheadline.weight(.semibold))
+                    Spacer()
+                    Button("모두 선택") {
+                        selectedItemIDs = Set(items.map(\.id))
+                    }
+                    .font(.caption.weight(.semibold))
+                    Button("폴더 이동") {
+                        showBatchMoveSheet = true
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                    .disabled(selectedItemIDs.isEmpty)
+                    Button("삭제", role: .destructive) {
+                        model.removeImages(selectedItemIDs)
+                        selectedItemIDs.removeAll()
+                        selectionMode = false
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .disabled(selectedItemIDs.isEmpty)
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+                .background(Color.blue.opacity(0.16))
+            }
+
             if items.isEmpty {
                 VStack(spacing: 14) {
                     Spacer()
@@ -932,21 +1034,63 @@ struct BookshelfView: View {
                 GeometryReader { geo in
                     let colWidth = max(40, geo.size.width / CGFloat(cols))
                     let distributed = distributeIntoColumns(items: items, columnCount: cols)
-                    ScrollView {
-                        HStack(alignment: .top, spacing: 0) {
-                            ForEach(0..<cols, id: \.self) { colIndex in
-                                LazyVStack(spacing: 0) {
-                                    ForEach(distributed[colIndex]) { item in
-                                        BookshelfPhotoTile(
-                                            model: model,
-                                            item: item,
-                                            width: colWidth,
-                                            onTap: { inspectedItem = item },
-                                            onMoveFolder: { movingImageItem = item }
-                                        )
+                    ScrollViewReader { proxy in
+                        ZStack(alignment: .bottomTrailing) {
+                            ScrollView {
+                                Color.clear.frame(height: 1).id("__bookshelf_top__")
+                                HStack(alignment: .top, spacing: 0) {
+                                    ForEach(0..<cols, id: \.self) { colIndex in
+                                        LazyVStack(spacing: 0) {
+                                            ForEach(distributed[colIndex]) { item in
+                                                BookshelfPhotoTile(
+                                                    model: model,
+                                                    item: item,
+                                                    width: colWidth,
+                                                    selectionMode: selectionMode,
+                                                    isSelected: selectedItemIDs.contains(item.id),
+                                                    onTap: {
+                                                        if selectionMode {
+                                                            if selectedItemIDs.contains(item.id) { selectedItemIDs.remove(item.id) }
+                                                            else { selectedItemIDs.insert(item.id) }
+                                                        } else {
+                                                            inspectedItem = item
+                                                        }
+                                                    },
+                                                    onMoveFolder: { movingImageItem = item }
+                                                )
+                                            }
+                                        }
+                                        .frame(width: colWidth)
                                     }
                                 }
-                                .frame(width: colWidth)
+                                Color.clear.frame(height: 1).id("__bookshelf_bottom__")
+                            }
+
+                            if items.count >= 8 {
+                                VStack(spacing: 6) {
+                                    Button {
+                                        withAnimation(.easeOut(duration: 0.25)) {
+                                            proxy.scrollTo("__bookshelf_top__", anchor: .top)
+                                        }
+                                    } label: {
+                                        Image(systemName: "chevron.up")
+                                            .font(.caption.weight(.bold))
+                                            .frame(width: 34, height: 34)
+                                            .background(.ultraThinMaterial, in: Circle())
+                                    }
+                                    Button {
+                                        withAnimation(.easeOut(duration: 0.25)) {
+                                            proxy.scrollTo("__bookshelf_bottom__", anchor: .bottom)
+                                        }
+                                    } label: {
+                                        Image(systemName: "chevron.down")
+                                            .font(.caption.weight(.bold))
+                                            .frame(width: 34, height: 34)
+                                            .background(.ultraThinMaterial, in: Circle())
+                                    }
+                                }
+                                .buttonStyle(.plain)
+                                .padding(12)
                             }
                         }
                     }
@@ -972,6 +1116,8 @@ struct BookshelfView: View {
                                         model: model,
                                         item: item,
                                         width: colWidth,
+                                        selectionMode: false,
+                                        isSelected: false,
                                         onTap: { inspectedItem = item },
                                         onMoveFolder: { movingImageItem = item }
                                     )
@@ -1023,32 +1169,70 @@ private struct BookshelfPhotoTile: View {
     @ObservedObject var model: ShelfModel
     let item: BookshelfItem
     let width: CGFloat
+    var selectionMode: Bool = false
+    var isSelected: Bool = false
     let onTap: () -> Void
     let onMoveFolder: () -> Void
+
+    @State private var loadedImage: UIImage? = nil
+    @State private var downloading = false
 
     var body: some View {
         let url = model.imageURL(for: item)
         let aspect = CGFloat(max(1, item.height)) / CGFloat(max(1, item.width))
-        Group {
-            if let image = UIImage(contentsOfFile: url.path) {
-                Image(uiImage: image)
-                    .resizable()
-                    .scaledToFit()
-                    .frame(width: width)
-            } else {
-                Rectangle()
-                    .fill(Color.white.opacity(0.06))
-                    .frame(width: width, height: width * aspect)
-                    .overlay {
-                        VStack(spacing: 4) {
-                            Image(systemName: "icloud.and.arrow.down")
-                            Text(item.fileName).font(.caption2).foregroundStyle(.secondary)
+        ZStack(alignment: .topTrailing) {
+            Group {
+                if let image = loadedImage ?? UIImage(contentsOfFile: url.path) {
+                    Image(uiImage: image)
+                        .resizable()
+                        .scaledToFit()
+                        .frame(width: width)
+                } else {
+                    Rectangle()
+                        .fill(Color.white.opacity(0.06))
+                        .frame(width: width, height: max(80, width * aspect))
+                        .overlay {
+                            VStack(spacing: 6) {
+                                if downloading {
+                                    ProgressView()
+                                } else {
+                                    Image(systemName: "icloud.and.arrow.down")
+                                        .font(.title3)
+                                        .foregroundStyle(.blue)
+                                    Text(item.fileName).font(.caption2).foregroundStyle(.secondary)
+                                }
+                            }
                         }
-                    }
+                }
+            }
+
+            if selectionMode {
+                Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
+                    .font(.title3)
+                    .foregroundStyle(isSelected ? .blue : .white)
+                    .shadow(radius: 3)
+                    .padding(6)
             }
         }
+        .overlay(
+            Rectangle().strokeBorder(selectionMode && isSelected ? Color.blue : Color.clear, lineWidth: 3)
+        )
         .contentShape(Rectangle())
         .onTapGesture { onTap() }
+        .task(id: item.id) {
+            if let existing = UIImage(contentsOfFile: url.path) {
+                loadedImage = existing
+                return
+            }
+            if item.cloud != nil {
+                downloading = true
+                defer { downloading = false }
+                if let downloadedURL = await DriveSyncManager.shared.downloadCloudImageIfNeeded(item: item, shelf: model),
+                   let img = UIImage(contentsOfFile: downloadedURL.path) {
+                    loadedImage = img
+                }
+            }
+        }
         .contextMenu {
             Button {
                 onTap()
@@ -1466,5 +1650,154 @@ struct BookshelfSingleImageViewer: View {
             }
         }
         .preferredColorScheme(.dark)
+    }
+}
+
+// MARK: - Batch Move Sheet & Bookshelf Storage Manager (Android BookshelfStorageActivity Parity)
+
+struct BookshelfBatchMoveSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    @ObservedObject var model: ShelfModel
+    let itemIDs: Set<String>
+    var onMoved: () -> Void
+    @State private var selectedFolder: String = ""
+
+    var body: some View {
+        NavigationStack {
+            VStack(spacing: 0) {
+                List(model.allDisplayFolders, id: \.self) { folder in
+                    let level = folder.filter { $0 == "/" }.count
+                    let isSelected = selectedFolder.caseInsensitiveCompare(folder) == .orderedSame
+                    HStack {
+                        if level > 0 { Spacer().frame(width: CGFloat(level) * 18) }
+                        Button {
+                            selectedFolder = folder
+                        } label: {
+                            HStack {
+                                Image(systemName: isSelected ? "folder.fill" : "folder")
+                                    .foregroundStyle(isSelected ? .blue : .secondary)
+                                Text(BookshelfPath.leaf(folder))
+                                    .font(.body.weight(isSelected ? .semibold : .regular))
+                                Spacer()
+                            }
+                        }
+                        .buttonStyle(.plain)
+
+                        Button("여기로 이동") {
+                            model.moveImages(itemIDs, toFolder: folder)
+                            onMoved()
+                            dismiss()
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.small)
+                    }
+                }
+                .listStyle(.plain)
+
+                Button {
+                    guard !selectedFolder.isEmpty else { return }
+                    model.moveImages(itemIDs, toFolder: selectedFolder)
+                    onMoved()
+                    dismiss()
+                } label: {
+                    Label("확인 (\(itemIDs.count)개 → ‘\(BookshelfPath.leaf(selectedFolder))’)", systemImage: "checkmark.circle.fill")
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 10)
+                }
+                .buttonStyle(.borderedProminent)
+                .padding(12)
+            }
+            .navigationTitle("선택한 사진 \(itemIDs.count)개 이동")
+            .navigationBarTitleDisplayMode(.inline)
+            .onAppear { selectedFolder = model.activeFolder }
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) { Button("취소") { dismiss() } }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("확인") {
+                        model.moveImages(itemIDs, toFolder: selectedFolder)
+                        onMoved()
+                        dismiss()
+                    }
+                }
+            }
+        }
+        .preferredColorScheme(.dark)
+    }
+}
+
+struct BookshelfStorageSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    @ObservedObject var model: ShelfModel
+    @ObservedObject var sync: DriveSyncManager = .shared
+    @State private var diskMB: String = "0.0 MB"
+    @State private var localCount: Int = 0
+    @State private var downloadingAll = false
+    @State private var statusText = ""
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("책장 저장 공간 요약") {
+                    LabeledContent("폴더 개수") { Text("\(model.allDisplayFolders.count)개") }
+                    LabeledContent("전체 사진 수") { Text("\(model.catalog.items.count)장") }
+                    LabeledContent("기기 저장 원본") { Text("\(localCount)장") }
+                    LabeledContent("클라우드 전용(온디맨드)") { Text("\(max(0, model.catalog.items.count - localCount))장") }
+                    LabeledContent("디스크 사용량") { Text(diskMB).monospacedDigit() }
+                }
+
+                Section("클라우드 저장 방식") {
+                    Picker("사진 저장 방식", selection: $sync.onDemandCloudPhotos) {
+                        Text("기기에 원본 모두 저장").tag(false)
+                        Text("필요할 때 클라우드에서 불러오기").tag(true)
+                    }
+                    Button {
+                        Task {
+                            downloadingAll = true
+                            defer { downloadingAll = false }
+                            var downloaded = 0
+                            for item in model.catalog.items {
+                                if !FileManager.default.fileExists(atPath: model.imageURL(for: item).path),
+                                   item.cloud != nil {
+                                    if await sync.downloadCloudImageIfNeeded(item: item, shelf: model) != nil {
+                                        downloaded += 1
+                                    }
+                                }
+                            }
+                            refreshStats()
+                            statusText = downloaded > 0 ? "클라우드 사진 \(downloaded)장을 기기에 내려받았습니다." : "이미 모든 사진이 기기에 저장되어 있습니다."
+                        }
+                    } label: {
+                        Label("클라우드 사진 모두 기기에 내려받기", systemImage: "icloud.and.arrow.down")
+                    }
+                    .disabled(downloadingAll || !sync.isConnected)
+                }
+
+                Section("유지 관리") {
+                    Button("미사용 잔여 파일 정리") {
+                        let cleaned = model.cleanupOrphanFiles()
+                        refreshStats()
+                        statusText = cleaned > 0 ? "잔여 파일 \(cleaned)개 정리 완료" : "정리할 파일이 없습니다."
+                    }
+                    if !statusText.isEmpty {
+                        Text(statusText).font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+            }
+            .navigationTitle("책장 저장 공간")
+            .navigationBarTitleDisplayMode(.inline)
+            .onAppear { refreshStats() }
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("완료") { dismiss() }
+                }
+            }
+        }
+        .preferredColorScheme(.dark)
+    }
+
+    private func refreshStats() {
+        let bytes = model.diskUsageBytes()
+        diskMB = String(format: "%.2f MB", Double(bytes) / (1024.0 * 1024.0))
+        localCount = model.localOriginalCount()
     }
 }
