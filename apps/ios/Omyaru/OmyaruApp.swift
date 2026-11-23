@@ -1543,7 +1543,7 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
     }
 
     func closeOtherTabs(keeping keepID: UUID) {
-        let toClose = visibleTabs.map(\.id).filter { $0 != keepID }
+        let toClose = visibleTabs.filter { $0.id != keepID && !$0.isPinned }.map(\.id)
         for id in toClose {
             webViews.removeValue(forKey: id)?.stopLoading()
             loadedTabIDs.remove(id)
@@ -1600,12 +1600,6 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
         let item = tabs.remove(at: fromIdx)
         tabs.insert(item, at: toIdx)
         persist()
-    }
-
-    func closeOtherTabs(keeping tabID: UUID) {
-        let others = Set(visibleTabs.filter { $0.id != tabID && !$0.isPinned }.map(\.id))
-        guard !others.isEmpty else { return }
-        closeTabs(others)
     }
 
     // MARK: - Profiles & Tab Groups

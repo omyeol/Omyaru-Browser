@@ -1773,7 +1773,10 @@ final class DriveSyncManager: NSObject, ObservableObject, ASWebAuthenticationPre
             }
         }
 
-        let remoteTabIDs = Set(remote.tabs.keys.map { replica.uuid(forWireID: $0) })
+        var remoteTabIDs = Set<UUID>()
+        for tid in remote.tabs.keys {
+            remoteTabIDs.insert(replica.uuid(forWireID: tid))
+        }
         browser.tabs.removeAll { tab in
             guard !tab.isPrivate else { return false }
             if remoteTabIDs.contains(tab.id) { return false }
