@@ -57,10 +57,10 @@ def main() -> None:
                 "buildVersion": build_version,
                 "date": date.today().isoformat(),
                 "localizedDescription": (
-                    f"v{version} (build {build_version}): Fixed hierarchical bookshelf folder tree ordering so nested subfolders always group strictly under their parent; high-speed parallel Google Drive sync, "
-                    "6x concurrent chunk & batch transfers, single appDataFolder listing, persistent KeyRing cache, delta-only CRDT shelf replica), "
-                    "shared sync folder picker with per-account subfolder (<Folder>/<account>) & kernel flock cross-app sync lock for zero duplication with Umtomi, "
-                    "and automatic LiveContainer Live Activity fallback (live-updating progress notification + floating top sync pill)."
+                    f"v{version} (build {build_version}): Full PC/Android/iOS bidirectional CRDT tab, tab group & profile sync "
+                    "(OmyaruTabReplica with live debounced push, group creation/move/delete & tombstone sync), "
+                    "smooth iOS 26 Safari Tab Overview long-press lift, spring-animated 2D grid drag reorder & floating Liquid Glass release menu "
+                    "(copy link, pin/unpin, duplicate, select, move, close other tabs, close), plus parallel Google Drive bookshelf sync."
                 ),
                 "downloadURL": download_url,
                 "size": ipa.stat().st_size,

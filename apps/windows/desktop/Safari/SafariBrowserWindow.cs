@@ -109,11 +109,17 @@ internal sealed partial class SafariBrowserWindow : Window
 
   private readonly TextBox _overviewSearchBox = new();
   private readonly StackPanel _overviewGroupPills = new();
+  private readonly DockPanel _overviewNormalHeader = new();
+  private readonly Border _overviewSelectionBar = new();
+  private readonly TextBlock _overviewSelectionCountText = new();
+  private Border _overviewMoveSelectedBtn = null!;
   private readonly ScrollViewer _overviewScroll = new();
   private readonly Canvas _overviewCanvas = new();
   private readonly ScaleTransform _overviewScale = new(1, 1);
   private readonly List<OverviewCardEntry> _overviewCards = new();
   private readonly DispatcherTimer _overviewLongPressTimer = new() { Interval = TimeSpan.FromMilliseconds(250) };
+  private readonly HashSet<string> _overviewSelectedIds = new(StringComparer.Ordinal);
+  private bool _overviewSelectionMode;
   private OverviewCardEntry? _overviewPendingCard;
   private OverviewCardEntry? _overviewLiftedCard;
   private Point _overviewPressCanvasPos;
@@ -839,15 +845,16 @@ internal sealed partial class SafariBrowserWindow : Window
     _overviewLayer.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
     _overviewLayer.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
 
-    // Top Overview Header Bar
-    var header = new DockPanel { Margin = new Thickness(28, 20, 28, 12) };
+    // Top Overview Header Container (switches between Normal Header and Multi-Select Action Bar)
+    var headerHost = new Grid { Margin = new Thickness(28, 20, 28, 12) };
+
     var doneBtn = SafariTheme.CreateGlassButton(
         SafariTheme.CreateGlyph("완료", 12.5, Brushes.White),
         ToggleTabOverview,
         "탭 목록 닫기",
         68, 32, 16, transparentIdle: false, accentFill: SafariTheme.AccentColor);
     DockPanel.SetDock(doneBtn, Dock.Right);
-    header.Children.Add(doneBtn);
+    _overviewNormalHeader.Children.Add(doneBtn);
 
     var addRow = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center };
     addRow.Children.Add(SafariIcons.Create(SafariIcon.Plus, 13, SafariTheme.TextPrimary));
@@ -859,7 +866,7 @@ internal sealed partial class SafariBrowserWindow : Window
         88, 32, 16, transparentIdle: false);
     addBtn.Margin = new Thickness(0, 0, 8, 0);
     DockPanel.SetDock(addBtn, Dock.Right);
-    header.Children.Add(addBtn);
+    _overviewNormalHeader.Children.Add(addBtn);
 
     // Search Filter
     var ovSearch = new Border
@@ -906,14 +913,87 @@ internal sealed partial class SafariBrowserWindow : Window
     ovSearchGrid.Children.Add(ovInputHost);
     ovSearch.Child = ovSearchGrid;
     DockPanel.SetDock(ovSearch, Dock.Right);
-    header.Children.Add(ovSearch);
+    _overviewNormalHeader.Children.Add(ovSearch);
 
     _overviewGroupPills.Orientation = Orientation.Horizontal;
     _overviewGroupPills.VerticalAlignment = VerticalAlignment.Center;
-    header.Children.Add(_overviewGroupPills);
+    _overviewNormalHeader.Children.Add(_overviewGroupPills);
 
-    Grid.SetRow(header, 0);
-    _overviewLayer.Children.Add(header);
+    // Multi-Select Action Bar (shown when user picks "탭 선택")
+    var selDock = new DockPanel { LastChildFill = false };
+    var selDoneBtn = SafariTheme.CreateGlassButton(
+        SafariTheme.CreateGlyph("완료", 12.5, Brushes.White),
+        ExitOverviewSelectionMode,
+        "탭 선택 모드 종료",
+        68, 32, 16, transparentIdle: false, accentFill: SafariTheme.AccentColor);
+    DockPanel.SetDock(selDoneBtn, Dock.Right);
+    selDock.Children.Add(selDoneBtn);
+
+    var selCloseRow = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center };
+    selCloseRow.Children.Add(SafariIcons.Create(SafariIcon.Trash, 13, Brushes.White, 1.65));
+    selCloseRow.Children.Add(new TextBlock { Text = "선택 닫기", FontSize = 12.5, Foreground = Brushes.White, Margin = new Thickness(5, 0, 0, 0), VerticalAlignment = VerticalAlignment.Center });
+    var selCloseBtn = SafariTheme.CreateGlassButton(
+        selCloseRow,
+        () => _ = CloseSelectedOverviewTabsAsync(),
+        "선택한 탭 모두 닫기",
+        98, 32, 16, transparentIdle: false, accentFill: SafariTheme.DangerRedColor);
+    selCloseBtn.Margin = new Thickness(0, 0, 8, 0);
+    DockPanel.SetDock(selCloseBtn, Dock.Right);
+    selDock.Children.Add(selCloseBtn);
+
+    var selMoveRow = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center };
+    selMoveRow.Children.Add(SafariIcons.Create(SafariIcon.Folder, 13, SafariTheme.TextPrimary, 1.65));
+    selMoveRow.Children.Add(new TextBlock { Text = "탭 이동", FontSize = 12.5, Foreground = SafariTheme.TextPrimary, Margin = new Thickness(5, 0, 0, 0), VerticalAlignment = VerticalAlignment.Center });
+    _overviewMoveSelectedBtn = SafariTheme.CreateGlassButton(
+        selMoveRow,
+        () =>
+        {
+          if (_overviewSelectedIds.Count == 0) return;
+          ShowMoveTabsPopup(_overviewMoveSelectedBtn, _overviewSelectedIds.ToList());
+        },
+        "선택한 탭을 다른 그룹/프로필로 이동",
+        92, 32, 16, transparentIdle: false);
+    _overviewMoveSelectedBtn.Margin = new Thickness(0, 0, 8, 0);
+    DockPanel.SetDock(_overviewMoveSelectedBtn, Dock.Right);
+    selDock.Children.Add(_overviewMoveSelectedBtn);
+
+    var selAllBtn = SafariTheme.CreateGlassButton(
+        SafariTheme.CreateGlyph("전체 선택", 12, SafariTheme.TextPrimary),
+        () =>
+        {
+          var visibleIds = _overviewCards.Select(c => c.Tab.Id).ToList();
+          if (visibleIds.All(id => _overviewSelectedIds.Contains(id)))
+            _overviewSelectedIds.Clear();
+          else
+            foreach (var id in visibleIds) _overviewSelectedIds.Add(id);
+          PopulateTabOverview();
+        },
+        "현재 목록 전체 선택 / 해제",
+        84, 32, 16, transparentIdle: false);
+    selAllBtn.Margin = new Thickness(0, 0, 8, 0);
+    DockPanel.SetDock(selAllBtn, Dock.Right);
+    selDock.Children.Add(selAllBtn);
+
+    _overviewSelectionCountText.FontSize = 14;
+    _overviewSelectionCountText.FontWeight = FontWeights.SemiBold;
+    _overviewSelectionCountText.Foreground = SafariTheme.TextPrimary;
+    _overviewSelectionCountText.VerticalAlignment = VerticalAlignment.Center;
+    DockPanel.SetDock(_overviewSelectionCountText, Dock.Left);
+    selDock.Children.Add(_overviewSelectionCountText);
+
+    _overviewSelectionBar.Background = new SolidColorBrush(Color.FromArgb(200, 26, 32, 46));
+    _overviewSelectionBar.BorderBrush = SafariTheme.Accent;
+    _overviewSelectionBar.BorderThickness = new Thickness(1);
+    _overviewSelectionBar.CornerRadius = new CornerRadius(18);
+    _overviewSelectionBar.Padding = new Thickness(14, 6, 8, 6);
+    _overviewSelectionBar.Child = selDock;
+    _overviewSelectionBar.Visibility = Visibility.Collapsed;
+
+    headerHost.Children.Add(_overviewNormalHeader);
+    headerHost.Children.Add(_overviewSelectionBar);
+
+    Grid.SetRow(headerHost, 0);
+    _overviewLayer.Children.Add(headerHost);
 
     _overviewCanvas.Background = Brushes.Transparent;
     _overviewCanvas.HorizontalAlignment = HorizontalAlignment.Left;
@@ -1090,6 +1170,9 @@ internal sealed partial class SafariBrowserWindow : Window
   internal void ToggleTabOverview()
   {
     CancelOverviewInteraction();
+    _overviewSelectionMode = false;
+    _overviewSelectedIds.Clear();
+    UpdateOverviewSelectionHeader();
     _showingOverview = !_showingOverview;
     ApplyChromePreferences();
     if (_showingOverview)
@@ -2196,9 +2279,79 @@ internal sealed partial class SafariBrowserWindow : Window
     }
   }
 
+  private void EnterOverviewSelectionMode(string? initialTabId = null)
+  {
+    if (!_showingOverview) ToggleTabOverview();
+    _overviewSelectionMode = true;
+    _overviewSelectedIds.Clear();
+    if (!string.IsNullOrWhiteSpace(initialTabId))
+      _overviewSelectedIds.Add(initialTabId);
+    PopulateTabOverview();
+  }
+
+  private void ExitOverviewSelectionMode()
+  {
+    _overviewSelectionMode = false;
+    _overviewSelectedIds.Clear();
+    UpdateOverviewSelectionHeader();
+    if (_showingOverview) PopulateTabOverview();
+  }
+
+  private void UpdateOverviewSelectionHeader()
+  {
+    _overviewNormalHeader.Visibility = _overviewSelectionMode ? Visibility.Collapsed : Visibility.Visible;
+    _overviewSelectionBar.Visibility = _overviewSelectionMode ? Visibility.Visible : Visibility.Collapsed;
+    _overviewSelectionCountText.Text = _overviewSelectedIds.Count > 0
+        ? $"{_overviewSelectedIds.Count}개 탭 선택됨"
+        : "이동하거나 닫을 탭을 선택하세요";
+  }
+
+  private async Task CloseSelectedOverviewTabsAsync()
+  {
+    var targets = _overviewSelectedIds.ToList();
+    if (targets.Count == 0) return;
+    _overviewSelectionMode = false;
+    _overviewSelectedIds.Clear();
+    UpdateOverviewSelectionHeader();
+    foreach (var id in targets)
+      await CloseTabAsync(id);
+    if (_showingOverview) PopulateTabOverview();
+  }
+
+  private void MoveTabsToDestination(IReadOnlyList<string> tabIds, string targetProfileId, string? targetGroupId, string destinationLabel)
+  {
+    if (tabIds.Count == 0) return;
+    var idSet = tabIds.ToHashSet(StringComparer.Ordinal);
+    var moved = 0;
+    for (var i = 0; i < _state.Tabs.Count; i++)
+    {
+      var t = _state.Tabs[i];
+      if (!idSet.Contains(t.Id)) continue;
+      if (t.ProfileId == targetProfileId && t.GroupId == targetGroupId) continue;
+      _state.Tabs[i] = t with { ProfileId = targetProfileId, GroupId = targetGroupId };
+      moved++;
+    }
+    if (moved == 0)
+    {
+      _syncStatus = $"이미 '{destinationLabel}'에 있는 탭입니다.";
+      UpdateStatusText();
+      return;
+    }
+
+    _overviewSelectionMode = false;
+    _overviewSelectedIds.Clear();
+    UpdateOverviewSelectionHeader();
+    EnsureWorkspaceTab();
+    MarkLocalChange();
+    RefreshWorkspaceUi();
+    _syncStatus = $"{moved}개 탭을 '{destinationLabel}'(으)로 이동했습니다.";
+    UpdateStatusText();
+  }
+
   private void PopulateTabOverview()
   {
     CancelOverviewInteraction();
+    UpdateOverviewSelectionHeader();
     _overviewGroupPills.Children.Clear();
     void AddGroupPill(string label, string? groupId)
     {
@@ -2230,12 +2383,13 @@ internal sealed partial class SafariBrowserWindow : Window
     {
       var currentTab = tab;
       var isActive = currentTab.Id == _state.ActiveTabId;
+      var isSelected = _overviewSelectionMode && _overviewSelectedIds.Contains(currentTab.Id);
       var scale = new ScaleTransform(1, 1);
       var translate = new TranslateTransform(0, 0);
       var transforms = new TransformGroup();
       transforms.Children.Add(scale);
       transforms.Children.Add(translate);
-      var cardBg = new SolidColorBrush(SafariTheme.CardFillColor);
+      var cardBg = new SolidColorBrush(isSelected ? Color.FromArgb(240, 26, 44, 72) : SafariTheme.CardFillColor);
 
       var cardGrid = new Grid();
       cardGrid.RowDefinitions.Add(new RowDefinition { Height = new GridLength(34) });
@@ -2243,9 +2397,28 @@ internal sealed partial class SafariBrowserWindow : Window
 
       // Card Header
       var topBar = new DockPanel { Margin = new Thickness(10, 0, 6, 0), VerticalAlignment = VerticalAlignment.Center };
-      var closeCardBtn = SafariTheme.CreateGlassButton(SafariIcons.Create(SafariIcon.Close, 10, SafariTheme.TextSecondary, 1.9), () => { _ = CloseTabAsync(currentTab.Id); }, "탭 닫기", 22, 22, 11);
-      DockPanel.SetDock(closeCardBtn, Dock.Right);
-      topBar.Children.Add(closeCardBtn);
+      Border? closeCardBtn = null;
+      if (_overviewSelectionMode)
+      {
+        var checkBadge = new Border
+        {
+          Width = 22,
+          Height = 22,
+          CornerRadius = new CornerRadius(11),
+          Background = isSelected ? SafariTheme.Accent : new SolidColorBrush(Color.FromArgb(70, 255, 255, 255)),
+          BorderBrush = isSelected ? SafariTheme.Accent : SafariTheme.SpecularBorder,
+          BorderThickness = new Thickness(1.2),
+          Child = isSelected ? SafariIcons.Create(SafariIcon.Check, 11, Brushes.White, 2.2) : null,
+        };
+        DockPanel.SetDock(checkBadge, Dock.Right);
+        topBar.Children.Add(checkBadge);
+      }
+      else
+      {
+        closeCardBtn = SafariTheme.CreateGlassButton(SafariIcons.Create(SafariIcon.Close, 10, SafariTheme.TextSecondary, 1.9), () => { _ = CloseTabAsync(currentTab.Id); }, "탭 닫기", 22, 22, 11);
+        DockPanel.SetDock(closeCardBtn, Dock.Right);
+        topBar.Children.Add(closeCardBtn);
+      }
 
       if (currentTab.IsPinned)
       {
@@ -2310,13 +2483,13 @@ internal sealed partial class SafariBrowserWindow : Window
         Height = OverviewCardHeight,
         CornerRadius = new CornerRadius(15),
         Background = cardBg,
-        BorderBrush = isActive ? SafariTheme.Accent : SafariTheme.SpecularBorder,
-        BorderThickness = new Thickness(isActive ? 2 : 1),
+        BorderBrush = (isSelected || isActive) ? SafariTheme.Accent : SafariTheme.SpecularBorder,
+        BorderThickness = new Thickness((isSelected || isActive) ? 2 : 1),
         Effect = SafariTheme.GlassShadow(18, 0.4, 6),
         Cursor = Cursors.Hand,
         RenderTransformOrigin = new Point(0.5, 0.5),
         RenderTransform = transforms,
-        ToolTip = "클릭: 탭 열기 · 길게 누르기: 순서 이동 / 메뉴",
+        ToolTip = _overviewSelectionMode ? "클릭: 선택 / 선택 해제" : "클릭: 탭 열기 · 길게 누르기: 순서 이동 / 메뉴",
         Child = cardGrid,
       };
       Canvas.SetLeft(card, 0);
@@ -2344,13 +2517,20 @@ internal sealed partial class SafariBrowserWindow : Window
       {
         if (_overviewPendingCard is not null || _overviewLiftedCard is not null) return;
         SafariTheme.AnimateScale(scale, 1.0, 150);
-        SafariTheme.AnimateColor(cardBg, SafariTheme.CardFillColor, 140);
+        SafariTheme.AnimateColor(cardBg, isSelected ? Color.FromArgb(240, 26, 44, 72) : SafariTheme.CardFillColor, 140);
       };
       card.MouseLeftButtonDown += (_, e) =>
       {
-        if (IsDescendantOf(e.OriginalSource, closeCardBtn)) return;
+        if (closeCardBtn is not null && IsDescendantOf(e.OriginalSource, closeCardBtn)) return;
         e.Handled = true;
         ClosePopup();
+        if (_overviewSelectionMode)
+        {
+          if (!_overviewSelectedIds.Add(currentTab.Id))
+            _overviewSelectedIds.Remove(currentTab.Id);
+          PopulateTabOverview();
+          return;
+        }
         _overviewLongPressTimer.Stop();
         _overviewPendingCard = entry;
         _overviewLiftedCard = null;
@@ -2652,7 +2832,8 @@ internal sealed partial class SafariBrowserWindow : Window
     else if (e.Key == Key.Escape && _showingOverview)
     {
       e.Handled = true;
-      ToggleTabOverview();
+      if (_overviewSelectionMode) ExitOverviewSelectionMode();
+      else ToggleTabOverview();
     }
   }
 

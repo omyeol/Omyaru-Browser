@@ -425,20 +425,23 @@ internal sealed partial class SafariBrowserWindow
   private void ShowTabContextPopup(UIElement anchor, TabEntry tab)
   {
     var panel = new StackPanel();
-    if (!string.IsNullOrWhiteSpace(tab.Url) && !string.Equals(tab.Url, "about:blank", StringComparison.OrdinalIgnoreCase))
+    panel.Children.Add(SafariTheme.CreatePopoverRow(SafariIcon.Link, "링크 복사하기", () =>
     {
-      panel.Children.Add(SafariTheme.CreatePopoverRow(SafariIcon.Link, "링크 복사하기", () =>
+      ClosePopup();
+      if (string.IsNullOrWhiteSpace(tab.Url) || string.Equals(tab.Url, "about:blank", StringComparison.OrdinalIgnoreCase))
       {
-        ClosePopup();
-        try
-        {
-          System.Windows.Clipboard.SetText(tab.Url);
-          _syncStatus = "링크가 클립보드에 복사되었습니다.";
-          UpdateStatusText();
-        }
-        catch { }
-      }));
-    }
+        _syncStatus = "복사할 링크가 없습니다.";
+        UpdateStatusText();
+        return;
+      }
+      try
+      {
+        System.Windows.Clipboard.SetText(tab.Url);
+        _syncStatus = "링크가 클립보드에 복사되었습니다.";
+        UpdateStatusText();
+      }
+      catch { }
+    }));
     panel.Children.Add(SafariTheme.CreatePopoverRow(
         tab.IsPinned ? SafariIcon.PinOff : SafariIcon.Pin,
         tab.IsPinned ? "탭 고정 해제" : "탭 고정",
@@ -447,17 +450,99 @@ internal sealed partial class SafariBrowserWindow
           ClosePopup();
           TogglePinTab(tab.Id);
         }));
-    panel.Children.Add(SafariTheme.CreatePopoverRow(SafariIcon.Duplicate, "탭 복제", () => { ClosePopup(); _ = DuplicateTabAsync(tab.Id); }));
-    panel.Children.Add(SafariTheme.CreatePopoverRow(SafariIcon.Undo, "닫은 탭 다시 열기", () => { ClosePopup(); _ = ReopenClosedTabAsync(); }));
-    panel.Children.Add(SafariTheme.CreatePopoverDivider());
-    panel.Children.Add(SafariTheme.CreatePopoverRow(SafariIcon.Close, "다른 탭 모두 닫기", () =>
+    panel.Children.Add(SafariTheme.CreatePopoverRow(SafariIcon.Duplicate, "탭 복제", () =>
     {
       ClosePopup();
-      foreach (var other in VisibleTabs().Where(t => t.Id != tab.Id && !t.IsPinned).ToArray())
-        _ = CloseTabAsync(other.Id);
+      _ = DuplicateTabAsync(tab.Id);
     }));
-    panel.Children.Add(SafariTheme.CreatePopoverRow(SafariIcon.Trash, "이 탭 닫기", () => { ClosePopup(); _ = CloseTabAsync(tab.Id); }, isDestructive: true));
-    ShowGlassPopup(anchor, panel, 224, 300);
+    panel.Children.Add(SafariTheme.CreatePopoverRow(SafariIcon.Check, "탭 선택", () =>
+    {
+      ClosePopup();
+      EnterOverviewSelectionMode(tab.Id);
+    }));
+    panel.Children.Add(SafariTheme.CreatePopoverRow(SafariIcon.Folder, "탭 이동", () =>
+    {
+      ClosePopup();
+      Dispatcher.BeginInvoke(() => ShowMoveTabsPopup(anchor, [tab.Id]), System.Windows.Threading.DispatcherPriority.Input);
+    }));
+    panel.Children.Add(SafariTheme.CreatePopoverDivider());
+    panel.Children.Add(SafariTheme.CreatePopoverRow(SafariIcon.Trash, "탭 닫기", () =>
+    {
+      ClosePopup();
+      _ = CloseTabAsync(tab.Id);
+    }, isDestructive: true));
+    ShowGlassPopup(anchor, panel, 214, 300);
+  }
+
+  private void ShowMoveTabsPopup(UIElement anchor, IReadOnlyList<string> tabIds)
+  {
+    if (tabIds.Count == 0) return;
+    var firstTab = _state.Tabs.FirstOrDefault(t => t.Id == tabIds[0]);
+    var panel = new StackPanel();
+
+    panel.Children.Add(new TextBlock
+    {
+      Text = tabIds.Count == 1 ? "이동할 위치 선택" : $"{tabIds.Count}개 탭을 이동할 위치 선택",
+      FontSize = 11.5,
+      FontWeight = FontWeights.SemiBold,
+      Foreground = SafariTheme.TextMuted,
+      Margin = new Thickness(10, 6, 10, 6),
+    });
+
+    foreach (var profile in _state.Profiles)
+    {
+      var p = profile;
+      var pGroups = _state.Groups.Where(g => g.ProfileId == p.Id && g.Id != PrivateGroupId).ToList();
+      if (_state.Profiles.Count > 1)
+      {
+        panel.Children.Add(new TextBlock
+        {
+          Text = p.Name,
+          FontSize = 11,
+          FontWeight = FontWeights.SemiBold,
+          Foreground = SafariTheme.TextMuted,
+          Margin = new Thickness(10, 6, 10, 2),
+        });
+      }
+
+      var isCurrentDefault = firstTab is not null && firstTab.ProfileId == p.Id && firstTab.GroupId is null;
+      var defaultLabel = _state.Profiles.Count > 1 ? $"{p.Name} · 기본 탭" : "기본 탭";
+      panel.Children.Add(SafariTheme.CreatePopoverRow(
+          isCurrentDefault ? SafariIcon.Check : SafariIcon.TabOverview,
+          "기본 탭",
+          () =>
+          {
+            ClosePopup();
+            MoveTabsToDestination(tabIds, p.Id, null, defaultLabel);
+          }));
+
+      foreach (var group in pGroups)
+      {
+        var g = group;
+        var isCurrentGroup = firstTab is not null && firstTab.ProfileId == p.Id && firstTab.GroupId == g.Id;
+        var label = _state.Profiles.Count > 1 ? $"{p.Name} · {g.Name}" : g.Name;
+        panel.Children.Add(SafariTheme.CreatePopoverRow(
+            isCurrentGroup ? SafariIcon.Check : SafariIcon.TabGroup,
+            g.Name,
+            () =>
+            {
+              ClosePopup();
+              MoveTabsToDestination(tabIds, p.Id, g.Id, label);
+            }));
+      }
+    }
+
+    panel.Children.Add(SafariTheme.CreatePopoverDivider());
+    panel.Children.Add(SafariTheme.CreatePopoverRow(SafariIcon.Plus, "새 탭 그룹으로 이동…", () => ClosePopupThen(() =>
+    {
+      var name = ShowSimpleInputDialog("새 탭 그룹으로 이동", "새 탭 그룹 이름을 입력하세요:", "");
+      if (string.IsNullOrWhiteSpace(name)) return;
+      var group = new TabGroupEntry(Guid.NewGuid().ToString("N"), _state.ActiveProfileId, name.Trim());
+      _state.Groups.Add(group);
+      MoveTabsToDestination(tabIds, _state.ActiveProfileId, group.Id, group.Name);
+    })));
+
+    ShowGlassPopup(anchor, panel, 240, 380);
   }
 
   private void ShowGroupContextPopup(UIElement anchor, TabGroupEntry group)
@@ -989,13 +1074,30 @@ internal sealed partial class SafariBrowserWindow
   private async Task ApplyDriveStateAsync(SyncSnapshot imported)
   {
     var previous = _state;
+    var wasPrivateWorkspace = previous.ActiveGroupId == PrivateGroupId;
+    var privateTabs = previous.Tabs.Where(t => t.GroupId == PrivateGroupId).ToList();
+    var pinnedIds = previous.Tabs.Where(t => t.IsPinned).Select(t => t.Id).ToHashSet(StringComparer.Ordinal);
+
     imported.ActiveProfileId = previous.ActiveProfileId;
-    imported.ActiveGroupId = previous.ActiveGroupId;
+    imported.ActiveGroupId = wasPrivateWorkspace ? null : previous.ActiveGroupId;
     imported.ActiveTabId = previous.ActiveTabId;
     imported.Normalize();
+
+    // Preserve local-only pin states (not synced in wire v1 schema) and local-only private tabs.
+    imported.Tabs = imported.Tabs
+        .Select(t => pinnedIds.Contains(t.Id) ? t with { IsPinned = true } : t)
+        .Concat(privateTabs)
+        .ToList();
+    if (wasPrivateWorkspace)
+    {
+      imported.ActiveGroupId = PrivateGroupId;
+      if (previous.ActiveTabId is not null && imported.Tabs.Any(t => t.Id == previous.ActiveTabId))
+        imported.ActiveTabId = previous.ActiveTabId;
+    }
+
     if (previous.Profiles.SequenceEqual(imported.Profiles) &&
         previous.Groups.SequenceEqual(imported.Groups) &&
-        previous.Tabs.Select(t => t with { ThumbnailBase64 = null }).SequenceEqual(imported.Tabs))
+        previous.Tabs.Select(t => t with { ThumbnailBase64 = null }).SequenceEqual(imported.Tabs.Select(t => t with { ThumbnailBase64 = null })))
       return;
 
     var liveIds = imported.Tabs.Select(t => t.Id).ToHashSet(StringComparer.Ordinal);

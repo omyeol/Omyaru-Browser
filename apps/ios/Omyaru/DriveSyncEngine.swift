@@ -250,6 +250,36 @@ private struct DriveRESTClient: Sendable {
         return results
     }
 
+    func listTabSyncFiles(includeKeys: Bool) async throws -> [DriveFileEntry] {
+        struct FileListResponse: Decodable {
+            let files: [DriveFileEntry]
+            let nextPageToken: String?
+        }
+        let q = includeKeys
+            ? "trashed = false and (name contains 'omyaru-tabs-v' or name contains 'omyaru-tab-reset-v1-' or name contains 'omyaru-account-key-v1-')"
+            : "trashed = false and (name contains 'omyaru-tabs-v' or name contains 'omyaru-tab-reset-v1-')"
+        var results: [DriveFileEntry] = []
+        var pageToken: String? = nil
+        var seenTokens = Set<String>()
+        repeat {
+            var comps = URLComponents(string: "https://www.googleapis.com/drive/v3/files")!
+            var query = [
+                URLQueryItem(name: "spaces", value: "appDataFolder"),
+                URLQueryItem(name: "pageSize", value: "1000"),
+                URLQueryItem(name: "fields", value: "nextPageToken,files(id,name)"),
+                URLQueryItem(name: "q", value: q)
+            ]
+            if let pageToken { query.append(URLQueryItem(name: "pageToken", value: pageToken)) }
+            comps.queryItems = query
+            let data = try await request(URLRequest(url: comps.url!, timeoutInterval: 20))
+            let page = try JSONDecoder().decode(FileListResponse.self, from: data)
+            results.append(contentsOf: page.files)
+            pageToken = page.nextPageToken
+            if let pageToken, !seenTokens.insert(pageToken).inserted { break }
+        } while pageToken != nil && results.count < 10_000
+        return results
+    }
+
     func readDriveFile(_ fileID: String) async throws -> Data {
         var comps = URLComponents(string: "https://www.googleapis.com/drive/v3/files/\(fileID)")!
         comps.queryItems = [URLQueryItem(name: "alt", value: "media")]
@@ -348,6 +378,8 @@ final class DriveSyncManager: NSObject, ObservableObject, ASWebAuthenticationPre
     @Published var progress: Double? = nil
     @Published var lastSyncedAt: Date? = nil
     private var cancelRequested: Bool = false
+    private var tabSyncBusy: Bool = false
+    private var quickTabSyncTask: Task<Void, Never>? = nil
 
     private var accessToken: String = "" {
         didSet { persistAuthSession() }
@@ -702,6 +734,8 @@ final class DriveSyncManager: NSObject, ObservableObject, ASWebAuthenticationPre
             return
         }
         cancelRequested = false
+        quickTabSyncTask?.cancel()
+        quickTabSyncTask = nil
         busy = true
         progress = 0.05
         status = "Google Drive 목록 확인 중..."
@@ -798,11 +832,66 @@ final class DriveSyncManager: NSObject, ObservableObject, ASWebAuthenticationPre
         let plain = try JSONSerialization.data(withJSONObject: payloadObj, options: [.sortedKeys])
         let encrypted = try await keys.encryptAsync(plain)
         _ = try await rest.uploadDriveFile(name: "omyaru-tab-reset-v1-\(resetID).json", payload: encrypted)
-        var seenResets = loadSeenSet(name: "seen-tab-resets.json")
-        seenResets.insert(resetID)
-        saveSeenSet(seenResets, name: "seen-tab-resets.json")
-        browser?.closeAllVisibleTabs()
+        var replica = OmyaruTabReplica(directory: accountBrowserSyncDir())
+        replica.observeResets([resetID])
+        try? replica.save()
+        if let browser {
+            browser.isApplyingRemoteSync = true
+            browser.tabs.removeAll { !$0.isPrivate }
+            if browser.tabs.isEmpty {
+                _ = browser.newTab()
+            } else if !browser.tabs.contains(where: { $0.id == browser.activeID }), let first = browser.tabs.first {
+                browser.activeID = first.id
+            }
+            browser.reconcileWebViewsAfterRemoteSync(previousURLs: [:])
+            browser.persist()
+            browser.isApplyingRemoteSync = false
+            replica.acknowledge(Self.flattenBrowserForTabSync(browser, replica: &replica))
+            try? replica.save()
+        }
         status = "모든 기기의 동기화 탭 초기화 요청을 기록했습니다."
+    }
+
+    func scheduleQuickTabSync(browser: BrowserModel) {
+        guard isConnected, autoSyncEnabled else { return }
+        quickTabSyncTask?.cancel()
+        quickTabSyncTask = Task { @MainActor [weak self, weak browser] in
+            try? await Task.sleep(nanoseconds: 2_500_000_000)
+            guard !Task.isCancelled, let self, let browser else { return }
+            await self.syncTabsOnly(browser: browser)
+        }
+    }
+
+    func syncTabsOnly(browser: BrowserModel) async {
+        guard isConnected, !busy, !tabSyncBusy else { return }
+        if accessToken.isEmpty && !refreshToken.isEmpty {
+            _ = await refreshAccessTokenIfPossible()
+        }
+        guard !accessToken.isEmpty else { return }
+        tabSyncBusy = true
+        defer { tabSyncBusy = false }
+        do {
+            let needsKeys = cachedKeyRing?.primaryKey == nil
+            let files = try await executeWithTokenRefresh { try await $0.listTabSyncFiles(includeKeys: needsKeys) }
+            let rest = DriveRESTClient(accessToken: accessToken)
+            let keys: OmyaruDriveKeyRing
+            if let cached = cachedKeyRing, cached.primaryKey != nil {
+                keys = cached
+            } else {
+                let loaded = try await loadOrCreateKeyRing(
+                    keyFiles: files.filter { $0.name.hasPrefix("omyaru-account-key-v1-") },
+                    rest: rest
+                )
+                cachedKeyRing = loaded
+                keys = loaded
+            }
+            let resetFiles = files.filter { $0.name.hasPrefix("omyaru-tab-reset-v1-") }
+            let tabFiles = files.filter { $0.name.hasPrefix("omyaru-tabs-v") }
+            try await syncTabsAndResets(browser: browser, keys: keys, resetFiles: resetFiles, tabFiles: tabFiles, rest: rest)
+            lastSyncedAt = Date()
+        } catch {
+            // Silent retry on next edit or foreground full sync
+        }
     }
 
     func downloadCloudImageIfNeeded(item: BookshelfItem, shelf: ShelfModel) async -> URL? {
@@ -1075,6 +1164,440 @@ final class DriveSyncManager: NSObject, ObservableObject, ASWebAuthenticationPre
         }
     }
 
+    // MARK: - Full Cross-Platform CRDT Tab, Tab Group & Profile Sync (100% Wire Compatible with PC DriveTabReplica & Android)
+
+    private struct OmyaruTabReplica {
+        let fileURL: URL
+        let hadPersistedState: Bool
+        private(set) var state: [String: Any]
+
+        init(directory: URL) {
+            try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            fileURL = directory.appendingPathComponent("tab-replica.json")
+            if let data = try? Data(contentsOf: fileURL),
+               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let actor = obj["actor"] as? String,
+               Self.isValidNonZeroHex32(actor),
+               obj["registers"] is [String: Any],
+               obj["baseline"] is [String: Any],
+               obj["seen"] is [String],
+               obj["pending"] is [[String: Any]] {
+                hadPersistedState = true
+                state = obj
+            } else {
+                hadPersistedState = false
+                state = [
+                    "actor": OmyaruSyncCrypto.compactUUID(),
+                    "clock": Int64(0),
+                    "registers": [String: Any](),
+                    "baseline": [String: Any](),
+                    "seen": [String](),
+                    "pending": [[String: Any]](),
+                    "tabResetIds": [String](),
+                    "needsTabClear": false,
+                    "uuidToWireId": [String: String]()
+                ]
+            }
+        }
+
+        var baseline: [String: Any] { state["baseline"] as? [String: Any] ?? [:] }
+        var pending: [[String: Any]] { state["pending"] as? [[String: Any]] ?? [] }
+        var seen: Set<String> { Set(state["seen"] as? [String] ?? []) }
+        var tabResetIDs: Set<String> {
+            Set((state["tabResetIds"] as? [String] ?? []).filter { Self.isValidNonZeroHex32($0) })
+        }
+        var needsTabClear: Bool { (state["needsTabClear"] as? Bool) ?? false }
+
+        func save() throws {
+            try FileManager.default.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+            let data = try JSONSerialization.data(withJSONObject: state, options: [.sortedKeys])
+            try data.write(to: fileURL, options: .atomic)
+        }
+
+        static func isValidNonZeroHex32(_ value: String) -> Bool {
+            guard value.count == 32,
+                  value.allSatisfy({ ("0"..."9").contains($0) || ("a"..."f").contains($0) || ("A"..."F").contains($0) }) else {
+                return false
+            }
+            return value.contains(where: { $0 != "0" })
+        }
+
+        static func deterministicUUID(seed: String) -> UUID {
+            let digest = Array(SHA256.hash(data: Data(seed.utf8)))
+            let bytes: uuid_t = (
+                digest[0], digest[1], digest[2], digest[3],
+                digest[4], digest[5],
+                (digest[6] & 0x0F) | 0x50, digest[7],
+                (digest[8] & 0x3F) | 0x80, digest[9],
+                digest[10], digest[11], digest[12], digest[13], digest[14], digest[15]
+            )
+            return UUID(uuid: bytes)
+        }
+
+        static func uuidFromCompactHex(_ hex: String) -> UUID? {
+            let s = hex.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            guard s.count == 32,
+                  s.allSatisfy({ ("0"..."9").contains($0) || ("a"..."f").contains($0) }) else {
+                return nil
+            }
+            let i1 = s.index(s.startIndex, offsetBy: 8)
+            let i2 = s.index(i1, offsetBy: 4)
+            let i3 = s.index(i2, offsetBy: 4)
+            let i4 = s.index(i3, offsetBy: 4)
+            return UUID(uuidString: "\(s[..<i1])-\(s[i1..<i2])-\(s[i2..<i3])-\(s[i3..<i4])-\(s[i4...])")
+        }
+
+        static func defaultGroupUUID(forProfileWireID profileWireID: String) -> UUID {
+            if profileWireID == "default" {
+                return BrowserModel.defaultGroupID
+            }
+            return deterministicUUID(seed: "omyaru-default-group:\(profileWireID)")
+        }
+
+        mutating func uuid(forWireID wireID: String, isProfile: Bool = false) -> UUID {
+            if isProfile && wireID == "default" {
+                return BrowserModel.defaultProfileID
+            }
+            if let parsed = Self.uuidFromCompactHex(wireID) ?? UUID(uuidString: wireID) {
+                return parsed
+            }
+            let derived = Self.deterministicUUID(seed: "omyaru-wire-id:\(wireID)")
+            var map = state["uuidToWireId"] as? [String: String] ?? [:]
+            map[derived.uuidString.lowercased()] = wireID
+            state["uuidToWireId"] = map
+            return derived
+        }
+
+        func wireID(forUUID uuid: UUID, isProfile: Bool = false) -> String {
+            if isProfile && uuid == BrowserModel.defaultProfileID {
+                return "default"
+            }
+            let map = state["uuidToWireId"] as? [String: String] ?? [:]
+            if let mapped = map[uuid.uuidString.lowercased()], !mapped.isEmpty {
+                return mapped
+            }
+            return OmyaruSyncCrypto.compactUUID(uuid)
+        }
+
+        mutating func recordExistingResets(_ ids: Set<String>) {
+            let valid = ids.filter { Self.isValidNonZeroHex32($0) }
+            guard !valid.isEmpty else { return }
+            var merged = tabResetIDs
+            merged.formUnion(valid)
+            state["tabResetIds"] = Array(merged).sorted()
+        }
+
+        mutating func observeResets(_ ids: Set<String>) {
+            let valid = ids.filter { Self.isValidNonZeroHex32($0) }
+            let existing = tabResetIDs
+            let unseen = valid.subtracting(existing)
+            guard !unseen.isEmpty else { return }
+            var merged = existing
+            merged.formUnion(valid)
+            state["tabResetIds"] = Array(merged).sorted()
+            state["needsTabClear"] = true
+
+            var registers = state["registers"] as? [String: [String: Any]] ?? [:]
+            for k in registers.keys where k.hasPrefix("tabs/") { registers.removeValue(forKey: k) }
+            state["registers"] = registers
+
+            var base = baseline
+            for k in base.keys where k.hasPrefix("tabs/") { base.removeValue(forKey: k) }
+            state["baseline"] = base
+
+            let filteredPending: [[String: Any]] = pending.compactMap { batch in
+                guard let rows = batch["changes"] as? [[String: Any]] else { return nil }
+                let kept = rows.filter { ($0["kind"] as? String) != "tabs" }
+                guard !kept.isEmpty else { return nil }
+                var copy = batch
+                copy["changes"] = kept
+                return copy
+            }
+            state["pending"] = filteredPending
+            state["seen"] = [String]()
+        }
+
+        mutating func acknowledge(_ projected: [String: Any]) {
+            state["baseline"] = projected
+            state["needsTabClear"] = false
+        }
+
+        mutating func markSeen(_ id: String) {
+            var s = seen
+            s.insert(id)
+            state["seen"] = Array(s).sorted()
+        }
+
+        mutating func popPending(uploadedID: String) {
+            var list = pending
+            if !list.isEmpty { list.removeFirst() }
+            state["pending"] = list
+            markSeen(uploadedID)
+        }
+
+        private static func jsonEqual(_ a: Any?, _ b: Any?) -> Bool {
+            if a == nil && b == nil { return true }
+            if a is NSNull && b is NSNull { return true }
+            guard let a, let b, !(a is NSNull), !(b is NSNull) else { return false }
+            if let sa = a as? String, let sb = b as? String { return sa == sb }
+            if let na = a as? NSNumber, let nb = b as? NSNumber {
+                let aBool = CFGetTypeID(na) == CFBooleanGetTypeID()
+                let bBool = CFGetTypeID(nb) == CFBooleanGetTypeID()
+                if aBool || bBool {
+                    return aBool && bBool && na.boolValue == nb.boolValue
+                }
+                return na.uint64Value == nb.uint64Value && na.int64Value == nb.int64Value
+            }
+            guard let da = try? JSONSerialization.data(withJSONObject: [a], options: [.sortedKeys]),
+                  let db = try? JSONSerialization.data(withJSONObject: [b], options: [.sortedKeys]) else {
+                return false
+            }
+            return da == db
+        }
+
+        mutating func capture(_ local: [String: Any]) {
+            let before = baseline
+            var changes: [String: Any] = [:]
+            for (key, value) in local where !Self.jsonEqual(before[key], value) {
+                changes[key] = value
+            }
+            let currentEntities = Set(local.keys.compactMap { key -> String? in
+                guard let slash = key.lastIndex(of: "/") else { return nil }
+                return String(key[..<slash])
+            })
+            let beforeEntities = Set(before.keys.compactMap { key -> String? in
+                guard let slash = key.lastIndex(of: "/") else { return nil }
+                return String(key[..<slash])
+            })
+            for entity in beforeEntities where !currentEntities.contains(entity) {
+                changes["\(entity)/$deleted"] = NSNumber(value: true)
+            }
+            guard !changes.isEmpty else {
+                state["baseline"] = local
+                return
+            }
+
+            let sortedKeys = changes.keys.sorted()
+            let actor = (state["actor"] as? String) ?? OmyaruSyncCrypto.compactUUID()
+            let resetArray = Array(tabResetIDs).sorted()
+            for offset in stride(from: 0, to: sortedKeys.count, by: 512) {
+                let slice = sortedKeys[offset..<min(sortedKeys.count, offset + 512)]
+                let nextClock = ((state["clock"] as? NSNumber)?.int64Value ?? 0) + 1
+                let rows: [[String: Any]] = slice.compactMap { key in
+                    let parts = key.split(separator: "/").map(String.init)
+                    guard parts.count == 3, let val = changes[key] else { return nil }
+                    return ["kind": parts[0], "id": parts[1], "field": parts[2], "value": val]
+                }
+                guard !rows.isEmpty else { continue }
+                let batch: [String: Any] = [
+                    "protocol": 1,
+                    "id": OmyaruSyncCrypto.compactUUID(),
+                    "actor": actor,
+                    "clock": nextClock,
+                    "tabResetIds": resetArray,
+                    "changes": rows
+                ]
+                applyBatch(batch, includeTabs: true)
+                state["pending"] = pending + [batch]
+            }
+            state["baseline"] = local
+        }
+
+        mutating func applyDocument(_ doc: [String: Any], expectedID: String) {
+            guard let docID = doc["id"] as? String,
+                  docID.caseInsensitiveCompare(expectedID) == .orderedSame,
+                  let proto = (doc["protocol"] as? NSNumber)?.intValue else { return }
+            let remoteResets = Set((doc["tabResetIds"] as? [String] ?? []).filter { Self.isValidNonZeroHex32($0) })
+            let includeTabs = tabResetIDs.isSubset(of: remoteResets)
+            if proto == 1 {
+                applyBatch(doc, includeTabs: includeTabs)
+            } else if proto == 2, let batches = doc["batches"] as? [[String: Any]] {
+                for batch in batches {
+                    applyBatch(batch, includeTabs: includeTabs)
+                }
+            }
+        }
+
+        mutating func applyBatch(_ batch: [String: Any], includeTabs: Bool) {
+            guard let actor = batch["actor"] as? String,
+                  Self.isValidNonZeroHex32(actor),
+                  let clock = (batch["clock"] as? NSNumber)?.int64Value,
+                  clock > 0,
+                  let rows = batch["changes"] as? [[String: Any]] else { return }
+            var registers = state["registers"] as? [String: [String: Any]] ?? [:]
+            for row in rows {
+                guard let kind = row["kind"] as? String,
+                      kind == "profiles" || kind == "groups" || kind == "tabs",
+                      let entityID = row["id"] as? String, !entityID.isEmpty,
+                      let field = row["field"] as? String, !field.isEmpty,
+                      let value = row["value"] else { continue }
+                if !includeTabs && kind == "tabs" { continue }
+                let key = "\(kind)/\(entityID)/\(field)"
+                let old = registers[key]
+                let oldClock = (old?["clock"] as? NSNumber)?.int64Value ?? 0
+                let oldActor = old?["actor"] as? String ?? ""
+                if clock > oldClock || (clock == oldClock && actor > oldActor) {
+                    registers[key] = ["actor": actor, "clock": clock, "value": value]
+                }
+            }
+            state["registers"] = registers
+            let currentClock = (state["clock"] as? NSNumber)?.int64Value ?? 0
+            state["clock"] = max(clock, currentClock)
+        }
+
+        func project() -> (profiles: [String: [String: Any]], groups: [String: [String: Any]], tabs: [String: [String: Any]]) {
+            let registers = state["registers"] as? [String: [String: Any]] ?? [:]
+            var profiles: [String: [String: Any]] = [:]
+            var groups: [String: [String: Any]] = [:]
+            var tabs: [String: [String: Any]] = [:]
+            for (key, row) in registers {
+                let parts = key.split(separator: "/").map(String.init)
+                guard parts.count == 3, let value = row["value"] else { continue }
+                let kind = parts[0]
+                let id = parts[1]
+                let field = parts[2]
+                if field == "$deleted" || registers["\(kind)/\(id)/$deleted"] != nil { continue }
+                switch kind {
+                case "profiles": profiles[id, default: [:]][field] = value
+                case "groups": groups[id, default: [:]][field] = value
+                case "tabs": tabs[id, default: [:]][field] = value
+                default: break
+                }
+            }
+            return (profiles, groups, tabs)
+        }
+    }
+
+    private static func hexToARGBUint(_ hex: String) -> UInt32 {
+        let clean = hex.trimmingCharacters(in: .whitespacesAndNewlines).replacingOccurrences(of: "#", with: "")
+        if clean.count == 6, let rgb = UInt32(clean, radix: 16) {
+            return 0xFF00_0000 | rgb
+        }
+        if clean.count == 8, let argb = UInt32(clean, radix: 16) {
+            return argb
+        }
+        return 0xFF0A_84FF
+    }
+
+    private static func argbUintToHex(_ val: UInt32) -> String {
+        String(format: "#%06X", val & 0x00FF_FFFF)
+    }
+
+    private static func wireIconToSFSymbol(_ wire: String) -> String {
+        switch wire.uppercased() {
+        case "PERSON": return "person.fill"
+        case "WORK": return "briefcase.fill"
+        case "STUDY": return "book.fill"
+        case "TRAVEL": return "airplane"
+        case "GAMING": return "gamecontroller.fill"
+        case "STAR": return "star.fill"
+        default:
+            let trimmed = wire.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.isEmpty || trimmed == trimmed.uppercased() { return "person.fill" }
+            return trimmed
+        }
+    }
+
+    private static func sfSymbolToWireIcon(_ symbol: String) -> String {
+        switch symbol {
+        case "person.fill": return "PERSON"
+        case "briefcase.fill": return "WORK"
+        case "book.fill": return "STUDY"
+        case "airplane": return "TRAVEL"
+        case "gamecontroller.fill": return "GAMING"
+        case "star.fill": return "STAR"
+        default:
+            let trimmed = symbol.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? "PERSON" : trimmed
+        }
+    }
+
+    private static func defaultGroupIDForProfile(
+        _ profileID: UUID,
+        profileWireID: String,
+        groups: [BrowserGroup]
+    ) -> UUID {
+        let canonical = OmyaruTabReplica.defaultGroupUUID(forProfileWireID: profileWireID)
+        if groups.contains(where: { $0.profileID == profileID && $0.id == canonical }) {
+            return canonical
+        }
+        if let firstDefault = groups.first(where: { $0.profileID == profileID && $0.name == "기본" }) {
+            return firstDefault.id
+        }
+        return canonical
+    }
+
+    private static func flattenBrowserForTabSync(
+        _ browser: BrowserModel,
+        replica: inout OmyaruTabReplica
+    ) -> [String: Any] {
+        var fields: [String: Any] = [:]
+        var profileWireByUUID: [UUID: String] = [:]
+        var defaultGroupByProfile: [UUID: UUID] = [:]
+        var validCustomGroupWires = Set<String>()
+
+        for (idx, profile) in browser.profiles.prefix(32).enumerated() {
+            let pid = replica.wireID(forUUID: profile.id, isProfile: true)
+            profileWireByUUID[profile.id] = pid
+            defaultGroupByProfile[profile.id] = defaultGroupIDForProfile(profile.id, profileWireID: pid, groups: browser.groups)
+            fields["profiles/\(pid)/name"] = profile.name.isEmpty ? "개인" : String(profile.name.prefix(40))
+            fields["profiles/\(pid)/icon"] = sfSymbolToWireIcon(profile.icon)
+            fields["profiles/\(pid)/color"] = NSNumber(value: hexToARGBUint(profile.colorHex))
+            fields["profiles/\(pid)/order"] = idx
+        }
+
+        var groupCountByProfile: [UUID: Int] = [:]
+        for group in browser.groups {
+            guard group.id != BrowserModel.privateGroupID,
+                  let pid = profileWireByUUID[group.profileID] else { continue }
+            if defaultGroupByProfile[group.profileID] == group.id { continue }
+            let count = groupCountByProfile[group.profileID] ?? 0
+            if count >= 100 { continue }
+            groupCountByProfile[group.profileID] = count + 1
+            let gid = replica.wireID(forUUID: group.id)
+            validCustomGroupWires.insert(gid)
+            fields["groups/\(gid)/profileId"] = pid
+            fields["groups/\(gid)/name"] = group.name.isEmpty ? "그룹" : String(group.name.prefix(40))
+        }
+
+        let regularTabs = browser.tabs.filter { !$0.isPrivate && $0.groupID != BrowserModel.privateGroupID }.prefix(500)
+        for (idx, tab) in regularTabs.enumerated() {
+            let tid = replica.wireID(forUUID: tab.id)
+            let pid = profileWireByUUID[tab.profileID] ?? "default"
+            let isDefaultGroup = (defaultGroupByProfile[tab.profileID] == tab.groupID) || (tab.groupID == BrowserModel.defaultGroupID)
+            let groupValue: Any
+            if isDefaultGroup {
+                groupValue = NSNull()
+            } else {
+                let gid = replica.wireID(forUUID: tab.groupID)
+                groupValue = validCustomGroupWires.contains(gid) ? gid : NSNull()
+            }
+            let safeTitle = tab.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "새 탭" : String(tab.title.prefix(200))
+            let trimmedURL = tab.url.trimmingCharacters(in: .whitespacesAndNewlines)
+            let safeURL = (trimmedURL.hasPrefix("http://") || trimmedURL.hasPrefix("https://")) ? String(trimmedURL.prefix(8192)) : "about:blank"
+            fields["tabs/\(tid)/title"] = safeTitle
+            fields["tabs/\(tid)/url"] = safeURL
+            fields["tabs/\(tid)/profileId"] = pid
+            fields["tabs/\(tid)/groupId"] = groupValue
+            fields["tabs/\(tid)/order"] = idx
+        }
+
+        return fields
+    }
+
+    private static func extractTabFileID(_ fileName: String) -> String? {
+        guard fileName.hasSuffix(".json") else { return nil }
+        let raw: String
+        if fileName.hasPrefix("omyaru-tabs-v2-") {
+            raw = String(fileName.dropFirst("omyaru-tabs-v2-".count).dropLast(5))
+        } else if fileName.hasPrefix("omyaru-tabs-v1-") {
+            raw = String(fileName.dropFirst("omyaru-tabs-v1-".count).dropLast(5))
+        } else {
+            return nil
+        }
+        return OmyaruTabReplica.isValidNonZeroHex32(raw) ? raw : nil
+    }
+
     private func syncTabsAndResets(
         browser: BrowserModel,
         keys: OmyaruDriveKeyRing,
@@ -1082,119 +1605,347 @@ final class DriveSyncManager: NSObject, ObservableObject, ASWebAuthenticationPre
         tabFiles: [DriveFileEntry],
         rest: DriveRESTClient
     ) async throws {
-        var seenResets = loadSeenSet(name: "seen-tab-resets.json")
-        let unseenResets = resetFiles.filter { file in
-            let resetID = file.name.replacingOccurrences(of: "omyaru-tab-reset-v1-", with: "").replacingOccurrences(of: ".json", with: "")
-            return !seenResets.contains(resetID)
-        }
-        var triggeredReset = false
-        if !unseenResets.isEmpty {
-            let fetchedResets = try await Self.fetchAndDecryptParallel(files: unseenResets, keys: keys, rest: rest, concurrency: 4)
-            for (file, plain) in fetchedResets {
-                let resetID = file.name.replacingOccurrences(of: "omyaru-tab-reset-v1-", with: "").replacingOccurrences(of: ".json", with: "")
-                if let plain,
-                   let doc = try? JSONSerialization.jsonObject(with: plain) as? [String: Any],
-                   doc["format"] as? String == "omyaru-tab-reset" {
-                    seenResets.insert(resetID)
-                    triggeredReset = true
-                }
+        var replica = OmyaruTabReplica(directory: accountBrowserSyncDir())
+
+        // 1. Check remote tab resets
+        let remoteResetIDs: Set<String> = Set(resetFiles.compactMap { file in
+            let raw = file.name
+                .replacingOccurrences(of: "omyaru-tab-reset-v1-", with: "")
+                .replacingOccurrences(of: ".json", with: "")
+            return OmyaruTabReplica.isValidNonZeroHex32(raw) ? raw : nil
+        })
+        if !remoteResetIDs.isEmpty {
+            if replica.hadPersistedState {
+                replica.observeResets(remoteResetIDs)
+            } else {
+                replica.recordExistingResets(remoteResetIDs)
             }
-            saveSeenSet(seenResets, name: "seen-tab-resets.json")
-        }
-        if triggeredReset {
-            browser.tabs.removeAll { !$0.isPrivate }
-            if browser.tabs.isEmpty { _ = browser.newTab() }
-            browser.persist()
-        }
-
-        var seenTabs = loadSeenSet(name: "seen-tabs.json")
-        let unseenTabs = tabFiles.filter { !seenTabs.contains($0.id) }.sorted { $0.name < $1.name }
-        if !unseenTabs.isEmpty {
-            let fetchedTabs = try await Self.fetchAndDecryptParallel(files: unseenTabs, keys: keys, rest: rest, concurrency: Self.maxConcurrentTransfers)
-            for (file, plain) in fetchedTabs {
-                if let plain, let batch = try? JSONSerialization.jsonObject(with: plain) as? [String: Any] {
-                    applyRemoteTabBatch(batch, to: browser)
-                }
-                seenTabs.insert(file.id)
+            if replica.needsTabClear {
+                browser.isApplyingRemoteSync = true
+                browser.tabs.removeAll { !$0.isPrivate }
+                browser.isApplyingRemoteSync = false
             }
-            saveSeenSet(seenTabs, name: "seen-tabs.json")
-            browser.persist()
+            try? replica.save()
         }
 
-        let batchID = OmyaruSyncCrypto.compactUUID()
-        let actorID = (UIDevice.current.identifierForVendor?.uuidString ?? UUID().uuidString)
-            .replacingOccurrences(of: "-", with: "").lowercased().padding(toLength: 32, withPad: "a", startingAt: 0)
-        let clock = Int64(Date().timeIntervalSince1970 * 1000)
-        var changes: [[String: Any]] = []
+        let validTabFiles = tabFiles.filter { Self.extractTabFileID($0.name) != nil }
 
-        for (idx, profile) in browser.profiles.enumerated() {
-            let pid = profile.id == BrowserModel.defaultProfileID ? "default" : OmyaruSyncCrypto.compactUUID(profile.id)
-            changes.append(["kind": "profiles", "id": pid, "field": "name", "value": profile.name])
-            changes.append(["kind": "profiles", "id": pid, "field": "icon", "value": profile.icon])
-            changes.append(["kind": "profiles", "id": pid, "field": "order", "value": idx])
+        // 2. First-time CRDT migration: pull remote Drive history FIRST, deduplicate legacy random-UUID copies, then capture only truly new local items!
+        if !replica.hadPersistedState {
+            let unseen = validTabFiles
+                .filter { !replica.seen.contains($0.id) }
+                .sorted { $0.name < $1.name }
+            if !unseen.isEmpty {
+                let fetched = try await Self.fetchAndDecryptParallel(
+                    files: unseen,
+                    keys: keys,
+                    rest: rest,
+                    concurrency: Self.maxConcurrentTransfers
+                )
+                for (file, plain) in fetched {
+                    if let plain,
+                       let expectedID = Self.extractTabFileID(file.name),
+                       let doc = try? JSONSerialization.jsonObject(with: plain) as? [String: Any] {
+                        replica.applyDocument(doc, expectedID: expectedID)
+                    }
+                    replica.markSeen(file.id)
+                }
+                try? replica.save()
+            }
+            let remote = replica.project()
+            if !remote.profiles.isEmpty || !remote.groups.isEmpty || !remote.tabs.isEmpty {
+                Self.deduplicateLocalAgainstRemote(browser: browser, remote: remote, replica: &replica)
+            }
+            let localFlat = Self.flattenBrowserForTabSync(browser, replica: &replica)
+            replica.capture(localFlat)
+            try? replica.save()
+        } else {
+            let localFlat = Self.flattenBrowserForTabSync(browser, replica: &replica)
+            replica.capture(localFlat)
+            try? replica.save()
         }
-        for (idx, tab) in browser.tabs.filter({ !$0.isPrivate }).prefix(30).enumerated() {
-            let tid = OmyaruSyncCrypto.compactUUID(tab.id)
-            let pid = tab.profileID == BrowserModel.defaultProfileID ? "default" : OmyaruSyncCrypto.compactUUID(tab.profileID)
-            let gid = OmyaruSyncCrypto.compactUUID(tab.groupID)
-            changes.append(["kind": "tabs", "id": tid, "field": "title", "value": tab.title])
-            changes.append(["kind": "tabs", "id": tid, "field": "url", "value": tab.url])
-            changes.append(["kind": "tabs", "id": tid, "field": "profileId", "value": pid])
-            changes.append(["kind": "tabs", "id": tid, "field": "groupId", "value": gid])
-            changes.append(["kind": "tabs", "id": tid, "field": "order", "value": idx])
-        }
-        guard !changes.isEmpty else { return }
-        let fingerprintData = try JSONSerialization.data(withJSONObject: changes, options: [.sortedKeys])
-        let hash = OmyaruSyncCrypto.sha256Hex(fingerprintData)
-        let lastHash = UserDefaults.standard.string(forKey: "omyaru.ios.drive.lastTabsHash") ?? ""
-        if hash != lastHash {
-            let batchObj: [String: Any] = [
-                "protocol": 1,
-                "id": batchID,
-                "actor": String(actorID.prefix(32)),
-                "clock": clock,
-                "changes": changes
-            ]
-            let plain = try JSONSerialization.data(withJSONObject: batchObj, options: [.sortedKeys])
+
+        // 3. Push local pending delta batches (with logical clock & tabResetIds)
+        for batch in replica.pending {
+            guard let batchID = batch["id"] as? String else { continue }
+            let plain = try JSONSerialization.data(withJSONObject: batch, options: [.sortedKeys])
             let encrypted = try await keys.encryptAsync(plain)
             let uploadedID = try await rest.uploadDriveFile(name: "omyaru-tabs-v2-\(batchID).json", payload: encrypted)
-            seenTabs.insert(uploadedID)
-            saveSeenSet(seenTabs, name: "seen-tabs.json")
-            UserDefaults.standard.set(hash, forKey: "omyaru.ios.drive.lastTabsHash")
+            replica.popPending(uploadedID: uploadedID)
+            try? replica.save()
+        }
+
+        // 4. Pull any unseen remote batches (for steady-state syncs)
+        if replica.hadPersistedState {
+            let unseen = validTabFiles
+                .filter { !replica.seen.contains($0.id) }
+                .sorted { $0.name < $1.name }
+            if !unseen.isEmpty {
+                let fetched = try await Self.fetchAndDecryptParallel(
+                    files: unseen,
+                    keys: keys,
+                    rest: rest,
+                    concurrency: Self.maxConcurrentTransfers
+                )
+                for (file, plain) in fetched {
+                    if let plain,
+                       let expectedID = Self.extractTabFileID(file.name),
+                       let doc = try? JSONSerialization.jsonObject(with: plain) as? [String: Any] {
+                        replica.applyDocument(doc, expectedID: expectedID)
+                    }
+                    replica.markSeen(file.id)
+                }
+                try? replica.save()
+            }
+        }
+
+        // 5. Project unified CRDT state -> apply profiles, tab groups, and tabs to BrowserModel
+        let projected = replica.project()
+        applyProjectedTabs(projected, to: browser, replica: &replica)
+        replica.acknowledge(Self.flattenBrowserForTabSync(browser, replica: &replica))
+        try? replica.save()
+    }
+
+    private static func deduplicateLocalAgainstRemote(
+        browser: BrowserModel,
+        remote: (profiles: [String: [String: Any]], groups: [String: [String: Any]], tabs: [String: [String: Any]]),
+        replica: inout OmyaruTabReplica
+    ) {
+        browser.isApplyingRemoteSync = true
+        defer { browser.isApplyingRemoteSync = false }
+
+        // Preserve remote default profile's name/icon/color on first sync so iOS defaults don't clobber PC/Android profile branding.
+        if let defRow = remote.profiles["default"],
+           let defIdx = browser.profiles.firstIndex(where: { $0.id == BrowserModel.defaultProfileID }) {
+            if let rName = defRow["name"] as? String, !rName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                browser.profiles[defIdx].name = rName
+            }
+            if let rIcon = defRow["icon"] as? String {
+                browser.profiles[defIdx].icon = wireIconToSFSymbol(rIcon)
+            }
+            if let rColor = defRow["color"] as? NSNumber {
+                browser.profiles[defIdx].colorHex = argbUintToHex(UInt32(truncatingIfNeeded: rColor.uint64Value))
+            }
+        }
+
+        // Map remote custom groups by (profileUUID, lowercased name) -> remote group UUID
+        var remoteGroupByKey: [String: UUID] = [:]
+        for (gid, row) in remote.groups {
+            guard let pid = row["profileId"] as? String,
+                  let name = row["name"] as? String else { continue }
+            let pUUID = replica.uuid(forWireID: pid, isProfile: true)
+            let gUUID = replica.uuid(forWireID: gid)
+            remoteGroupByKey["\(pUUID.uuidString)|\(name.lowercased())"] = gUUID
+        }
+
+        var remappedGroups: [UUID: UUID] = [:]
+
+        for i in browser.groups.indices {
+            let g = browser.groups[i]
+            if g.name == "기본" { continue }
+            let key = "\(g.profileID.uuidString)|\(g.name.lowercased())"
+            if let remoteUUID = remoteGroupByKey[key], remoteUUID != g.id {
+                remappedGroups[g.id] = remoteUUID
+                browser.groups[i].id = remoteUUID
+            }
+        }
+        if !remappedGroups.isEmpty {
+            for i in browser.tabs.indices {
+                if let newGID = remappedGroups[browser.tabs[i].groupID] {
+                    browser.tabs[i].groupID = newGID
+                }
+            }
+            if let newActiveG = remappedGroups[browser.activeGroupID] {
+                browser.activeGroupID = newActiveG
+            }
+        }
+
+        // Map remote tabs by (profileUUID, lowercased url) so legacy random-UUID iOS duplicates don't push back to PC
+        var remoteURLSet = Set<String>()
+        var remoteTabCountByProfile: [UUID: Int] = [:]
+        for (_, row) in remote.tabs {
+            guard let pid = row["profileId"] as? String,
+                  let url = row["url"] as? String else { continue }
+            let pUUID = replica.uuid(forWireID: pid, isProfile: true)
+            remoteTabCountByProfile[pUUID, default: 0] += 1
+            if url != "about:blank" {
+                remoteURLSet.insert("\(pUUID.uuidString)|\(url.lowercased())")
+            }
+        }
+
+        let remoteTabIDs = Set(remote.tabs.keys.map { replica.uuid(forWireID: $0) })
+        browser.tabs.removeAll { tab in
+            guard !tab.isPrivate else { return false }
+            if remoteTabIDs.contains(tab.id) { return false }
+            if tab.url == "about:blank" {
+                return (remoteTabCountByProfile[tab.profileID] ?? 0) > 0
+            }
+            return remoteURLSet.contains("\(tab.profileID.uuidString)|\(tab.url.lowercased())")
         }
     }
 
-    private func applyRemoteTabBatch(_ batch: [String: Any], to browser: BrowserModel) {
-        let rows: [[String: Any]]
-        if let direct = batch["changes"] as? [[String: Any]] {
-            rows = direct
-        } else if let batches = batch["batches"] as? [[String: Any]] {
-            rows = batches.flatMap { ($0["changes"] as? [[String: Any]]) ?? [] }
+    private func applyProjectedTabs(
+        _ projected: (profiles: [String: [String: Any]], groups: [String: [String: Any]], tabs: [String: [String: Any]]),
+        to browser: BrowserModel,
+        replica: inout OmyaruTabReplica
+    ) {
+        guard !projected.profiles.isEmpty || !projected.groups.isEmpty || !projected.tabs.isEmpty else { return }
+
+        let prevURLs = Dictionary(uniqueKeysWithValues: browser.tabs.map { ($0.id, $0.url) })
+        let existingProfilesByID = Dictionary(uniqueKeysWithValues: browser.profiles.map { ($0.id, $0) })
+        let existingTabsByID = Dictionary(uniqueKeysWithValues: browser.tabs.map { ($0.id, $0) })
+        let privateTabs = browser.tabs.filter { $0.isPrivate }
+
+        // 1. Build synced profiles
+        let sortedProfileEntries = projected.profiles.sorted { a, b in
+            let oa = (a.value["order"] as? NSNumber)?.intValue ?? (a.key == "default" ? -1 : Int.max)
+            let ob = (b.value["order"] as? NSNumber)?.intValue ?? (b.key == "default" ? -1 : Int.max)
+            if oa != ob { return oa < ob }
+            if a.key == "default" { return true }
+            if b.key == "default" { return false }
+            return a.key < b.key
+        }
+
+        var nextProfiles: [BrowserProfile] = []
+        var profileUUIDByWireID: [String: UUID] = [:]
+        for (pid, row) in sortedProfileEntries {
+            guard let name = row["name"] as? String, !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { continue }
+            let pUUID = replica.uuid(forWireID: pid, isProfile: true)
+            let existing = existingProfilesByID[pUUID]
+            let icon = (row["icon"] as? String).map(Self.wireIconToSFSymbol) ?? existing?.icon ?? "person.fill"
+            let colorHex: String
+            if let num = row["color"] as? NSNumber {
+                colorHex = Self.argbUintToHex(UInt32(truncatingIfNeeded: num.uint64Value))
+            } else {
+                colorHex = existing?.colorHex ?? "#0A84FF"
+            }
+            nextProfiles.append(BrowserProfile(id: pUUID, name: name, icon: icon, colorHex: colorHex))
+            profileUUIDByWireID[pid] = pUUID
+        }
+        if !nextProfiles.contains(where: { $0.id == BrowserModel.defaultProfileID }) {
+            let fallback = existingProfilesByID[BrowserModel.defaultProfileID]
+                ?? BrowserProfile(id: BrowserModel.defaultProfileID, name: "개인", icon: "person.fill", colorHex: "#0A84FF")
+            nextProfiles.insert(fallback, at: 0)
+            profileUUIDByWireID["default"] = BrowserModel.defaultProfileID
+        }
+
+        // 2. Build synced groups (each profile gets its synthetic default "기본" group first, followed by all synced custom groups!)
+        var nextGroups: [BrowserGroup] = []
+        var defaultGroupByProfile: [UUID: UUID] = [:]
+        var validGroupUUIDByWireAndProfile: [String: UUID] = [:]
+
+        for profile in nextProfiles {
+            let pWire = replica.wireID(forUUID: profile.id, isProfile: true)
+            let defGroupID = Self.defaultGroupIDForProfile(profile.id, profileWireID: pWire, groups: browser.groups)
+            defaultGroupByProfile[profile.id] = defGroupID
+            nextGroups.append(BrowserGroup(id: defGroupID, profileID: profile.id, name: "기본"))
+        }
+
+        let sortedGroupEntries = projected.groups.sorted { $0.key < $1.key }
+        for (gid, row) in sortedGroupEntries {
+            guard gid != "__private_workspace__",
+                  gid != "00000000000000000000000000000002",
+                  let pid = row["profileId"] as? String,
+                  let pUUID = profileUUIDByWireID[pid],
+                  let name = row["name"] as? String,
+                  !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { continue }
+            let gUUID = replica.uuid(forWireID: gid)
+            if nextGroups.contains(where: { $0.id == gUUID }) { continue }
+            nextGroups.append(BrowserGroup(id: gUUID, profileID: pUUID, name: name))
+            validGroupUUIDByWireAndProfile["\(pUUID.uuidString)|\(gid)"] = gUUID
+        }
+
+        // 3. Build synced regular tabs in exact CRDT order, preserving local pin/desktop/zoom metadata & private tabs
+        let sortedTabEntries = projected.tabs.sorted { a, b in
+            let oa = (a.value["order"] as? NSNumber)?.intValue ?? Int.max
+            let ob = (b.value["order"] as? NSNumber)?.intValue ?? Int.max
+            return oa == ob ? a.key < b.key : oa < ob
+        }
+
+        var nextRegularTabs: [BrowserTab] = []
+        for (tid, row) in sortedTabEntries.prefix(500) {
+            guard let url = row["url"] as? String,
+                  let pid = row["profileId"] as? String else { continue }
+            let title = (row["title"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? "새 탭"
+            let pUUID = profileUUIDByWireID[pid] ?? nextProfiles[0].id
+            let defGroupID = defaultGroupByProfile[pUUID] ?? BrowserModel.defaultGroupID
+            let resolvedGroupID: UUID
+            if let rawGID = row["groupId"] as? String,
+               !rawGID.isEmpty,
+               rawGID != "00000000000000000000000000000002",
+               let mapped = validGroupUUIDByWireAndProfile["\(pUUID.uuidString)|\(rawGID)"] {
+                resolvedGroupID = mapped
+            } else {
+                resolvedGroupID = defGroupID
+            }
+            let tUUID = replica.uuid(forWireID: tid)
+            let local = existingTabsByID[tUUID]
+            nextRegularTabs.append(BrowserTab(
+                id: tUUID,
+                title: title,
+                url: url,
+                profileID: pUUID,
+                groupID: resolvedGroupID,
+                isPrivate: false,
+                isDesktopMode: local?.isDesktopMode ?? false,
+                pageZoom: local?.pageZoom ?? 1.0,
+                isPinned: local?.isPinned ?? false
+            ))
+        }
+
+        let nextAllTabs = nextRegularTabs + privateTabs
+
+        // 4. Resolve active profile / group / tab without kicking the user out of their current view unless deleted
+        let nextActiveProfileID = nextProfiles.contains(where: { $0.id == browser.activeProfileID })
+            ? browser.activeProfileID
+            : nextProfiles[0].id
+        let nextActiveGroupID: UUID
+        if browser.activeGroupID == BrowserModel.privateGroupID {
+            nextActiveGroupID = BrowserModel.privateGroupID
+        } else if nextGroups.contains(where: { $0.id == browser.activeGroupID && $0.profileID == nextActiveProfileID }) {
+            nextActiveGroupID = browser.activeGroupID
         } else {
+            nextActiveGroupID = defaultGroupByProfile[nextActiveProfileID] ?? BrowserModel.defaultGroupID
+        }
+
+        var finalTabs = nextAllTabs
+        let nextActiveTabID: UUID
+        if finalTabs.contains(where: { $0.id == browser.activeID }) {
+            nextActiveTabID = browser.activeID
+        } else if let inGroup = finalTabs.first(where: {
+            nextActiveGroupID == BrowserModel.privateGroupID
+                ? $0.isPrivate
+                : (!$0.isPrivate && $0.profileID == nextActiveProfileID && $0.groupID == nextActiveGroupID)
+        }) {
+            nextActiveTabID = inGroup.id
+        } else if let anyRegular = finalTabs.first(where: { !$0.isPrivate }) {
+            nextActiveTabID = anyRegular.id
+        } else {
+            let fresh = BrowserTab(profileID: nextActiveProfileID, groupID: defaultGroupByProfile[nextActiveProfileID] ?? BrowserModel.defaultGroupID)
+            finalTabs.append(fresh)
+            nextActiveTabID = fresh.id
+        }
+
+        // Skip redundant UI churn if nothing changed
+        if browser.profiles == nextProfiles &&
+           browser.groups == nextGroups &&
+           browser.tabs == finalTabs &&
+           browser.activeProfileID == nextActiveProfileID &&
+           browser.activeGroupID == nextActiveGroupID &&
+           browser.activeID == nextActiveTabID {
             return
         }
-        var tabTitles: [String: String] = [:]
-        var tabURLs: [String: String] = [:]
-        var deletedTabs = Set<String>()
-        for row in rows {
-            guard let kind = row["kind"] as? String, kind == "tabs",
-                  let id = row["id"] as? String,
-                  let field = row["field"] as? String else { continue }
-            if field == "$deleted" { deletedTabs.insert(id) }
-            else if field == "title", let val = row["value"] as? String { tabTitles[id] = val }
-            else if field == "url", let val = row["value"] as? String { tabURLs[id] = val }
-        }
-        for (id, url) in tabURLs where !deletedTabs.contains(id) && url != "about:blank" {
-            if !browser.tabs.contains(where: { $0.url == url }) && browser.tabs.count < 30 {
-                browser.tabs.append(BrowserTab(
-                    title: tabTitles[id] ?? url,
-                    url: url,
-                    profileID: browser.activeProfileID,
-                    groupID: browser.activeGroupID,
-                    isPrivate: false
-                ))
-            }
-        }
+
+        browser.isApplyingRemoteSync = true
+        defer { browser.isApplyingRemoteSync = false }
+        browser.profiles = nextProfiles
+        browser.groups = nextGroups
+        browser.tabs = finalTabs
+        browser.activeProfileID = nextActiveProfileID
+        browser.activeGroupID = nextActiveGroupID
+        browser.activeID = nextActiveTabID
+        browser.reconcileWebViewsAfterRemoteSync(previousURLs: prevURLs)
+        browser.persist()
     }
 
     // MARK: - High-Speed Parallel Bookshelf Sync With Delta CRDT Replica & Cross-App Kernel Lock

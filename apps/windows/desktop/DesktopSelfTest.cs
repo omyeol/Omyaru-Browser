@@ -369,6 +369,51 @@ internal static class DesktopSelfTest
         var _ = syncDlg.Handle;
       }
 
+      // Verify PC <-> iOS OmyaruTabReplica wire compatibility (profiles + color + custom groups + null default group + tabResetIds + tombstones).
+      {
+        var iosBatchId = Guid.NewGuid().ToString("N");
+        var iosActorId = Guid.NewGuid().ToString("N");
+        var iosGroupId = Guid.NewGuid().ToString("N");
+        var iosTab1Id = Guid.NewGuid().ToString("N");
+        var iosTab2Id = Guid.NewGuid().ToString("N");
+        var resetId = Guid.NewGuid().ToString("N");
+        var iosBatchJson = $$"""
+          {
+            "protocol": 1,
+            "id": "{{iosBatchId}}",
+            "actor": "{{iosActorId}}",
+            "clock": 7,
+            "tabResetIds": ["{{resetId}}"],
+            "changes": [
+              { "kind": "profiles", "id": "default", "field": "name", "value": "개인" },
+              { "kind": "profiles", "id": "default", "field": "icon", "value": "PERSON" },
+              { "kind": "profiles", "id": "default", "field": "color", "value": 4278879487 },
+              { "kind": "profiles", "id": "default", "field": "order", "value": 0 },
+              { "kind": "groups", "id": "{{iosGroupId}}", "field": "profileId", "value": "default" },
+              { "kind": "groups", "id": "{{iosGroupId}}", "field": "name", "value": "만화" },
+              { "kind": "tabs", "id": "{{iosTab1Id}}", "field": "title", "value": "Grouped" },
+              { "kind": "tabs", "id": "{{iosTab1Id}}", "field": "url", "value": "https://example.com/manga" },
+              { "kind": "tabs", "id": "{{iosTab1Id}}", "field": "profileId", "value": "default" },
+              { "kind": "tabs", "id": "{{iosTab1Id}}", "field": "groupId", "value": "{{iosGroupId}}" },
+              { "kind": "tabs", "id": "{{iosTab1Id}}", "field": "order", "value": 0 },
+              { "kind": "tabs", "id": "{{iosTab2Id}}", "field": "title", "value": "Default" },
+              { "kind": "tabs", "id": "{{iosTab2Id}}", "field": "url", "value": "https://example.com/home" },
+              { "kind": "tabs", "id": "{{iosTab2Id}}", "field": "profileId", "value": "default" },
+              { "kind": "tabs", "id": "{{iosTab2Id}}", "field": "groupId", "value": null },
+              { "kind": "tabs", "id": "{{iosTab2Id}}", "field": "order", "value": 1 }
+            ]
+          }
+          """;
+        var pcReplica = new DriveTabReplica();
+        pcReplica.Data.TabResetIds.Add(resetId);
+        pcReplica.ApplyDocument(iosBatchJson, iosBatchId);
+        var projected = pcReplica.Project(SyncSnapshot.CreateDefault());
+        if (!projected.Groups.Any(g => g.Id == iosGroupId && g.Name == "만화") ||
+            !projected.Tabs.Any(t => t.Id == iosTab1Id && t.GroupId == iosGroupId) ||
+            !projected.Tabs.Any(t => t.Id == iosTab2Id && t.GroupId is null))
+          return 50;
+      }
+
       return 0;
     }
     finally

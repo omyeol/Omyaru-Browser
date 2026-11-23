@@ -74,7 +74,10 @@ internal static class DesktopDriveSync
     foreach (var entry in entries.Where(e => !replica.Data.SeenFiles.Contains(e.Id)))
     {
       var json = Decrypt(await client.ReadAsync(entry, cancellation));
-      replica.ApplyDocument(json, entry.Name[DriveAppDataClient.Prefix.Length..^5]);
+      var prefixLen = entry.Name.StartsWith(DriveAppDataClient.AccountPrefix, StringComparison.Ordinal)
+          ? DriveAppDataClient.AccountPrefix.Length
+          : DriveAppDataClient.Prefix.Length;
+      replica.ApplyDocument(json, entry.Name[prefixLen..^5]);
       replica.Data.SeenFiles.Add(entry.Id);
     }
     Save(replica);

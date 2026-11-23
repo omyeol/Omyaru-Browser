@@ -526,7 +526,9 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
     static let defaultProfileID = UUID(uuidString: "00000000-0000-0000-0000-000000000010")!
     static let defaultGroupID = UUID(uuidString: "00000000-0000-0000-0000-000000000002")!
     static let appVersionName = "0.15.18"
-    static let appBuildNumber = 81
+    static let appBuildNumber = 85
+
+    var isApplyingRemoteSync: Bool = false
 
     @Published var profiles: [BrowserProfile]
     @Published var groups: [BrowserGroup]
@@ -814,6 +816,37 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
         )
         if let data = try? JSONEncoder().encode(state) {
             UserDefaults.standard.set(data, forKey: Self.stateKey)
+        }
+        if !isApplyingRemoteSync {
+            DriveSyncManager.shared.scheduleQuickTabSync(browser: self)
+        }
+    }
+
+    func reconcileWebViewsAfterRemoteSync(previousURLs: [UUID: String]) {
+        let liveIDs = Set(tabs.map(\.id))
+        for (tid, wv) in webViews where !liveIDs.contains(tid) {
+            wv.stopLoading()
+            webViews.removeValue(forKey: tid)
+            loadedTabIDs.remove(tid)
+            tabSnapshots.removeValue(forKey: tid)
+        }
+        for tab in tabs {
+            if let prevURL = previousURLs[tab.id], prevURL != tab.url, let wv = webViews[tab.id] {
+                if tab.url == "about:blank" {
+                    loadedTabIDs.remove(tab.id)
+                    wv.loadHTMLString("", baseURL: nil)
+                } else if let url = URL(string: tab.url) {
+                    if tab.id == activeID {
+                        loadedTabIDs.insert(tab.id)
+                        wv.load(URLRequest(url: url))
+                    } else {
+                        loadedTabIDs.remove(tab.id)
+                    }
+                }
+            }
+        }
+        if let active = activeTab, active.url != "about:blank", !loadedTabIDs.contains(active.id) {
+            _ = webView(for: active.id, loadIfNeeded: true)
         }
     }
 

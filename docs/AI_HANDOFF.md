@@ -1,3 +1,40 @@
+# 2026-11-24 Antigravity: PC·iOS 탭·탭 그룹·프로필 완전 양방향 CRDT 동기화(`OmyaruTabReplica`), PC `탭 목록` 우클릭/길게 누르기 메뉴(`탭 선택`·`탭 이동` 신설) 및 멀티 선택 모드 (`Omyaru v0.5.8` / iOS `build 85`)
+
+- 작업 워크스페이스: `E:/DEV/CODEX/BROWSER`
+- 사용자 요청:
+  1. PC 버전과 iOS 버전 간 탭 및 탭 그룹 동기화가 제대로 되지 않는 문제 원인 규명 및 수정
+  2. PC 버전 `탭 목록`에서 탭 우클릭/길게 누르기 시 메뉴 항목을 `링크 복사하기 · 탭 고정 · 탭 복제 · 탭 선택(신규) · 탭 이동(신규) / --- / 탭 닫기` 구성으로 개편
+  3. iOS LiveContainer/AltStore 소스(`apps/ios/altstore-source.json`) 갱신 확인 및 CI 동시성 최적화
+- 원인 분석 (PC ↔ iOS 탭·탭 그룹 동기화 실패):
+  1. **iOS가 탭 그룹(`kind == "groups"`)을 아예 업로드/수신하지 않았음 (`DriveSyncEngine.swift`)**: iOS는 송신 시 `profiles`와 `tabs`(최대 30개)만 내보냈고 `groups`를 전혀 기록하지 않아 iOS 그룹이 PC로 넘어가지 않았으며, 수신(`applyRemoteTabBatch`)도 `kind == "tabs"`만 필터링해 PC의 탭 그룹·프로필·`groupId`·`profileId`·순서·삭제 툼스톤을 모두 버리고 활성 그룹에 랜덤 UUID로 중복 생성하고 있었음.
+  2. **프로필 `color` 누락 + 기본 그룹 ID 불일치**: PC `DriveTabReplica`는 `profiles`에 `color`(UInt32 ARGB)가 없으면 프로젝션에서 제외하고, 기본 탭 그룹을 `groupId: null`로 표현하나 iOS는 `color` 없이 고정 UUID(`00000000...0002`)를 송신하고 있었음.
+  3. **논리 시계 및 `tabResetIds` 누락**: iOS가 Lamport 논리 시계 대신 epoch ms(`1.79×10^12`)를 매번 전송하고 `tabResetIds`를 스탬프하지 않아, 탭 초기화 이력이 있는 PC에서 iOS 탭이 무시되거나 구버전 탭이 PC 변경을 덮어쓰고 있었음.
+  4. **PC 수신 시 비공개 탭/핀 상태 유실 (`SafariBrowserWindow.PopupsAndSync.cs`)**: `ApplyDriveStateAsync()`가 원격 스냅샷 적용 시 로컬 비공개 탭(`__private_workspace__`)과 로컬 고정 탭(`IsPinned`)을 보존하지 않고 덮어쓰고 있었음.
+- 해결 내용:
+  1. **iOS `OmyaruTabReplica` CRDT 엔진 전면 교체 및 실시간 디바운스 동기화 (`apps/ios/Omyaru/DriveSyncEngine.swift`, `OmyaruApp.swift`)**:
+     - PC `DriveTabReplica.cs`·Android와 100% 와이어 호환되는 `OmyaruTabReplica`(`tab-replica.json`) 도입: `profiles`(`name`·`icon`·`color` UInt32 ARGB·`order`), `groups`(`profileId`·`name`), `tabs`(`title`·`url`·`profileId`·`groupId` 기본 그룹=`null`·`order`, 최대 500개), `$deleted` 툼스톤, `tabResetIds` 스탬프, Protocol 1/Protocol 2 체크포인트, 논리 시계(`max + 1`), 양방향 UUID↔WireID 매핑, SF Symbol↔프로필 아이콘 코드 변환 구현.
+     - 최초 마이그레이션 시 Drive 이력을 먼저 수신해 기존 랜덤 UUID 중복 탭·동명 그룹을 자동 통합하고 원격 기본 프로필 메타데이터를 보존.
+     - `BrowserModel.persist()` 시 2.5초 디바운스 경량 탭 전용 동기화(`scheduleQuickTabSync` / `listTabSyncFiles`) 추가 + 원격 삭제 탭 `WKWebView` 자동 정리(`reconcileWebViewsAfterRemoteSync`).
+  2. **PC `ApplyDriveStateAsync` 비공개 탭·고정 탭 보존 & 와이어 교차 검증 (`SafariBrowserWindow.PopupsAndSync.cs`, `DesktopDriveSync.cs`, `DesktopSelfTest.cs`)**:
+     - Drive 동기화 수신 시 로컬 비공개 탭(`PrivateGroupId`), 활성 비공개 워크스페이스, 로컬 `IsPinned` 상태 유지.
+     - `DesktopSelfTest`에 iOS `OmyaruTabReplica` 와이어 포맷 → PC `DriveTabReplica.ApplyDocument` / `Project` 교차 호환 검증 테스트 추가.
+  3. **PC `탭 목록` 컨텍스트 메뉴 개편 + `탭 선택` 멀티 선택 모드 & `탭 이동` (`SafariBrowserWindow.cs`, `SafariBrowserWindow.PopupsAndSync.cs`)**:
+     - 컨텍스트 메뉴를 요청 구성(`링크 복사하기 · 탭 고정/해제 · 탭 복제 · 탭 선택 · 탭 이동 / --- / 탭 닫기`)으로 정비.
+     - **`탭 선택`**: `탭 목록` 상단 선택 액션 바(`N개 탭 선택됨 · 전체 선택 · 탭 이동 · 선택 닫기 · 완료`) 및 카드 체크 배지 토글 지원.
+     - **`탭 이동`**: 모든 프로필·탭 그룹 및 `새 탭 그룹으로 이동…` Liquid Glass 팝오버로 단일/선택 탭 일괄 이동(즉시 Drive 동기화 반영).
+  4. **CI 워크플로 & 메타데이터 갱신 (`.github/workflows/ios.yml`, `apps/ios/Omyaru/Info.plist`, `apps/ios/make_altstore_source.py`)**:
+     - `.github/workflows/ios.yml`에 `concurrency(cancel-in-progress: true)` 추가해 대기 중인 이전 실행 자동 취소.
+     - 버전 갱신: Windows `0.5.7` → `0.5.8`, iOS `build 84` → `build 85` (`appBuildNumber = 85`).
+- 검증 결과:
+  - `powershell -ExecutionPolicy Bypass -File scripts/Publish-Windows.ps1` 성공 (`Omyaru.exe`, `78,624,389` bytes).
+  - `Omyaru.exe --self-test` 종료 코드 `0` (iOS↔PC CRDT 와이어 호환 테스트 포함).
+  - `Omyaru.exe --smoke-test` 종료 코드 `0`.
+- 빌드 산출물:
+  - 상대 경로: `artifacts/releases/Omyaru-v0.5.8-win-x64/Omyaru.exe`
+  - 절대 경로: `E:/DEV/CODEX/BROWSER/artifacts/releases/Omyaru-v0.5.8-win-x64/Omyaru.exe`
+
+---
+
 # 2026-11-24 Antigravity: PC·iOS 탭 드래그 애니메이션, 탭 목록 길게 누르기 이동/컨텍스트 메뉴, 주소창 위 탭 배치 & 북마크 모음 숨김 옵션, 탭 목록 상단 정리 (`Omyaru v0.5.7` / iOS `build 84`)
 
 - 작업 워크스페이스: `E:/DEV/CODEX/BROWSER`

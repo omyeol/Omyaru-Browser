@@ -218,7 +218,7 @@ internal sealed class SettingsForm : Form
             () => _working.CollectDiagnostics, value => _working.CollectDiagnostics = value));
 
     AddSection("도움말 및 정보",
-        InfoRow("ⓘ", "Omyaru", "Windows 0.5.7 · macOS Safari 스타일 GPU 데스크톱"));
+        InfoRow("ⓘ", "Omyaru", "Windows 0.5.8 · macOS Safari 스타일 GPU 데스크톱"));
 
     void ResizeCards()
     {
