@@ -18,11 +18,11 @@
       "versions": [
         {
           "version": "0.15.18",
-          "buildVersion": "81",
-          "date": "2026-11-22",
-          "localizedDescription": "v0.15.18 (build 81): High-speed parallel Google Drive sync (multi-core off-MainActor PBKDF2, 6x concurrent chunk & batch transfers, single appDataFolder listing, persistent KeyRing cache, delta-only CRDT shelf replica), shared sync folder picker with per-account subfolder (<Folder>/<account>) & kernel flock cross-app sync lock for zero duplication with Umtomi, and automatic LiveContainer Live Activity fallback (live-updating progress notification + floating top sync pill).",
+          "buildVersion": "82",
+          "date": "2026-11-23",
+          "localizedDescription": "v0.15.18 (build 82): Fixed hierarchical bookshelf folder tree ordering so nested subfolders always group strictly under their parent; high-speed parallel Google Drive sync, 6x concurrent chunk & batch transfers, single appDataFolder listing, persistent KeyRing cache, delta-only CRDT shelf replica), shared sync folder picker with per-account subfolder (<Folder>/<account>) & kernel flock cross-app sync lock for zero duplication with Umtomi, and automatic LiveContainer Live Activity fallback (live-updating progress notification + floating top sync pill).",
           "downloadURL": "https://github.com/omyeol/Omyaru-Browser/releases/download/v0.15.18/Omyaru-v0.15.18-ios.ipa",
-          "size": 2113938,
+          "size": 2114954,
           "minOSVersion": "16.0"
         }
       ],
