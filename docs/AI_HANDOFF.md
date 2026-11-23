@@ -1,3 +1,17 @@
+# 2026-11-24 Antigravity: iOS 탭 목록 길게 누르기 떨림(부들부들) 근본 해결 — 전용 플로팅 드래그 오버레이 분리 (`iOS build 86`)
+
+- 작업 워크스페이스: `E:/DEV/CODEX/BROWSER`
+- 사용자 요청:
+  - `KakaoTalk_20261124_030211627.mp4` 영상처럼 iOS 탭 목록에서 탭 카드를 길게 누를 때 카드가 부들부들 떨리는 현상 수정
+- 원인:
+  - 기존 `safariTabCard`가 `.scaleEffect(1.06)` + `.offset(dragOffset)`이 적용된 **동일 뷰**에 `DragGesture`와 `GeometryReader`를 붙여, 길게 눌러 들릴 때 스케일/오프셋 변화가 제스처 좌표를 역으로 흔드는 60/120Hz 피드백 루프가 발생하고, 그 미세 진동으로 12pt 이동 임계값을 오탐해 컨텍스트 메뉴도 안정적으로 열리지 않았음.
+- 해결 (`apps/ios/Omyaru/BrowserViews.swift`, `Info.plist`, `OmyaruApp.swift`):
+  - **전용 최상위 플로팅 드래그 오버레이 분리**: `LazyVGrid` 내부 카드 슬롯은 변환(`.scaleEffect`/`.offset`) 없이 정적 상태(`.opacity(isDraggingThis ? 0 : 1)`)와 `"overviewRootSpace"` 고정 좌표계만 유지하고, 들려 올라온 시각 카드는 `TabOverview` 최상위 `ZStack`의 `.allowsHitTesting(false)` 오버레이에서 `.position(dragCardCenter)` + `.scaleEffect(dragCardScale)`로 독립 렌더링.
+  - **10pt 홀드 데드존 & 안정적 릴리스 메뉴/안착**: 손가락 이동이 10pt 이내인 동안 오버레이 좌표를 100% 고정해 떨림을 원천 제거하고, 미이동 릴리스 시 Liquid Glass 컨텍스트 메뉴(`링크 복사하기 · 탭 고정 · 탭 복제 · 탭 선택 · 탭 이동 · 다른 탭 닫기 · 탭 닫기`)가 확정적으로 열리며, 드래그 릴리스 시 최종 슬롯 중심으로 부드럽게 안착(`0.22s spring`, `dragSessionID` 토큰 가드).
+  - iOS 빌드 번호: `85` → **`86`** (`Info.plist`, `OmyaruApp.swift`).
+
+---
+
 # 2026-11-24 Antigravity: PC·iOS 탭·탭 그룹·프로필 완전 양방향 CRDT 동기화(`OmyaruTabReplica`), PC `탭 목록` 우클릭/길게 누르기 메뉴(`탭 선택`·`탭 이동` 신설) 및 멀티 선택 모드 (`Omyaru v0.5.8` / iOS `build 85`)
 
 - 작업 워크스페이스: `E:/DEV/CODEX/BROWSER`
