@@ -267,22 +267,26 @@ internal sealed class SafariExtensionPopupWindow : Window
       if (source?.CompositionTarget is null) return;
       var toDip = source.CompositionTarget.TransformFromDevice;
 
-      Point anchorBottomRightDev;
-      if (_anchor is FrameworkElement fe && fe.IsLoaded && fe.ActualWidth > 0)
-        anchorBottomRightDev = fe.PointToScreen(new Point(fe.ActualWidth, fe.ActualHeight));
-      else
-        anchorBottomRightDev = Owner.PointToScreen(new Point(Owner.ActualWidth - 120, 48));
+      // Align popup snugly to the right edge of the browser window, right below the toolbar.
+      var ownerTopRightDev = Owner.PointToScreen(new Point(Owner.ActualWidth, 0));
+      var ownerTopRight = toDip.Transform(ownerTopRightDev);
 
-      var anchorBottomRight = toDip.Transform(anchorBottomRightDev);
+      Point anchorBottomDev;
+      if (_anchor is FrameworkElement fe && fe.IsLoaded && fe.ActualHeight > 0)
+        anchorBottomDev = fe.PointToScreen(new Point(fe.ActualWidth, fe.ActualHeight));
+      else
+        anchorBottomDev = Owner.PointToScreen(new Point(Owner.ActualWidth, 48));
+      var anchorBottom = toDip.Transform(anchorBottomDev);
 
       // Clamp cleanly inside the active monitor's working area
       var screen = System.Windows.Forms.Screen.FromPoint(
-          new System.Drawing.Point((int)anchorBottomRightDev.X, (int)anchorBottomRightDev.Y));
+          new System.Drawing.Point((int)anchorBottomDev.X, (int)anchorBottomDev.Y));
       var waTopLeft = toDip.Transform(new Point(screen.WorkingArea.Left, screen.WorkingArea.Top));
       var waBottomRight = toDip.Transform(new Point(screen.WorkingArea.Right, screen.WorkingArea.Bottom));
 
-      var desiredLeft = anchorBottomRight.X - Width;
-      var desiredTop = anchorBottomRight.Y + 6;
+      var visibleRightEdge = Math.Min(ownerTopRight.X, waBottomRight.X) - 10;
+      var desiredLeft = visibleRightEdge - Width;
+      var desiredTop = anchorBottom.Y + 8;
 
       Left = Math.Clamp(desiredLeft, waTopLeft.X + 8, Math.Max(waTopLeft.X + 8, waBottomRight.X - Width - 8));
       Top = Math.Clamp(desiredTop, waTopLeft.Y + 8, Math.Max(waTopLeft.Y + 8, waBottomRight.Y - Height - 8));

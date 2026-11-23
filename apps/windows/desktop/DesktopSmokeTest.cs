@@ -78,7 +78,11 @@ internal static class DesktopSmokeTest
         };
         bmWindow.Show();
         bmWindow.UpdateLayout();
-        var bmOk = bmWindow.ActualWidth >= 800 && bmWindow.ActualHeight >= 540;
+        var rootItems = demoCatalog.Items.Where(b => b.FolderId is null).Take(3).ToList();
+        foreach (var item in rootItems) bmWindow.ToggleBookmarkSelection(item.Id);
+        bmWindow.UpdateLayout();
+        var multiSelectOk = bmWindow.SelectedBookmarkCountForTest == rootItems.Count;
+        var bmOk = bmWindow.ActualWidth >= 800 && bmWindow.ActualHeight >= 540 && multiSelectOk;
         if (bmOk && !string.IsNullOrWhiteSpace(screenshotPath) && bmWindow.Content is System.Windows.FrameworkElement bmRoot)
         {
           bmRoot.UpdateLayout();

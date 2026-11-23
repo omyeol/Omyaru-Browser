@@ -364,6 +364,10 @@ internal static class DesktopSelfTest
         WinFormsSurface.Attach(testForm, cloakFirstShow: false);
         var _ = testForm.Handle;
       }
+      using (var syncDlg = new GoogleDriveSyncDialog { Opacity = 0, ShowInTaskbar = false })
+      {
+        var _ = syncDlg.Handle;
+      }
 
       return 0;
     }

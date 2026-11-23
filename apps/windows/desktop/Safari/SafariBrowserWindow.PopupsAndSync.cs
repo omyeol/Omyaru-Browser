@@ -764,20 +764,32 @@ internal sealed partial class SafariBrowserWindow
     return null;
   }
 
+  private System.Windows.Forms.IWin32Window ResolveModalOwner()
+  {
+    var activeOwner = System.Windows.Application.Current?.Windows
+        .OfType<Window>()
+        .FirstOrDefault(w => w.IsActive && w.IsVisible && new System.Windows.Interop.WindowInteropHelper(w).Handle != IntPtr.Zero)
+        ?? this;
+    return DwmBackdrop.OwnerOf(activeOwner);
+  }
+
   private async Task ShowSyncDialogAsync()
   {
-    if (_autoSyncBusy) return;
-    _autoSyncBusy = true;
-    System.Windows.Forms.DialogResult result;
+    if (_closing || _syncDialogOpen) return;
+    _syncDialogOpen = true;
+    System.Windows.Forms.DialogResult result = System.Windows.Forms.DialogResult.Cancel;
     try
     {
-      var activeOwner = System.Windows.Application.Current?.Windows.OfType<Window>().FirstOrDefault(w => w.IsActive) ?? this;
       using var dialog = new GoogleDriveSyncDialog();
-      result = dialog.ShowDialog(DwmBackdrop.OwnerOf(activeOwner));
+      result = dialog.ShowDialog(ResolveModalOwner());
+    }
+    catch (Exception ex)
+    {
+      MessageBox.Show(this, "동기화 창을 열지 못했습니다:\n" + ex.Message, "Google Drive 동기화");
     }
     finally
     {
-      _autoSyncBusy = false;
+      _syncDialogOpen = false;
       _driveNextCheck = default;
     }
     if (result == System.Windows.Forms.DialogResult.OK || !GoogleDriveAuthorization.NeedsReauthentication)
@@ -849,7 +861,7 @@ internal sealed partial class SafariBrowserWindow
 
   private async Task FlushAndAutoSyncAsync()
   {
-    if (_closing || _autoSyncBusy) return;
+    if (_closing || _autoSyncBusy || _syncDialogOpen) return;
     var localChanged = _stateDirty;
     if (_stateDirty)
     {

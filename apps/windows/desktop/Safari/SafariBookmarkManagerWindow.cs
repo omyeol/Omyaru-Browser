@@ -43,7 +43,22 @@ internal sealed class SafariBookmarkManagerWindow : Window
   private readonly TextBlock _toastText = new();
   private readonly StackPanel _folderTreePanel = new();
   private readonly StackPanel _breadcrumbPanel = new();
+  private readonly Border _selectionBar = new();
+  private readonly TextBlock _selectionCountText = new();
+  private readonly Grid _listViewportHost = new();
+  private readonly ScrollViewer _listScroll = new();
   private readonly StackPanel _listPanel = new();
+  private readonly Canvas _marqueeCanvas = new() { IsHitTestVisible = false, ClipToBounds = true };
+  private readonly System.Windows.Shapes.Rectangle _marqueeRect = new()
+  {
+    Fill = SafariTheme.Frozen(Color.FromArgb(46, 10, 132, 255)),
+    Stroke = SafariTheme.Frozen(Color.FromArgb(205, 10, 132, 255)),
+    StrokeThickness = 1,
+    RadiusX = 4,
+    RadiusY = 4,
+    Visibility = Visibility.Collapsed,
+    IsHitTestVisible = false,
+  };
   private readonly TextBlock _sortButtonText = new();
   private readonly Popup _rowPopup = new()
   {
@@ -53,9 +68,23 @@ internal sealed class SafariBookmarkManagerWindow : Window
   };
 
   private readonly HashSet<string> _expandedFolderIds = new(StringComparer.Ordinal);
+  private readonly HashSet<string> _selectedBookmarkIds = new(StringComparer.Ordinal);
+  private readonly List<(string Id, Border Row, SolidColorBrush Bg)> _renderedBookmarkRows = [];
+  private List<string> _draggingBookmarkIds = [];
   private string? _selectedFolderId; // null = PC 북마크 (최상위)
+  private string? _selectionAnchorBookmarkId;
   private SortMode _sortMode = SortMode.Custom;
-  private string? _draggingBookmarkId;
+
+  // Pointer & rubber-band marquee drag state
+  private bool _pointerDown;
+  private bool _pointerMovedEnough;
+  private bool _isMarqueeDragging;
+  private bool _marqueeAdditive;
+  private Point _pointerStartViewport;
+  private Point _pointerStartContent;
+  private string? _pointerHitBookmarkId;
+  private bool _pointerHitWasSelected;
+  private HashSet<string> _marqueeBaseline = new(StringComparer.Ordinal);
 
   internal SafariBookmarkManagerWindow(
       Window owner,
@@ -93,6 +122,7 @@ internal sealed class SafariBookmarkManagerWindow : Window
       if (e.Key == Key.Escape)
       {
         if (_rowPopup.IsOpen) { _rowPopup.IsOpen = false; e.Handled = true; }
+        else if (_selectedBookmarkIds.Count > 0) { ClearSelection(); e.Handled = true; }
         else { e.Handled = true; Close(); }
       }
       else if (Keyboard.Modifiers == ModifierKeys.Control && e.Key == Key.F)
@@ -100,6 +130,21 @@ internal sealed class SafariBookmarkManagerWindow : Window
         e.Handled = true;
         _searchBox.Focus();
         _searchBox.SelectAll();
+      }
+      else if (Keyboard.Modifiers == ModifierKeys.Control && e.Key == Key.A && !_searchBox.IsKeyboardFocusWithin)
+      {
+        e.Handled = true;
+        SelectAllVisibleBookmarks();
+      }
+      else if (e.Key == Key.Delete && !_searchBox.IsKeyboardFocusWithin && _selectedBookmarkIds.Count > 0)
+      {
+        e.Handled = true;
+        DeleteSelectedBookmarks();
+      }
+      else if (e.Key == Key.Enter && !_searchBox.IsKeyboardFocusWithin && _selectedBookmarkIds.Count > 0)
+      {
+        e.Handled = true;
+        OpenSelectedBookmarks();
       }
     };
 
@@ -253,6 +298,7 @@ internal sealed class SafariBookmarkManagerWindow : Window
     var rightCol = new Grid();
     rightCol.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
     rightCol.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+    rightCol.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
     rightCol.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
 
     // Action Bar (Exact Whale-style: [정렬 ⌄] [추가 ⌄]   ...   [북마크 정리] [북마크 내보내기] [북마크 가져오기])
@@ -315,15 +361,28 @@ internal sealed class SafariBookmarkManagerWindow : Window
     Grid.SetRow(_breadcrumbPanel, 1);
     rightCol.Children.Add(_breadcrumbPanel);
 
-    // Scrollable Items Panel
-    var listScroll = new ScrollViewer
-    {
-      VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
-      HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled,
-      Content = _listPanel,
-    };
-    Grid.SetRow(listScroll, 2);
-    rightCol.Children.Add(listScroll);
+    // Contextual Multi-Selection Action Bar (visible whenever >= 1 bookmark is selected)
+    BuildSelectionBar();
+    Grid.SetRow(_selectionBar, 2);
+    rightCol.Children.Add(_selectionBar);
+
+    // Scrollable Items Panel + Marquee Rubber-Band Selection Overlay
+    _listScroll.VerticalScrollBarVisibility = ScrollBarVisibility.Auto;
+    _listScroll.HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled;
+    _listScroll.Background = Brushes.Transparent;
+    _listScroll.Content = _listPanel;
+    _listPanel.MinHeight = 420;
+    _listPanel.Background = Brushes.Transparent;
+
+    _marqueeCanvas.Children.Add(_marqueeRect);
+    _listViewportHost.Background = Brushes.Transparent;
+    _listViewportHost.ClipToBounds = true;
+    _listViewportHost.Children.Add(_listScroll);
+    _listViewportHost.Children.Add(_marqueeCanvas);
+    WireMarqueeAndSelectionEvents();
+
+    Grid.SetRow(_listViewportHost, 3);
+    rightCol.Children.Add(_listViewportHost);
 
     Grid.SetColumn(rightCol, 2);
     body.Children.Add(rightCol);
@@ -471,6 +530,7 @@ internal sealed class SafariBookmarkManagerWindow : Window
       if (e.Handled) return;
       e.Handled = true;
       _selectedFolderId = folderId;
+      ClearSelection();
       RefreshAll();
     };
     row.MouseRightButtonUp += (_, e) =>
@@ -480,7 +540,7 @@ internal sealed class SafariBookmarkManagerWindow : Window
     };
     row.DragOver += (_, e) =>
     {
-      if (_draggingBookmarkId is not null)
+      if (_draggingBookmarkIds.Count > 0)
       {
         e.Effects = System.Windows.DragDropEffects.Move;
         e.Handled = true;
@@ -490,11 +550,10 @@ internal sealed class SafariBookmarkManagerWindow : Window
     row.DragLeave += (_, _) => SafariTheme.AnimateColor(bg, idle, 80);
     row.Drop += (_, e) =>
     {
-      if (_draggingBookmarkId is { } bid)
+      if (_draggingBookmarkIds.Count > 0)
       {
         e.Handled = true;
-        if (BookmarkStore.MoveBookmarkToFolder(_catalog, bid, folderId))
-          PersistAndRefresh($"‘{name}’ 폴더로 이동했습니다");
+        MoveBookmarksToFolder(_draggingBookmarkIds, folderId, name);
       }
     };
     return row;
@@ -546,6 +605,7 @@ internal sealed class SafariBookmarkManagerWindow : Window
   private void RenderBookmarkList()
   {
     _listPanel.Children.Clear();
+    _renderedBookmarkRows.Clear();
     var query = _searchBox.Text.Trim();
     var isSearching = !string.IsNullOrEmpty(query);
 
@@ -574,6 +634,8 @@ internal sealed class SafariBookmarkManagerWindow : Window
     };
 
     var list = items.ToList();
+    var visibleIds = list.Select(b => b.Id).ToHashSet(StringComparer.Ordinal);
+    _selectedBookmarkIds.IntersectWith(visibleIds);
     foreach (var entry in list)
       _listPanel.Children.Add(CreateListBookmarkRow(entry, showFolderTag: isSearching));
 
@@ -589,6 +651,7 @@ internal sealed class SafariBookmarkManagerWindow : Window
         Margin = new Thickness(0, 64, 0, 0),
       });
     }
+    UpdateSelectionVisuals();
   }
 
   private Border CreateListSubfolderRow(BookmarkFolderEntry folder)
@@ -638,6 +701,7 @@ internal sealed class SafariBookmarkManagerWindow : Window
         () => ShowFolderContextMenu(menuBtn!, folder.Id, folder.Name),
         "폴더 작업",
         28, 28, 8);
+    menuBtn.Tag = "row-menu";
     Grid.SetColumn(menuBtn, 3);
     grid.Children.Add(menuBtn);
 
@@ -649,17 +713,19 @@ internal sealed class SafariBookmarkManagerWindow : Window
       Padding = new Thickness(8, 0, 6, 0),
       Cursor = Cursors.Hand,
       AllowDrop = true,
+      Tag = "subfolder-row",
       Child = grid,
     };
     row.MouseEnter += (_, _) => SafariTheme.AnimateColor(bg, hover, 90);
     row.MouseLeave += (_, _) => SafariTheme.AnimateColor(bg, idle, 120);
     row.MouseLeftButtonUp += (_, e) =>
     {
-      if (e.Handled) return;
+      if (e.Handled || _isMarqueeDragging) return;
       e.Handled = true;
       _expandedFolderIds.Add(folder.Id);
       if (folder.ParentId is not null) _expandedFolderIds.Add(folder.ParentId);
       _selectedFolderId = folder.Id;
+      ClearSelection();
       RefreshAll();
     };
     row.MouseRightButtonUp += (_, e) =>
@@ -669,7 +735,7 @@ internal sealed class SafariBookmarkManagerWindow : Window
     };
     row.DragOver += (_, e) =>
     {
-      if (_draggingBookmarkId is not null)
+      if (_draggingBookmarkIds.Count > 0)
       {
         e.Effects = System.Windows.DragDropEffects.Move;
         e.Handled = true;
@@ -679,11 +745,10 @@ internal sealed class SafariBookmarkManagerWindow : Window
     row.DragLeave += (_, _) => SafariTheme.AnimateColor(bg, idle, 80);
     row.Drop += (_, e) =>
     {
-      if (_draggingBookmarkId is { } bid)
+      if (_draggingBookmarkIds.Count > 0)
       {
         e.Handled = true;
-        if (BookmarkStore.MoveBookmarkToFolder(_catalog, bid, folder.Id))
-          PersistAndRefresh($"‘{folder.Name}’ 폴더로 이동했습니다");
+        MoveBookmarksToFolder(_draggingBookmarkIds, folder.Id, folder.Name);
       }
     };
     return row;
@@ -691,9 +756,8 @@ internal sealed class SafariBookmarkManagerWindow : Window
 
   private Border CreateListBookmarkRow(BookmarkEntry entry, bool showFolderTag)
   {
-    var idle = Color.FromArgb(0, 255, 255, 255);
-    var hover = Color.FromArgb(24, 255, 255, 255);
-    var bg = new SolidColorBrush(idle);
+    var isSelected = _selectedBookmarkIds.Contains(entry.Id);
+    var bg = new SolidColorBrush(isSelected ? Color.FromArgb(62, 10, 132, 255) : Color.FromArgb(0, 255, 255, 255));
 
     var grid = new Grid();
     grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(32) });
@@ -755,6 +819,7 @@ internal sealed class SafariBookmarkManagerWindow : Window
         () => ShowBookmarkContextMenu(menuBtn!, entry),
         "북마크 작업",
         28, 28, 8);
+    menuBtn.Tag = "row-menu";
     Grid.SetColumn(menuBtn, 3);
     grid.Children.Add(menuBtn);
 
@@ -763,43 +828,408 @@ internal sealed class SafariBookmarkManagerWindow : Window
       Height = 38,
       CornerRadius = new CornerRadius(8),
       Background = bg,
-      Padding = new Thickness(8, 0, 6, 0),
+      BorderBrush = isSelected ? SafariTheme.Frozen(Color.FromArgb(140, 10, 132, 255)) : Brushes.Transparent,
+      BorderThickness = new Thickness(1),
+      Padding = new Thickness(7, 0, 5, 0),
+      Margin = new Thickness(0, 1, 0, 1),
       Cursor = Cursors.Hand,
-      ToolTip = $"{entry.Name}\n{entry.Url}\n(폴더로 드래그해 이동 가능)",
+      Tag = entry.Id,
+      ToolTip = $"{entry.Name}\n{entry.Url}\n(더블클릭: 열기 · Ctrl+클릭/드래그: 다중 선택 · 선택 후 폴더로 드래그: 이동)",
       Child = grid,
     };
 
-    Point? dragOrigin = null;
-    row.MouseEnter += (_, _) => SafariTheme.AnimateColor(bg, hover, 90);
-    row.MouseLeave += (_, _) => SafariTheme.AnimateColor(bg, idle, 120);
-    row.PreviewMouseLeftButtonDown += (_, e) => dragOrigin = e.GetPosition(row);
-    row.MouseMove += (_, e) =>
+    row.MouseEnter += (_, _) =>
     {
-      if (e.LeftButton == MouseButtonState.Pressed && dragOrigin is { } origin)
-      {
-        var delta = e.GetPosition(row) - origin;
-        if (Math.Abs(delta.X) > 10 || Math.Abs(delta.Y) > 10)
-        {
-          dragOrigin = null;
-          _draggingBookmarkId = entry.Id;
-          DragDrop.DoDragDrop(row, entry.Id, System.Windows.DragDropEffects.Move);
-          _draggingBookmarkId = null;
-        }
-      }
+      if (!_selectedBookmarkIds.Contains(entry.Id))
+        SafariTheme.AnimateColor(bg, Color.FromArgb(24, 255, 255, 255), 80);
     };
-    row.MouseLeftButtonUp += (_, e) =>
+    row.MouseLeave += (_, _) =>
     {
-      dragOrigin = null;
-      if (e.Handled) return;
-      e.Handled = true;
-      _openUrl(entry.Url);
+      if (!_selectedBookmarkIds.Contains(entry.Id))
+        SafariTheme.AnimateColor(bg, Color.FromArgb(0, 255, 255, 255), 110);
     };
     row.MouseRightButtonUp += (_, e) =>
     {
       e.Handled = true;
+      if (!_selectedBookmarkIds.Contains(entry.Id))
+      {
+        _selectedBookmarkIds.Clear();
+        _selectedBookmarkIds.Add(entry.Id);
+        _selectionAnchorBookmarkId = entry.Id;
+        UpdateSelectionVisuals();
+      }
       ShowBookmarkContextMenu(row, entry);
     };
+    _renderedBookmarkRows.Add((entry.Id, row, bg));
     return row;
+  }
+
+  private void BuildSelectionBar()
+  {
+    _selectionBar.Visibility = Visibility.Collapsed;
+    _selectionBar.CornerRadius = new CornerRadius(10);
+    _selectionBar.Background = SafariTheme.Frozen(Color.FromArgb(46, 10, 132, 255));
+    _selectionBar.BorderBrush = SafariTheme.Frozen(Color.FromArgb(110, 10, 132, 255));
+    _selectionBar.BorderThickness = new Thickness(1);
+    _selectionBar.Padding = new Thickness(12, 6, 8, 6);
+    _selectionBar.Margin = new Thickness(0, 0, 0, 8);
+
+    var dock = new DockPanel();
+    var actions = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center };
+
+    var moveBtn = SelectionPill("폴더 이동…", PromptMoveSelectedToFolder);
+    var openBtn = SelectionPill("새 탭에서 열기", OpenSelectedBookmarks);
+    var delBtn = SelectionPill("삭제", DeleteSelectedBookmarks, danger: true);
+    var clearBtn = SelectionPill("선택 해제", ClearSelection);
+    openBtn.Margin = new Thickness(6, 0, 6, 0);
+    clearBtn.Margin = new Thickness(6, 0, 0, 0);
+    actions.Children.Add(moveBtn);
+    actions.Children.Add(openBtn);
+    actions.Children.Add(delBtn);
+    actions.Children.Add(clearBtn);
+    DockPanel.SetDock(actions, Dock.Right);
+    dock.Children.Add(actions);
+
+    _selectionCountText.FontSize = 12;
+    _selectionCountText.FontWeight = FontWeights.SemiBold;
+    _selectionCountText.Foreground = SafariTheme.TextPrimary;
+    _selectionCountText.VerticalAlignment = VerticalAlignment.Center;
+    dock.Children.Add(_selectionCountText);
+    _selectionBar.Child = dock;
+  }
+
+  private static Border SelectionPill(string label, Action onClick, bool danger = false)
+  {
+    var tb = new TextBlock
+    {
+      Text = label,
+      FontSize = 11.5,
+      FontWeight = FontWeights.SemiBold,
+      Foreground = danger ? Brushes.White : SafariTheme.TextPrimary,
+      VerticalAlignment = VerticalAlignment.Center,
+      Margin = new Thickness(10, 0, 10, 0),
+    };
+    var btn = SafariTheme.CreateGlassButton(
+        tb, onClick, label, double.NaN, 26, 8,
+        transparentIdle: false,
+        accentFill: danger ? SafariTheme.DangerRedColor : null);
+    if (!danger)
+    {
+      btn.BorderBrush = SafariTheme.SpecularBorder;
+      btn.BorderThickness = new Thickness(1);
+    }
+    return btn;
+  }
+
+  private void WireMarqueeAndSelectionEvents()
+  {
+    _listViewportHost.PreviewMouseLeftButtonDown += (_, e) =>
+    {
+      if (IsInsideInteractiveChild(e.OriginalSource as DependencyObject)) return;
+      if (IsInsideTaggedElement(e.OriginalSource as DependencyObject, "subfolder-row")) return;
+
+      var hitBookmarkId = FindBookmarkRowId(e.OriginalSource as DependencyObject);
+      if (e.ClickCount == 2 && hitBookmarkId is not null)
+      {
+        if (_catalog.Items.FirstOrDefault(b => b.Id == hitBookmarkId) is { } doubleClicked)
+        {
+          _pointerDown = false;
+          e.Handled = true;
+          _openUrl(doubleClicked.Url);
+        }
+        return;
+      }
+
+      _pointerDown = true;
+      _pointerMovedEnough = false;
+      _isMarqueeDragging = false;
+      _pointerStartViewport = e.GetPosition(_listViewportHost);
+      _pointerStartContent = e.GetPosition(_listPanel);
+      _pointerHitBookmarkId = hitBookmarkId;
+      _pointerHitWasSelected = hitBookmarkId is not null && _selectedBookmarkIds.Contains(hitBookmarkId);
+    };
+
+    _listViewportHost.PreviewMouseMove += (_, e) =>
+    {
+      if (!_pointerDown || e.LeftButton != MouseButtonState.Pressed) return;
+      var curViewport = e.GetPosition(_listViewportHost);
+      if (!_pointerMovedEnough)
+      {
+        var delta = curViewport - _pointerStartViewport;
+        if (Math.Abs(delta.X) < 6 && Math.Abs(delta.Y) < 6) return;
+        _pointerMovedEnough = true;
+
+        var ctrl = Keyboard.Modifiers.HasFlag(ModifierKeys.Control);
+        var shift = Keyboard.Modifiers.HasFlag(ModifierKeys.Shift);
+        if (_pointerHitWasSelected && !ctrl && !shift && _selectedBookmarkIds.Count > 0)
+        {
+          // Dragging an already-selected bookmark moves ALL selected bookmarks onto a target folder!
+          _draggingBookmarkIds = _selectedBookmarkIds.ToList();
+          _pointerDown = false;
+          DragDrop.DoDragDrop(_listViewportHost, "omyaru-bookmarks", System.Windows.DragDropEffects.Move);
+          _draggingBookmarkIds.Clear();
+          return;
+        }
+
+        // Otherwise start rubber-band marquee multi-selection!
+        _isMarqueeDragging = true;
+        _marqueeAdditive = ctrl;
+        _marqueeBaseline = ctrl
+            ? new HashSet<string>(_selectedBookmarkIds, StringComparer.Ordinal)
+            : new HashSet<string>(StringComparer.Ordinal);
+        _marqueeRect.Visibility = Visibility.Visible;
+        _listViewportHost.CaptureMouse();
+      }
+
+      if (_isMarqueeDragging)
+      {
+        // Smooth edge auto-scroll during marquee drag
+        if (curViewport.Y < 24 && _listScroll.VerticalOffset > 0)
+          _listScroll.ScrollToVerticalOffset(Math.Max(0, _listScroll.VerticalOffset - 18));
+        else if (curViewport.Y > _listViewportHost.ActualHeight - 24 && _listScroll.VerticalOffset < _listScroll.ScrollableHeight)
+          _listScroll.ScrollToVerticalOffset(Math.Min(_listScroll.ScrollableHeight, _listScroll.VerticalOffset + 18));
+
+        var curContent = e.GetPosition(_listPanel);
+        var startViewportAdjusted = new Point(
+            _pointerStartContent.X - _listScroll.HorizontalOffset,
+            _pointerStartContent.Y - _listScroll.VerticalOffset);
+        var left = Math.Clamp(Math.Min(startViewportAdjusted.X, curViewport.X), 0, _listViewportHost.ActualWidth);
+        var top = Math.Clamp(Math.Min(startViewportAdjusted.Y, curViewport.Y), 0, _listViewportHost.ActualHeight);
+        var right = Math.Clamp(Math.Max(startViewportAdjusted.X, curViewport.X), 0, _listViewportHost.ActualWidth);
+        var bottom = Math.Clamp(Math.Max(startViewportAdjusted.Y, curViewport.Y), 0, _listViewportHost.ActualHeight);
+
+        Canvas.SetLeft(_marqueeRect, left);
+        Canvas.SetTop(_marqueeRect, top);
+        _marqueeRect.Width = Math.Max(1, right - left);
+        _marqueeRect.Height = Math.Max(1, bottom - top);
+
+        var selectionBounds = new Rect(_pointerStartContent, curContent);
+        ApplyMarqueeSelection(selectionBounds);
+      }
+    };
+
+    _listViewportHost.PreviewMouseLeftButtonUp += (_, e) =>
+    {
+      if (!_pointerDown) return;
+      _pointerDown = false;
+
+      if (_isMarqueeDragging)
+      {
+        _isMarqueeDragging = false;
+        _marqueeRect.Visibility = Visibility.Collapsed;
+        if (_listViewportHost.IsMouseCaptured) _listViewportHost.ReleaseMouseCapture();
+        e.Handled = true;
+        UpdateSelectionVisuals();
+        return;
+      }
+
+      var ctrl = Keyboard.Modifiers.HasFlag(ModifierKeys.Control);
+      var shift = Keyboard.Modifiers.HasFlag(ModifierKeys.Shift);
+      if (_pointerHitBookmarkId is { } clickedId)
+      {
+        if (ctrl)
+          ToggleBookmarkSelection(clickedId);
+        else if (shift && _selectionAnchorBookmarkId is { } anchorId)
+          SelectBookmarkRange(anchorId, clickedId);
+        else
+        {
+          _selectedBookmarkIds.Clear();
+          _selectedBookmarkIds.Add(clickedId);
+          _selectionAnchorBookmarkId = clickedId;
+          UpdateSelectionVisuals();
+        }
+        e.Handled = true;
+      }
+      else if (!ctrl)
+      {
+        ClearSelection();
+      }
+    };
+
+    _listViewportHost.LostMouseCapture += (_, _) =>
+    {
+      if (_isMarqueeDragging)
+      {
+        _isMarqueeDragging = false;
+        _pointerDown = false;
+        _marqueeRect.Visibility = Visibility.Collapsed;
+      }
+    };
+  }
+
+  private void ApplyMarqueeSelection(Rect contentSelectionBounds)
+  {
+    _selectedBookmarkIds.Clear();
+    if (_marqueeAdditive)
+    {
+      foreach (var id in _marqueeBaseline) _selectedBookmarkIds.Add(id);
+    }
+    string? lastHit = null;
+    foreach (var (id, row, _) in _renderedBookmarkRows)
+    {
+      if (row.ActualWidth <= 0 || row.ActualHeight <= 0) continue;
+      try
+      {
+        var rowRect = row.TransformToAncestor(_listPanel).TransformBounds(new Rect(0, 0, row.ActualWidth, row.ActualHeight));
+        if (contentSelectionBounds.IntersectsWith(rowRect))
+        {
+          _selectedBookmarkIds.Add(id);
+          lastHit = id;
+        }
+      }
+      catch { }
+    }
+    if (lastHit is not null) _selectionAnchorBookmarkId = lastHit;
+    UpdateSelectionVisuals();
+  }
+
+  internal void ToggleBookmarkSelection(string bookmarkId)
+  {
+    if (!_selectedBookmarkIds.Add(bookmarkId))
+      _selectedBookmarkIds.Remove(bookmarkId);
+    _selectionAnchorBookmarkId = bookmarkId;
+    UpdateSelectionVisuals();
+  }
+
+  internal void SelectBookmarkRange(string anchorId, string targetId)
+  {
+    var idxA = _renderedBookmarkRows.FindIndex(r => r.Id == anchorId);
+    var idxB = _renderedBookmarkRows.FindIndex(r => r.Id == targetId);
+    if (idxA < 0 || idxB < 0)
+    {
+      ToggleBookmarkSelection(targetId);
+      return;
+    }
+    var start = Math.Min(idxA, idxB);
+    var end = Math.Max(idxA, idxB);
+    if (!Keyboard.Modifiers.HasFlag(ModifierKeys.Control))
+      _selectedBookmarkIds.Clear();
+    for (var i = start; i <= end; i++)
+      _selectedBookmarkIds.Add(_renderedBookmarkRows[i].Id);
+    UpdateSelectionVisuals();
+  }
+
+  internal void SelectAllVisibleBookmarks()
+  {
+    _selectedBookmarkIds.Clear();
+    foreach (var (id, _, _) in _renderedBookmarkRows)
+      _selectedBookmarkIds.Add(id);
+    UpdateSelectionVisuals();
+  }
+
+  internal void ClearSelection()
+  {
+    if (_selectedBookmarkIds.Count == 0) return;
+    _selectedBookmarkIds.Clear();
+    UpdateSelectionVisuals();
+  }
+
+  internal int SelectedBookmarkCountForTest => _selectedBookmarkIds.Count;
+
+  private void UpdateSelectionVisuals()
+  {
+    var selectedBg = Color.FromArgb(62, 10, 132, 255);
+    var selectedBorder = SafariTheme.Frozen(Color.FromArgb(145, 10, 132, 255));
+    var idleBg = Color.FromArgb(0, 255, 255, 255);
+
+    foreach (var (id, row, bg) in _renderedBookmarkRows)
+    {
+      var selected = _selectedBookmarkIds.Contains(id);
+      bg.BeginAnimation(SolidColorBrush.ColorProperty, null);
+      bg.Color = selected ? selectedBg : (row.IsMouseOver ? Color.FromArgb(24, 255, 255, 255) : idleBg);
+      row.BorderBrush = selected ? selectedBorder : Brushes.Transparent;
+    }
+
+    if (_selectedBookmarkIds.Count > 0)
+    {
+      _selectionCountText.Text = $"{_selectedBookmarkIds.Count}개 북마크 선택됨 · 폴더로 드래그하거나 오른쪽 버튼으로 일괄 정리";
+      _selectionBar.Visibility = Visibility.Visible;
+    }
+    else
+    {
+      _selectionBar.Visibility = Visibility.Collapsed;
+    }
+  }
+
+  private void MoveBookmarksToFolder(IReadOnlyCollection<string> bookmarkIds, string? targetFolderId, string targetFolderName)
+  {
+    var moved = 0;
+    foreach (var id in bookmarkIds)
+    {
+      if (BookmarkStore.MoveBookmarkToFolder(_catalog, id, targetFolderId)) moved++;
+    }
+    if (moved > 0)
+    {
+      ClearSelection();
+      PersistAndRefresh(moved == 1 ? $"‘{targetFolderName}’ 폴더로 이동했습니다" : $"‘{targetFolderName}’ 폴더로 {moved}개 이동했습니다");
+    }
+  }
+
+  private void PromptMoveSelectedToFolder()
+  {
+    if (_selectedBookmarkIds.Count == 0) return;
+    var dest = PromptChooseFolder($"{_selectedBookmarkIds.Count}개 북마크 이동", excludeSubtreeOf: null);
+    if (!dest.Confirmed) return;
+    var name = dest.FolderId is null
+        ? "PC 북마크"
+        : _catalog.Folders.FirstOrDefault(f => f.Id == dest.FolderId)?.Name ?? "PC 북마크";
+    MoveBookmarksToFolder(_selectedBookmarkIds.ToArray(), dest.FolderId, name);
+  }
+
+  private void OpenSelectedBookmarks()
+  {
+    var targets = _catalog.Items.Where(b => _selectedBookmarkIds.Contains(b.Id)).ToList();
+    foreach (var bm in targets.Take(20))
+      _openUrl(bm.Url);
+  }
+
+  private void DeleteSelectedBookmarks()
+  {
+    var targets = _catalog.Items.Where(b => _selectedBookmarkIds.Contains(b.Id)).ToList();
+    if (targets.Count == 0) return;
+    if (targets.Count >= 2 &&
+        MessageBox.Show(this, $"선택한 북마크 {targets.Count}개를 모두 삭제할까요?", "북마크 삭제",
+            MessageBoxButton.YesNo, MessageBoxImage.Warning) != MessageBoxResult.Yes)
+      return;
+    foreach (var item in targets)
+      BookmarkStore.Remove(_catalog, item);
+    ClearSelection();
+    PersistAndRefresh(targets.Count == 1 ? $"‘{targets[0].Name}’ 삭제됨" : $"북마크 {targets.Count}개 삭제됨");
+  }
+
+  private static bool IsInsideInteractiveChild(DependencyObject? source)
+  {
+    var cur = source;
+    while (cur is not null)
+    {
+      if (cur is System.Windows.Controls.Primitives.ScrollBar or Thumb) return true;
+      if (cur is FrameworkElement fe && Equals(fe.Tag, "row-menu")) return true;
+      cur = VisualTreeHelper.GetParent(cur);
+    }
+    return false;
+  }
+
+  private static bool IsInsideTaggedElement(DependencyObject? source, string tag)
+  {
+    var cur = source;
+    while (cur is not null)
+    {
+      if (cur is FrameworkElement fe && Equals(fe.Tag, tag)) return true;
+      cur = VisualTreeHelper.GetParent(cur);
+    }
+    return false;
+  }
+
+  private string? FindBookmarkRowId(DependencyObject? source)
+  {
+    var cur = source;
+    while (cur is not null)
+    {
+      if (cur is Border b && b.Tag is string id && _renderedBookmarkRows.Any(r => r.Id == id))
+        return id;
+      cur = VisualTreeHelper.GetParent(cur);
+    }
+    return null;
   }
 
   private void ShowGlassMenu(UIElement anchor, StackPanel panel, double minW = 190)
@@ -897,6 +1327,25 @@ internal sealed class SafariBookmarkManagerWindow : Window
   private void ShowBookmarkContextMenu(UIElement anchor, BookmarkEntry entry)
   {
     var panel = new StackPanel();
+    if (_selectedBookmarkIds.Count >= 2 && _selectedBookmarkIds.Contains(entry.Id))
+    {
+      var count = _selectedBookmarkIds.Count;
+      panel.Children.Add(SafariTheme.CreatePopoverRow(SafariIcon.OpenExternal, $"선택한 {count}개 새 탭에서 열기", () => { _rowPopup.IsOpen = false; OpenSelectedBookmarks(); }));
+      panel.Children.Add(SafariTheme.CreatePopoverRow(SafariIcon.Folder, $"선택한 {count}개 폴더 이동…", () =>
+      {
+        _rowPopup.IsOpen = false;
+        Dispatcher.BeginInvoke(PromptMoveSelectedToFolder, System.Windows.Threading.DispatcherPriority.Background);
+      }));
+      panel.Children.Add(SafariTheme.CreatePopoverDivider());
+      panel.Children.Add(SafariTheme.CreatePopoverRow(SafariIcon.Trash, $"선택한 {count}개 삭제", () =>
+      {
+        _rowPopup.IsOpen = false;
+        Dispatcher.BeginInvoke(DeleteSelectedBookmarks, System.Windows.Threading.DispatcherPriority.Background);
+      }, isDestructive: true));
+      ShowGlassMenu(anchor, panel, 220);
+      return;
+    }
+
     panel.Children.Add(SafariTheme.CreatePopoverRow(SafariIcon.OpenExternal, "새 탭에서 열기", () => { _rowPopup.IsOpen = false; _openUrl(entry.Url); }));
     panel.Children.Add(SafariTheme.CreatePopoverRow(SafariIcon.Reader, "북마크 편집…", () =>
     {
@@ -927,6 +1376,7 @@ internal sealed class SafariBookmarkManagerWindow : Window
     {
       _rowPopup.IsOpen = false;
       BookmarkStore.Remove(_catalog, entry);
+      ClearSelection();
       PersistAndRefresh($"‘{entry.Name}’ 삭제됨");
     }, isDestructive: true));
     ShowGlassMenu(anchor, panel, 195);

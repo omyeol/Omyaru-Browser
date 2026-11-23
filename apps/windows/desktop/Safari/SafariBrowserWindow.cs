@@ -128,6 +128,7 @@ internal sealed partial class SafariBrowserWindow : Window
   private bool _closing;
   private bool _stateDirty;
   private bool _autoSyncBusy;
+  private bool _syncDialogOpen;
   private bool _captureInProgress;
   private bool _isLoading;
   private bool _readerAvailable;

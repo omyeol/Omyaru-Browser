@@ -1,3 +1,30 @@
+# 2026-11-24 Antigravity: 북마크 관리자 드래그·Ctrl 다중 선택 · 확장 팝업 우측 끝 정렬 · 동기화 버튼 창 미표시 해결 (`Omyaru v0.5.6`)
+
+- 작업 워크스페이스: `E:/DEV/CODEX/BROWSER`
+- 사용자 요청:
+  1. 북마크 관리자에서 마우스 드래그(사각형 영역)로 북마크 여러 개 선택 및 `Ctrl+클릭` 다중 선택 지원
+  2. 확장 프로그램 플로팅 팝업이 브라우저 창 우측 끝에 맞춰 뜨도록 위치 조정
+  3. 동기화 버튼을 눌러도 동기화 창이 뜨지 않는 문제 해결
+- 원인 및 해결:
+  1. **북마크 관리자 다중 선택 & 일괄 작업 (`apps/windows/desktop/Safari/SafariBookmarkManagerWindow.cs`)**:
+     - 리스트 뷰포트에 반투명 블루 마키 사각형 오버레이(`_marqueeCanvas` / `_marqueeRect`)를 추가해 빈 공간 또는 미선택 항목에서 드래그 시 실시간 다중 선택(가장자리 자동 스크롤 + `Ctrl+드래그` 추가 선택 지원), `Ctrl+클릭` 개별 토글, `Shift+클릭` 범위 선택, `Ctrl+A` 전체 선택, `Delete` 일괄 삭제, `Esc` 선택 해제, 더블클릭 열기 구현.
+     - 이미 선택된 북마크를 드래그하면 선택된 모든 북마크를 좌측 폴더 트리나 하위 폴더로 한 번에 이동 가능하며, 1개 이상 선택 시 상단 선택 액션 바(`N개 북마크 선택됨 · 폴더 이동… · 새 탭에서 열기 · 삭제 · 선택 해제`) 및 다중 선택 우클릭 메뉴 표시.
+  2. **확장 프로그램 팝업 우측 끝 정렬 (`apps/windows/desktop/Safari/SafariExtensionPopupWindow.cs`)**:
+     - `RepositionToAnchor()`가 확장 버튼 우측 대신 브라우저 창 실제 우측 끝(`Math.Min(ownerTopRight.X, waBottomRight.X) - 10 - Width`) 바로 아래 툴바 하단에 정렬되도록 수정(일반 창·최대화 창 모두 대응).
+  3. **동기화 버튼 클릭 시 창 미표시 수정 (`SafariBrowserWindow.cs`, `SafariBrowserWindow.PopupsAndSync.cs`)**:
+     - **원인**: `ShowSyncDialogAsync()`가 백그라운드 자동 동기화 플래그(`_autoSyncBusy`)를 공유해 `if (_autoSyncBusy) return;`으로 차단하고 있었기 때문에, 백그라운드 Drive 동기화가 진행 중일 때 동기화 버튼 클릭이 조용히 무시되었음.
+     - **해결**: 모달 중복 방지 전용 `_syncDialogOpen` 플래그를 분리해 백그라운드 동기화 중에도 동기화 버튼(툴바·메뉴·시작 페이지·상태 막대·설정) 클릭 시 `GoogleDriveSyncDialog`가 즉시 열리도록 수정, 안전한 활성 소유 창 핸들 조회(`ResolveModalOwner`) 및 예외 알림 추가.
+  - 버전 갱신: `PrivacyBrowser.Desktop.csproj`, `SafariSettingsWindow.cs`, `DesktopSettings.cs` (`0.5.4` → `0.5.6`).
+- 검증 결과:
+  - `powershell -ExecutionPolicy Bypass -File scripts/Publish-Windows.ps1` 성공 (`Omyaru.exe`, `78,613,797` bytes).
+  - `Omyaru.exe --self-test` 종료 코드 `0` (`GoogleDriveSyncDialog` 생성/핸들 검증 포함).
+  - `Omyaru.exe --smoke-test` 종료 코드 `0` (`SafariBookmarkManagerWindow` 다중 선택 3개 + 선택 액션 바 오프스크린 렌더 육안 확인 포함).
+- 빌드 산출물:
+  - 상대 경로: `artifacts/releases/Omyaru-v0.5.6-win-x64/Omyaru.exe`
+  - 절대 경로: `E:/DEV/CODEX/BROWSER/artifacts/releases/Omyaru-v0.5.6-win-x64/Omyaru.exe`
+
+---
+
 # 2026-11-24 Antigravity: 확장 프로그램 플로팅 팝업 · 책장 열 변경 후 전체화면 레이아웃 수정 · Whale 스타일 폴더형 북마크 관리자 & 동기화/중복 방지 (`Omyaru v0.5.4` / iOS `build 83`)
 
 - 작업 워크스페이스: `E:/DEV/CODEX/BROWSER`
