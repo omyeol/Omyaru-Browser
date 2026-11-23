@@ -1,0 +1,55 @@
+# Editors and operating systems
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Local secrets and machine configuration
+.env
+.env.*
+!.env.example
+local.properties
+*.keystore
+*.jks
+*.p12
+*.pem
+
+# Rust
+target/
+**/target/
+
+# Android / Gradle
+.gradle/
+**/.gradle/
+**/build/
+captures/
+.cxx/
+.cache/
+**/.build-*/
+
+# Firefox/Gecko source and build output are fetched locally, never vendored
+upstream/
+firefox-source/
+obj-*/
+**/obj-*/
+
+# Generated packages and reports
+artifacts/
+dist/
+reports/
+**/bin/
+**/obj/
+*.dat
+apps/windows/gecko-lab/profile/
+*.apk
+*.aab
+*.exe
+*.msix
+*.zip
+
+# Python tooling
+__pycache__/
+*.py[cod]
+.pytest_cache/

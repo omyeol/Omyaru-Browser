@@ -993,11 +993,25 @@ final class DriveSyncManager: NSObject, ObservableObject, ASWebAuthenticationPre
                         }
                     }
                     if let items = bObj["items"] as? [[String: Any]] {
+                        func canonicalBookmarkKey(_ raw: String) -> String {
+                            let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+                            guard let comps = URLComponents(string: trimmed), var host = comps.host?.lowercased() else {
+                                return trimmed.lowercased()
+                            }
+                            if host.hasPrefix("www.") { host = String(host.dropFirst(4)) }
+                            else if host.hasPrefix("m.") { host = String(host.dropFirst(2)) }
+                            var path = comps.path
+                            if path == "/" { path = "" }
+                            else { while path.hasSuffix("/") { path.removeLast() } }
+                            let query = comps.query.map { "?\($0)" } ?? ""
+                            return host + path + query
+                        }
                         for row in items {
                             guard let title = row["title"] as? String,
                                   let url = row["url"] as? String else { continue }
                             let folderID = row["folderId"] as? String
-                            if !browser.bookmarks.contains(where: { $0.url == url }) {
+                            let key = canonicalBookmarkKey(url)
+                            if !browser.bookmarks.contains(where: { canonicalBookmarkKey($0.url) == key && ($0.folderID ?? "") == (folderID ?? "") }) {
                                 browser.bookmarks.append(BrowserBookmark(title: title, url: url, folderID: folderID))
                             }
                         }
