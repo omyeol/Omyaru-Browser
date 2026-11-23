@@ -7,6 +7,7 @@ internal sealed class DesktopPreferences
   public bool RestoreTabs { get; set; } = true;
   public string SearchEngine { get; set; } = "DuckDuckGo";
   public bool ShowFavoritesBar { get; set; } = true;
+  public bool TabsAboveAddressBar { get; set; }
   public bool BookmarkIconsOnly { get; set; }
   public bool ShowStatusBar { get; set; } = true;
   public bool CompactToolbar { get; set; }
@@ -175,8 +176,10 @@ internal sealed class SettingsForm : Form
         }),
         ToggleRow("▧", "캡처 화면 양옆 여백", "영역 선택 중 페이지 좌우에 여백을 표시합니다.",
             () => _working.CaptureSideMargins, value => _working.CaptureSideMargins = value),
-        ToggleRow("★", "북마크 막대", "주소창 아래에 빠른 북마크 막대를 표시합니다.",
+        ToggleRow("★", "주소창 아래 북마크 모음 표시", "끄면 URL 입력창 아래의 북마크 모음 막대를 숨깁니다.",
             () => _working.ShowFavoritesBar, value => _working.ShowFavoritesBar = value),
+        ToggleRow("⇡", "탭 목록을 주소창 위로 배치", "켜면 탭 목록이 URL 입력창 위쪽에 표시됩니다.",
+            () => _working.TabsAboveAddressBar, value => _working.TabsAboveAddressBar = value),
         ToggleRow("◉", "북마크 아이콘만 표시", "북마크 막대에서 이름을 숨기고 사이트 아이콘만 표시합니다.",
             () => _working.BookmarkIconsOnly, value => _working.BookmarkIconsOnly = value),
         ToggleRow("▱", "상태 막대", "프로필과 동기화 상태를 창 아래에 표시합니다.",
@@ -215,7 +218,7 @@ internal sealed class SettingsForm : Form
             () => _working.CollectDiagnostics, value => _working.CollectDiagnostics = value));
 
     AddSection("도움말 및 정보",
-        InfoRow("ⓘ", "Omyaru", "Windows 0.5.6 · macOS Safari 스타일 GPU 데스크톱"));
+        InfoRow("ⓘ", "Omyaru", "Windows 0.5.7 · macOS Safari 스타일 GPU 데스크톱"));
 
     void ResizeCards()
     {

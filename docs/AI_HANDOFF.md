@@ -1,3 +1,38 @@
+# 2026-11-24 Antigravity: PC·iOS 탭 드래그 애니메이션, 탭 목록 길게 누르기 이동/컨텍스트 메뉴, 주소창 위 탭 배치 & 북마크 모음 숨김 옵션, 탭 목록 상단 정리 (`Omyaru v0.5.7` / iOS `build 84`)
+
+- 작업 워크스페이스: `E:/DEV/CODEX/BROWSER`
+- 사용자 요청:
+  1. PC 상단 탭 바에서 탭을 드래그해 순서를 바꿀 때 이웃 탭이 부드럽게 밀려나는 애니메이션 적용(참고 영상: `E:\REC\2026\2026-11-24 01-32-14.mkv`)
+  2. PC `탭 모아보기`(→ `탭 목록`으로 개명)에서 탭 카드를 길게 누르면 들려 올라오며 드래그 시 애니메이션과 함께 2D 순서 이동, 이동 없이 길게 누르고 떼면 `링크 복사하기`, `탭 고정/해제` 등 메뉴 표시(참고 영상: `KakaoTalk_20261124_013558967.mp4`)
+  3. iOS `탭 목록`에서도 동일하게 탭 카드를 길게 누르고 드래그 시 손가락을 따라 들려 이동하며 주변 카드가 스프링 애니메이션으로 자리 교체, 움직이지 않고 떼면 `링크 복사하기`, `탭 고정`, `다른 탭 닫기` 등 Liquid Glass 메뉴 표시
+  4. PC 설정에 `탭 목록을 주소창 위로 배치` 옵션 및 `주소창 아래 북마크 모음 표시`(숨기기) 옵션 배치, `탭 모아보기` 명칭을 `탭 목록`으로 통일, `탭 목록` 열람 시 상단 URL 툴바만 표시하고 아래 북마크 모음·탭 바는 숨김
+- 구현 내용:
+  1. **PC 상단 탭 바 GPU 드래그 재정렬 애니메이션 (`apps/windows/desktop/Safari/SafariBrowserWindow.cs`)**:
+     - 기존 Win32 `DragDrop.DoDragDrop`을 제거하고 포인터 캡처 + 순수 GPU `TranslateTransform` 기반 1:1 커서 추적 드래그로 교체.
+     - 드래그 중 시각 트리를 재구성하지 않고 논리 순서(`_stripLogicalOrder`)와 정확한 중점 + 6px 히스테리시스 데드밴드로 이웃 탭들이 `175ms CubicEase Out`으로 부드럽게 빈 자리로 슬라이드 이동하며, 마우스를 놓으면 드래그한 탭이 `145ms`로 안착 후 순서를 커밋(`CommitVisibleTabOrder`).
+     - `TabEntry.IsPinned`(`Models.cs`) 및 `SafariIcon.Pin`/`PinOff`(`SafariIcons.cs`) 지원으로 고정 탭은 앞쪽 구역에 핀 배지와 함께 컴팩트하게 유지.
+  2. **PC `탭 목록` Canvas 2D 길게 누르기 리프트·애니메이션 재정렬·컨텍스트 메뉴 (`SafariBrowserWindow.cs`, `SafariBrowserWindow.PopupsAndSync.cs`)**:
+     - `WrapPanel`을 반응형 `Canvas` + `TransformGroup(ScaleTransform, TranslateTransform)`으로 교체해 레이아웃 패스 없는 60fps+ 2D 카드 재배치 구현.
+     - 카드 길게 누르기(`250ms`) 시 카드가 `scale 1.06` + 깊은 그림자 + 액센트 테두리 + `ZIndex=100`으로 들려 올라오며, 드래그하면 포인터를 따라 이동하고 다른 슬롯에 진입 시 주변 카드들이 `220ms CubicEase Out`으로 부드럽게 자리 교체.
+     - 길게 누른 뒤 드래그 없이 떼면(또는 우클릭 시) Liquid Glass 컨텍스트 팝업(`링크 복사하기`, `탭 고정/고정 해제`, `탭 복제`, `닫은 탭 다시 열기`, `다른 탭 모두 닫기`, `이 탭 닫기`) 표시.
+  3. **PC 상단 크롬 배치 옵션 & `탭 목록` 상단 정리 (`SafariBrowserWindow.cs`, `SafariBrowserWindow.WebView.cs`, `SafariSettingsWindow.cs`, `DesktopSettings.cs`)**:
+     - `DesktopPreferences.TabsAboveAddressBar` 추가 및 설정 `모양` 섹션 최상단에 `탭 목록을 주소창 위로 배치`·`주소창 아래 북마크 모음 표시` 토글 배치(즉시 라이브 반영 + `WindowChrome.CaptionHeight` 및 `IsHitTestVisibleInChrome` 연동).
+     - `탭 모아보기` → `탭 목록` 명칭 통일.
+     - `탭 목록` 열람 중(`_showingOverview == true`)에는 `_favoritesBarHost`와 `_tabStripHost`를 모두 접고 Row 0에 `_toolbarHost`(URL 필드 영역)만 단독 표시하며, 탭 선택·주소 이동·닫기 시 원래 크롬 배치로 자동 복원.
+  4. **iOS `탭 목록` 길게 누르기 드래그 재정렬·리프트·릴리스 메뉴 (`apps/ios/Omyaru/BrowserViews.swift`, `LiquidGlassComponents.swift`, `OmyaruApp.swift`, `Info.plist`)**:
+     - 기존 충돌하던 이중 제스처(`.onLongPressGesture(0.42)` + `.simultaneousGesture(LongPress(0.55)...)`)를 단일 `LongPressGesture(minimumDuration: 0.28).sequenced(before: DragGesture(minimumDistance: 0, coordinateSpace: .named("tabGridSpace")))`로 통합.
+     - `.offset` 이전 지오메트리 측정(`TabCardFramePreferenceKey`) + 드래그 중 `ScrollView`/`TabView` 스크롤 잠금(`.scrollDisabled(draggingTabID != nil)`) + 손가락 오프셋 고정 `scaleEffect(1.06)` + 실시간 그리드 히트테스트 스프링 스왑(`response: 0.32, dampingFraction: 0.78`) + 미이동 릴리스 시 컨텍스트 메뉴(`링크 복사하기`, `탭 고정/해제`, `탭 복제`, `탭 선택`, `탭 이동`, `다른 탭 닫기`, `탭 닫기`) 표시. `closeOtherTabs(keeping:)` 추가(고정 탭 보호).
+  - 버전 갱신: Windows `0.5.6` → `0.5.7`, iOS `build 83` → `build 84`.
+- 검증 결과:
+  - `powershell -ExecutionPolicy Bypass -File scripts/Publish-Windows.ps1` 성공 (`Omyaru.exe`, `78,620,702` bytes).
+  - `Omyaru.exe --self-test` 종료 코드 `0`.
+  - `Omyaru.exe --smoke-test` 종료 코드 `0` (`탭 목록` 열람 시 북마크 모음·탭 바 숨김/URL 툴바 단독 표시 및 `TabsAboveAddressBar` 행 전환 자동 검증 포함).
+- 빌드 산출물:
+  - 상대 경로: `artifacts/releases/Omyaru-v0.5.7-win-x64/Omyaru.exe`
+  - 절대 경로: `E:/DEV/CODEX/BROWSER/artifacts/releases/Omyaru-v0.5.7-win-x64/Omyaru.exe`
+
+---
+
 # 2026-11-24 Antigravity: 북마크 관리자 드래그·Ctrl 다중 선택 · 확장 팝업 우측 끝 정렬 · 동기화 버튼 창 미표시 해결 (`Omyaru v0.5.6`)
 
 - 작업 워크스페이스: `E:/DEV/CODEX/BROWSER`

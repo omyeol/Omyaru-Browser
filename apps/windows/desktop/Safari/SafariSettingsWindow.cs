@@ -127,22 +127,24 @@ internal sealed class SafariSettingsWindow : Window
             () => { var next = CycleSearchEngine(); ApplyLive(); return next; }));
 
     AddSection("모양",
-        ActionRow(SafariIcon.PageMenu, "주소창 아래 메뉴 버튼 편집", "자주 쓰는 메뉴를 바로가기 버튼으로 선택합니다.", ShowToolbarShortcutsDialog),
-        ToggleRow(SafariIcon.Capture, "캡처 화면 양옆 여백", "영역 선택 중 페이지 좌우에 여백을 표시합니다.",
-            () => _working.CaptureSideMargins, value => { _working.CaptureSideMargins = value; ApplyLive(); }),
-        ToggleRow(SafariIcon.StarOutline, "북마크 막대", "주소창 아래에 빠른 북마크 막대를 표시합니다.",
+        ToggleRow(SafariIcon.TabGroup, "탭 목록을 주소창 위로 배치", "켜면 탭 목록이 URL 입력창 위쪽에 표시됩니다.",
+            () => _working.TabsAboveAddressBar, value => { _working.TabsAboveAddressBar = value; ApplyLive(); }),
+        ToggleRow(SafariIcon.StarOutline, "주소창 아래 북마크 모음 표시", "끄면 URL 입력창 아래의 북마크 모음 막대를 숨깁니다.",
             () => _working.ShowFavoritesBar, value => { _working.ShowFavoritesBar = value; ApplyLive(); }),
         ToggleRow(SafariIcon.Globe, "북마크 아이콘만 표시", "북마크 막대에서 이름을 숨기고 사이트 아이콘만 표시합니다.",
             () => _working.BookmarkIconsOnly, value => { _working.BookmarkIconsOnly = value; ApplyLive(); }),
         ToggleRow(SafariIcon.Sidebar, "상태 막대", "프로필과 동기화 상태를 창 아래에 표시합니다.",
             () => _working.ShowStatusBar, value => { _working.ShowStatusBar = value; ApplyLive(); }),
-        ToggleRow(SafariIcon.TabGroup, "컴팩트 도구 모음", "탐색 영역의 세로 공간을 줄입니다.",
-            () => _working.CompactToolbar, value => { _working.CompactToolbar = value; ApplyLive(); }));
+        ToggleRow(SafariIcon.Capture, "캡처 화면 양옆 여백", "영역 선택 중 페이지 좌우에 여백을 표시합니다.",
+            () => _working.CaptureSideMargins, value => { _working.CaptureSideMargins = value; ApplyLive(); }),
+        ToggleRow(SafariIcon.PageMenu, "컴팩트 도구 모음", "탐색 영역의 세로 공간을 줄입니다.",
+            () => _working.CompactToolbar, value => { _working.CompactToolbar = value; ApplyLive(); }),
+        ActionRow(SafariIcon.Settings, "주소창 아래 메뉴 버튼 편집", "자주 쓰는 메뉴를 바로가기 버튼으로 선택합니다.", ShowToolbarShortcutsDialog));
 
     AddSection("탭",
         ToggleRow(SafariIcon.OpenExternal, "링크를 새 탭에서 열기", "새 창 요청을 현재 프로필의 새 탭으로 엽니다.",
             () => _working.OpenLinksInNewTab, value => { _working.OpenLinksInNewTab = value; ApplyLive(); }),
-        ToggleRow(SafariIcon.Duplicate, "탭 미리보기", "탭 모아보기와 동기화 파일에 썸네일을 유지합니다.",
+        ToggleRow(SafariIcon.Duplicate, "탭 미리보기", "탭 목록과 동기화 파일에 썸네일을 유지합니다.",
             () => _working.ShowTabThumbnails, value => { _working.ShowTabThumbnails = value; ApplyLive(); }));
 
     AddSection("브라우징",
@@ -179,7 +181,7 @@ internal sealed class SafariSettingsWindow : Window
             () => _working.CollectDiagnostics, value => { _working.CollectDiagnostics = value; ApplyLive(); }));
 
     AddSection("도움말 및 정보",
-        InfoRow(SafariIcon.Settings, "Omyaru", "Windows 0.5.6 · macOS Safari 스타일 GPU 데스크톱"));
+        InfoRow(SafariIcon.Settings, "Omyaru", "Windows 0.5.7 · macOS Safari 스타일 GPU 데스크톱"));
 
     Content = root;
   }

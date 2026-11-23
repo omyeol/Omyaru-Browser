@@ -1569,6 +1569,12 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
         persist()
     }
 
+    func closeOtherTabs(keeping tabID: UUID) {
+        let others = Set(visibleTabs.filter { $0.id != tabID && !$0.isPinned }.map(\.id))
+        guard !others.isEmpty else { return }
+        closeTabs(others)
+    }
+
     // MARK: - Profiles & Tab Groups
 
     func selectProfile(_ id: UUID) {

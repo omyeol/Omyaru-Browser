@@ -19,6 +19,7 @@ using HorizontalAlignment = System.Windows.HorizontalAlignment;
 using Image = System.Windows.Controls.Image;
 using KeyEventArgs = System.Windows.Input.KeyEventArgs;
 using Orientation = System.Windows.Controls.Orientation;
+using Panel = System.Windows.Controls.Panel;
 using Point = System.Windows.Point;
 using TextBox = System.Windows.Controls.TextBox;
 using WpfWebView2 = Microsoft.Web.WebView2.Wpf.WebView2;
@@ -99,11 +100,60 @@ internal sealed partial class SafariBrowserWindow : Window
   private bool? _lastStarredIcon;
   private bool? _lastLoadingIcon;
 
-  // Overview controls
+  // Overview controls (Canvas-positioned GPU-animated grid with long-press lift & 2D reorder)
+  private const double OverviewCardWidth = 264;
+  private const double OverviewCardHeight = 192;
+  private const double OverviewCardGap = 16;
+  private const double OverviewPadX = 28;
+  private const double OverviewPadY = 12;
+
   private readonly TextBox _overviewSearchBox = new();
   private readonly StackPanel _overviewGroupPills = new();
-  private readonly WrapPanel _overviewGrid = new();
+  private readonly ScrollViewer _overviewScroll = new();
+  private readonly Canvas _overviewCanvas = new();
   private readonly ScaleTransform _overviewScale = new(1, 1);
+  private readonly List<OverviewCardEntry> _overviewCards = new();
+  private readonly DispatcherTimer _overviewLongPressTimer = new() { Interval = TimeSpan.FromMilliseconds(250) };
+  private OverviewCardEntry? _overviewPendingCard;
+  private OverviewCardEntry? _overviewLiftedCard;
+  private Point _overviewPressCanvasPos;
+  private double _overviewGrabOffsetX;
+  private double _overviewGrabOffsetY;
+  private bool _overviewDraggedMoved;
+  private bool _overviewDragChangedOrder;
+  private bool _overviewPressCancelled;
+
+  // Top tab strip animated drag reorder state
+  private readonly List<TabStripDragItem> _tabStripItems = new();
+  private List<TabStripDragItem>? _stripLogicalOrder;
+  private TabStripDragItem? _activeStripDrag;
+  private Point _stripPressPanelPos;
+  private double _stripGrabOffsetX;
+  private bool _stripDragMoved;
+  private bool _stripDragReordered;
+
+  private sealed class OverviewCardEntry
+  {
+    public required TabEntry Tab { get; init; }
+    public required Border Card { get; init; }
+    public required SolidColorBrush Background { get; init; }
+    public required ScaleTransform Scale { get; init; }
+    public required TranslateTransform Translate { get; init; }
+    public required bool IsActive { get; init; }
+    public double TargetX { get; set; }
+    public double TargetY { get; set; }
+  }
+
+  private sealed class TabStripDragItem
+  {
+    public required TabEntry Tab { get; init; }
+    public required Border Pill { get; init; }
+    public required TranslateTransform Translate { get; init; }
+    public required bool IsActive { get; init; }
+    public double HomeLeft { get; set; }
+    public double SlotWidth { get; set; }
+    public double TargetTranslateX { get; set; }
+  }
 
   // Floating Glass Popup (native layered HWND -> renders cleanly ABOVE WebView2!)
   private readonly Popup _activePopup = new()
@@ -191,6 +241,7 @@ internal sealed partial class SafariBrowserWindow : Window
         await CaptureTabThumbnailAsync(_pendingThumbnailTabId);
     };
     _autoSyncTimer.Tick += async (_, _) => await FlushAndAutoSyncAsync();
+    _overviewLongPressTimer.Tick += OnOverviewLongPressTick;
     GoogleDriveAuthorization.SessionChanged += OnDriveSessionChanged;
 
     Loaded += async (_, _) =>
@@ -212,6 +263,7 @@ internal sealed partial class SafariBrowserWindow : Window
       _driveCancellation.Cancel();
       _autoSyncTimer.Stop();
       _thumbnailTimer.Stop();
+      _overviewLongPressTimer.Stop();
       _activePopup.IsOpen = false;
       _findPopup.IsOpen = false;
       CloseExtensionPopup();
@@ -687,7 +739,7 @@ internal sealed partial class SafariBrowserWindow : Window
     // Capsule 2: Safari Core Actions (+ New Tab · Overlapping Squares Tab Overview · More Menu)
     var safariRow = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center };
     var newTabBtn = SafariTheme.CreateGlassButton(SafariIcons.Create(SafariIcon.Plus, 15.5), () => _ = CreateTabAsync(), "새 탭 (Ctrl+T)", 33, 30, 15);
-    var overviewBtn = SafariTheme.CreateGlassButton(SafariIcons.Create(SafariIcon.TabOverview, 15.5), ToggleTabOverview, "탭 모아보기 (Ctrl+Shift+O)", 33, 30, 15);
+    var overviewBtn = SafariTheme.CreateGlassButton(SafariIcons.Create(SafariIcon.TabOverview, 15.5), ToggleTabOverview, "탭 목록 (Ctrl+Shift+O)", 33, 30, 15);
     _menuBtn = SafariTheme.CreateGlassButton(SafariIcons.Create(SafariIcon.Ellipsis, 15.5), () => ShowMainMenuPopup(_menuBtn), "더보기 메뉴", 33, 30, 15);
     safariRow.Children.Add(newTabBtn);
     safariRow.Children.Add(overviewBtn);
@@ -792,7 +844,7 @@ internal sealed partial class SafariBrowserWindow : Window
     var doneBtn = SafariTheme.CreateGlassButton(
         SafariTheme.CreateGlyph("완료", 12.5, Brushes.White),
         ToggleTabOverview,
-        "탭 모아보기 닫기",
+        "탭 목록 닫기",
         68, 32, 16, transparentIdle: false, accentFill: SafariTheme.AccentColor);
     DockPanel.SetDock(doneBtn, Dock.Right);
     header.Children.Add(doneBtn);
@@ -863,16 +915,19 @@ internal sealed partial class SafariBrowserWindow : Window
     Grid.SetRow(header, 0);
     _overviewLayer.Children.Add(header);
 
-    _overviewGrid.Margin = new Thickness(24, 6, 24, 28);
-    _overviewGrid.HorizontalAlignment = HorizontalAlignment.Left;
-    var ovScroll = new ScrollViewer
+    _overviewCanvas.Background = Brushes.Transparent;
+    _overviewCanvas.HorizontalAlignment = HorizontalAlignment.Left;
+    _overviewCanvas.VerticalAlignment = VerticalAlignment.Top;
+    _overviewScroll.VerticalScrollBarVisibility = ScrollBarVisibility.Auto;
+    _overviewScroll.HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled;
+    _overviewScroll.Content = _overviewCanvas;
+    _overviewScroll.SizeChanged += (_, _) =>
     {
-      VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
-      HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled,
-      Content = _overviewGrid,
+      if (_showingOverview && _overviewLiftedCard is null)
+        LayoutOverviewCards(animate: false);
     };
-    Grid.SetRow(ovScroll, 1);
-    _overviewLayer.Children.Add(ovScroll);
+    Grid.SetRow(_overviewScroll, 1);
+    _overviewLayer.Children.Add(_overviewScroll);
   }
 
   private void BuildFindPopup()
@@ -956,12 +1011,71 @@ internal sealed partial class SafariBrowserWindow : Window
     _rootGrid.Margin = maximized ? new Thickness(7) : new Thickness(0);
   }
 
+  private bool ShouldShowTabStrip()
+  {
+    if (_showingOverview) return false;
+    if (_preferences.TabsAboveAddressBar) return true;
+    var tabs = VisibleTabs();
+    return !(tabs.Count == 1 && tabs[0].Url == "about:blank");
+  }
+
   private void ApplyChromePreferences()
   {
-    _favoritesBarHost.Visibility = _preferences.ShowFavoritesBar && (_bookmarks.Items.Count > 0 || _bookmarks.Folders.Count > 0)
-        ? Visibility.Visible
-        : Visibility.Collapsed;
+    var showFavorites = !_showingOverview &&
+        _preferences.ShowFavoritesBar &&
+        (_bookmarks.Items.Count > 0 || _bookmarks.Folders.Count > 0);
+    var showTabStrip = ShouldShowTabStrip();
+
+    if (_showingOverview)
+    {
+      // When Tab List (탭 목록) is open, hide both the bookmark bar and tab strip so only the URL toolbar row stays visible.
+      Grid.SetRow(_toolbarHost, 0);
+      Grid.SetRow(_favoritesBarHost, 1);
+      Grid.SetRow(_tabStripHost, 2);
+      _toolbarHost.Padding = new Thickness(12, 8, 10, 7);
+      _toolbarHost.BorderBrush = SafariTheme.Divider;
+      _toolbarHost.BorderThickness = new Thickness(0, 0, 0, 1);
+    }
+    else if (_preferences.TabsAboveAddressBar)
+    {
+      Grid.SetRow(_tabStripHost, 0);
+      Grid.SetRow(_toolbarHost, 1);
+      Grid.SetRow(_favoritesBarHost, 2);
+
+      _tabStripHost.Padding = new Thickness(12, 6, 12, 4);
+      _tabStripHost.BorderThickness = new Thickness(0);
+
+      _toolbarHost.Padding = new Thickness(12, 4, 10, 7);
+      _toolbarHost.BorderBrush = SafariTheme.Divider;
+      _toolbarHost.BorderThickness = new Thickness(0, 0, 0, showFavorites ? 0 : 1);
+
+      _favoritesBarHost.BorderBrush = SafariTheme.Divider;
+      _favoritesBarHost.BorderThickness = new Thickness(0, 0, 0, 1);
+    }
+    else
+    {
+      Grid.SetRow(_toolbarHost, 0);
+      Grid.SetRow(_favoritesBarHost, 1);
+      Grid.SetRow(_tabStripHost, 2);
+
+      _toolbarHost.Padding = new Thickness(12, 8, 10, 7);
+      _toolbarHost.BorderBrush = SafariTheme.Divider;
+      _toolbarHost.BorderThickness = new Thickness(0, 0, 0, !showFavorites && !showTabStrip ? 1 : 0);
+
+      _favoritesBarHost.BorderBrush = SafariTheme.Divider;
+      _favoritesBarHost.BorderThickness = new Thickness(0, 0, 0, !showTabStrip ? 1 : 0);
+
+      _tabStripHost.Padding = new Thickness(10, 2, 10, 6);
+      _tabStripHost.BorderBrush = SafariTheme.Divider;
+      _tabStripHost.BorderThickness = new Thickness(0, 0, 0, 1);
+    }
+
+    _favoritesBarHost.Visibility = showFavorites ? Visibility.Visible : Visibility.Collapsed;
+    _tabStripHost.Visibility = showTabStrip ? Visibility.Visible : Visibility.Collapsed;
     _statusBarHost.Visibility = _preferences.ShowStatusBar ? Visibility.Visible : Visibility.Collapsed;
+
+    if (WindowChrome.GetWindowChrome(this) is { } chrome)
+      chrome.CaptionHeight = !_showingOverview && _preferences.TabsAboveAddressBar ? 40 : 46;
   }
 
   // Smooth GPU Sidebar Slide Animation (0 <-> 268px, 220ms CubicEase Out)
@@ -972,16 +1086,23 @@ internal sealed partial class SafariBrowserWindow : Window
     SafariTheme.AnimateDouble(_sidebarHost, FrameworkElement.WidthProperty, _sidebarOpen ? SidebarExpandedWidth : 0, 220);
   }
 
-  // Smooth GPU Tab Overview Grid Morph (Scale + Opacity, 210ms CubicEase Out)
+  // Smooth GPU Tab List (탭 목록) Morph (Scale + Opacity, 210ms CubicEase Out)
   internal void ToggleTabOverview()
   {
+    CancelOverviewInteraction();
     _showingOverview = !_showingOverview;
+    ApplyChromePreferences();
     if (_showingOverview)
     {
       _webViewLayer.Visibility = Visibility.Collapsed;
       _startPageLayer.Visibility = Visibility.Collapsed;
-      PopulateTabOverview();
       _overviewLayer.Visibility = Visibility.Visible;
+      PopulateTabOverview();
+      Dispatcher.BeginInvoke(() =>
+      {
+        if (_showingOverview && _overviewLiftedCard is null)
+          LayoutOverviewCards(animate: false);
+      }, DispatcherPriority.Loaded);
       _overviewScale.ScaleX = 0.94;
       _overviewScale.ScaleY = 0.94;
       _overviewLayer.Opacity = 0;
@@ -1127,19 +1248,24 @@ internal sealed partial class SafariBrowserWindow : Window
     mgrChip.Margin = new Thickness(6, 0, 2, 0);
     _favoritesBarPanel.Children.Add(mgrChip);
 
-    _favoritesBarHost.Visibility = _preferences.ShowFavoritesBar && (_bookmarks.Items.Count > 0 || _bookmarks.Folders.Count > 0)
+    _favoritesBarHost.Visibility = !_showingOverview &&
+        _preferences.ShowFavoritesBar &&
+        (_bookmarks.Items.Count > 0 || _bookmarks.Folders.Count > 0)
         ? Visibility.Visible
         : Visibility.Collapsed;
   }
 
-  private string? _draggingTabId;
-
   private void PopulateTabStrip()
   {
+    _activeStripDrag = null;
+    _stripLogicalOrder = null;
+    _stripDragMoved = false;
+    _stripDragReordered = false;
+    _tabStripItems.Clear();
     _tabStripPanel.Children.Clear();
+
     var tabs = VisibleTabs();
-    // macOS 27 Safari collapses the separate tab bar on a single-tab Start Page for clean visual breathing room.
-    if (tabs.Count == 1 && tabs[0].Url == "about:blank")
+    if (!ShouldShowTabStrip())
     {
       _tabStripHost.Visibility = Visibility.Collapsed;
       return;
@@ -1149,24 +1275,33 @@ internal sealed partial class SafariBrowserWindow : Window
 
     foreach (var tab in tabs)
     {
-      var isActive = tab.Id == _state.ActiveTabId;
+      var currentTab = tab;
+      var isActive = currentTab.Id == _state.ActiveTabId;
       var idleColor = isActive ? SafariTheme.ActiveTabFillColor : Color.FromArgb(0, 44, 47, 57);
       var hoverColor = isActive ? SafariTheme.CapsuleHoverColor : SafariTheme.InactiveTabHoverColor;
       var bg = new SolidColorBrush(idleColor);
+      var translate = new TranslateTransform(0, 0);
 
       var inner = new Grid();
       inner.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
       inner.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
       inner.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
 
-      UIElement iconEl;
-      if (_tabFavicons.TryGetValue(tab.Id, out var favImg))
+      var leadingIcons = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center };
+      if (currentTab.IsPinned)
       {
-        iconEl = new Image { Source = favImg, Width = 14, Height = 14, Margin = new Thickness(0, 0, 7, 0), VerticalAlignment = VerticalAlignment.Center };
+        var pinBadge = SafariIcons.Create(SafariIcon.Pin, 11, SafariTheme.Accent, 1.8);
+        if (pinBadge is FrameworkElement fePin) fePin.Margin = new Thickness(0, 0, 5, 0);
+        leadingIcons.Children.Add(pinBadge);
+      }
+
+      if (_tabFavicons.TryGetValue(currentTab.Id, out var favImg))
+      {
+        leadingIcons.Children.Add(new Image { Source = favImg, Width = 14, Height = 14, Margin = new Thickness(0, 0, 7, 0), VerticalAlignment = VerticalAlignment.Center });
       }
       else
       {
-        iconEl = new Border
+        leadingIcons.Children.Add(new Border
         {
           Width = 8,
           Height = 8,
@@ -1174,14 +1309,14 @@ internal sealed partial class SafariBrowserWindow : Window
           Background = isActive ? SafariTheme.Accent : SafariTheme.TextMuted,
           Margin = new Thickness(2, 0, 8, 0),
           VerticalAlignment = VerticalAlignment.Center,
-        };
+        });
       }
-      Grid.SetColumn(iconEl, 0);
-      inner.Children.Add(iconEl);
+      Grid.SetColumn(leadingIcons, 0);
+      inner.Children.Add(leadingIcons);
 
       var titleText = new TextBlock
       {
-        Text = string.IsNullOrWhiteSpace(tab.Title) ? "새 탭" : tab.Title,
+        Text = string.IsNullOrWhiteSpace(currentTab.Title) ? "새 탭" : currentTab.Title,
         FontSize = 12,
         FontWeight = isActive ? FontWeights.SemiBold : FontWeights.Normal,
         Foreground = isActive ? SafariTheme.TextPrimary : SafariTheme.TextSecondary,
@@ -1193,18 +1328,18 @@ internal sealed partial class SafariBrowserWindow : Window
 
       var closeBtn = SafariTheme.CreateGlassButton(
           SafariIcons.Create(SafariIcon.Close, 9.5, SafariTheme.TextSecondary, 1.9),
-          () => _ = CloseTabAsync(tab.Id),
+          () => _ = CloseTabAsync(currentTab.Id),
           "탭 닫기 (Ctrl+W)",
           18, 18, 9);
-      closeBtn.Opacity = isActive ? 0.85 : 0;
+      closeBtn.Opacity = isActive && !currentTab.IsPinned ? 0.85 : 0;
       closeBtn.Margin = new Thickness(4, 0, 0, 0);
       Grid.SetColumn(closeBtn, 2);
       inner.Children.Add(closeBtn);
 
       var pill = new Border
       {
-        MinWidth = 124,
-        MaxWidth = 228,
+        MinWidth = currentTab.IsPinned ? 94 : 124,
+        MaxWidth = currentTab.IsPinned ? 156 : 228,
         Height = 30,
         CornerRadius = new CornerRadius(11),
         Background = bg,
@@ -1213,77 +1348,175 @@ internal sealed partial class SafariBrowserWindow : Window
         Padding = new Thickness(10, 0, 6, 0),
         Margin = new Thickness(2, 0, 2, 0),
         Cursor = Cursors.Hand,
-        AllowDrop = true,
-        ToolTip = $"{tab.Title}\n{tab.Url}",
+        RenderTransform = translate,
+        ToolTip = currentTab.IsPinned ? $"[고정됨] {currentTab.Title}\n{currentTab.Url}" : $"{currentTab.Title}\n{currentTab.Url}",
         Child = inner,
       };
+      WindowChrome.SetIsHitTestVisibleInChrome(pill, true);
       if (isActive)
       {
         pill.Effect = SafariTheme.GlassShadow(10, 0.25, 2);
         activePill = pill;
       }
 
-      Point? pressOrigin = null;
+      var entry = new TabStripDragItem
+      {
+        Tab = currentTab,
+        Pill = pill,
+        Translate = translate,
+        IsActive = isActive,
+      };
+      _tabStripItems.Add(entry);
+
       pill.MouseEnter += (_, _) =>
       {
+        if (_activeStripDrag is not null) return;
         SafariTheme.AnimateColor(bg, hoverColor, 100);
         SafariTheme.AnimateDouble(closeBtn, OpacityProperty, 0.95, 100);
       };
       pill.MouseLeave += (_, _) =>
       {
+        if (_activeStripDrag is not null) return;
         SafariTheme.AnimateColor(bg, idleColor, 140);
-        if (!isActive) SafariTheme.AnimateDouble(closeBtn, OpacityProperty, 0, 120);
+        if (!isActive || currentTab.IsPinned) SafariTheme.AnimateDouble(closeBtn, OpacityProperty, 0, 120);
       };
-      pill.PreviewMouseLeftButtonDown += (_, e) => pressOrigin = e.GetPosition(pill);
+      pill.MouseLeftButtonDown += (_, e) =>
+      {
+        if (IsDescendantOf(e.OriginalSource, closeBtn)) return;
+        e.Handled = true;
+        _activeStripDrag = entry;
+        _stripDragMoved = false;
+        _stripDragReordered = false;
+        _stripPressPanelPos = e.GetPosition(_tabStripPanel);
+
+        double x = 0;
+        foreach (var item in _tabStripItems)
+        {
+          item.HomeLeft = x;
+          item.SlotWidth = Math.Max(1, item.Pill.ActualWidth + item.Pill.Margin.Left + item.Pill.Margin.Right);
+          item.TargetTranslateX = 0;
+          x += item.SlotWidth;
+        }
+        _stripGrabOffsetX = _stripPressPanelPos.X - entry.HomeLeft;
+        _stripLogicalOrder = new List<TabStripDragItem>(_tabStripItems);
+        pill.CaptureMouse();
+      };
       pill.MouseMove += (_, e) =>
       {
-        if (e.LeftButton == MouseButtonState.Pressed && pressOrigin is { } origin)
+        if (!ReferenceEquals(_activeStripDrag, entry) || e.LeftButton != MouseButtonState.Pressed || _stripLogicalOrder is null)
+          return;
+
+        var curPos = e.GetPosition(_tabStripPanel);
+        if (!_stripDragMoved)
         {
-          var delta = e.GetPosition(pill) - origin;
-          if (Math.Abs(delta.X) > 10)
+          if (Math.Abs(curPos.X - _stripPressPanelPos.X) < 5) return;
+          _stripDragMoved = true;
+          Panel.SetZIndex(pill, 100);
+          pill.Effect = SafariTheme.GlassShadow(16, 0.44, 4);
+          pill.BorderBrush = SafariTheme.Accent;
+          SafariTheme.AnimateColor(bg, isActive ? SafariTheme.CapsuleHoverColor : SafariTheme.ActiveTabFillColor, 110);
+        }
+
+        // Compute group bounds (pinned tabs stay in pinned zone, unpinned stay in unpinned zone)
+        var pinnedCount = _stripLogicalOrder.Count(i => i.Tab.IsPinned);
+        var minIdx = currentTab.IsPinned ? 0 : pinnedCount;
+        var maxIdx = currentTab.IsPinned ? pinnedCount - 1 : _stripLogicalOrder.Count - 1;
+        if (maxIdx < minIdx) return;
+
+        double minLeft = 0;
+        for (var i = 0; i < minIdx; i++) minLeft += _stripLogicalOrder[i].SlotWidth;
+        double maxRight = minLeft;
+        for (var i = minIdx; i <= maxIdx; i++) maxRight += _stripLogicalOrder[i].SlotWidth;
+
+        var desiredLeft = Math.Clamp(curPos.X - _stripGrabOffsetX, minLeft, Math.Max(minLeft, maxRight - entry.SlotWidth));
+        translate.BeginAnimation(TranslateTransform.XProperty, null);
+        translate.X = desiredLeft - entry.HomeLeft;
+
+        // Live animated neighbor swap using exact midpoint + 6px hysteresis deadband
+        var draggedCenterX = desiredLeft + entry.SlotWidth * 0.5;
+        var swapped = false;
+        while (true)
+        {
+          var curIdx = _stripLogicalOrder.IndexOf(entry);
+          if (curIdx < 0) break;
+          double slotLeft = 0;
+          for (var i = 0; i < curIdx; i++) slotLeft += _stripLogicalOrder[i].SlotWidth;
+
+          if (curIdx < maxIdx)
           {
-            pressOrigin = null;
-            _draggingTabId = tab.Id;
-            DragDrop.DoDragDrop(pill, tab.Id, System.Windows.DragDropEffects.Move);
-            _draggingTabId = null;
+            var rightNeighbor = _stripLogicalOrder[curIdx + 1];
+            var rightThreshold = slotLeft + (entry.SlotWidth + rightNeighbor.SlotWidth) * 0.5 + 6.0;
+            if (draggedCenterX > rightThreshold)
+            {
+              _stripLogicalOrder[curIdx] = rightNeighbor;
+              _stripLogicalOrder[curIdx + 1] = entry;
+              swapped = true;
+              continue;
+            }
           }
+          if (curIdx > minIdx)
+          {
+            var leftNeighbor = _stripLogicalOrder[curIdx - 1];
+            var leftThreshold = slotLeft + (entry.SlotWidth - leftNeighbor.SlotWidth) * 0.5 - 6.0;
+            if (draggedCenterX < leftThreshold)
+            {
+              _stripLogicalOrder[curIdx] = leftNeighbor;
+              _stripLogicalOrder[curIdx - 1] = entry;
+              swapped = true;
+              continue;
+            }
+          }
+          break;
         }
-      };
-      pill.DragOver += (_, e) =>
-      {
-        if (_draggingTabId is not null && _draggingTabId != tab.Id)
+
+        if (swapped)
         {
-          e.Effects = System.Windows.DragDropEffects.Move;
-          e.Handled = true;
-        }
-      };
-      pill.Drop += (_, e) =>
-      {
-        if (_draggingTabId is { } srcId && srcId != tab.Id)
-        {
-          e.Handled = true;
-          ReorderTab(srcId, tab.Id);
+          _stripDragReordered = true;
+          AnimateTabStripNeighbors(_stripLogicalOrder, entry);
         }
       };
       pill.MouseLeftButtonUp += async (_, e) =>
       {
-        pressOrigin = null;
-        if (e.Handled) return;
+        if (!ReferenceEquals(_activeStripDrag, entry)) return;
         e.Handled = true;
-        await SelectTabAsync(tab.Id);
+        var moved = _stripDragMoved;
+        var order = _stripLogicalOrder;
+        var reordered = _stripDragReordered;
+        _activeStripDrag = null;
+        _stripLogicalOrder = null;
+        _stripDragMoved = false;
+        _stripDragReordered = false;
+        if (pill.IsMouseCaptured) pill.ReleaseMouseCapture();
+        if (moved)
+          FinishTabStripDrag(entry, order, reordered);
+        else
+          await SelectTabAsync(currentTab.Id);
+      };
+      pill.LostMouseCapture += (_, _) =>
+      {
+        if (!ReferenceEquals(_activeStripDrag, entry)) return;
+        var moved = _stripDragMoved;
+        var order = _stripLogicalOrder;
+        var reordered = _stripDragReordered;
+        _activeStripDrag = null;
+        _stripLogicalOrder = null;
+        _stripDragMoved = false;
+        _stripDragReordered = false;
+        if (moved)
+          FinishTabStripDrag(entry, order, reordered);
       };
       pill.MouseDown += async (_, e) =>
       {
         if (e.ChangedButton == MouseButton.Middle)
         {
           e.Handled = true;
-          await CloseTabAsync(tab.Id);
+          await CloseTabAsync(currentTab.Id);
         }
       };
       pill.MouseRightButtonUp += (_, e) =>
       {
         e.Handled = true;
-        ShowTabContextPopup(pill, tab);
+        ShowTabContextPopup(pill, currentTab);
       };
       _tabStripPanel.Children.Add(pill);
     }
@@ -1291,25 +1524,116 @@ internal sealed partial class SafariBrowserWindow : Window
     // Inline subtle "+" button right after the last tab
     var plusTab = SafariTheme.CreateGlassButton(SafariIcons.Create(SafariIcon.Plus, 13.5, SafariTheme.TextSecondary), () => _ = CreateTabAsync(), "새 탭 (Ctrl+T)", 28, 28, 10);
     plusTab.Margin = new Thickness(4, 0, 2, 0);
+    WindowChrome.SetIsHitTestVisibleInChrome(plusTab, true);
     _tabStripPanel.Children.Add(plusTab);
 
     if (activePill is not null)
       Dispatcher.BeginInvoke(() => activePill.BringIntoView(), DispatcherPriority.Loaded);
   }
 
-  private void ReorderTab(string sourceTabId, string targetTabId)
+  private static void AnimateTabStripNeighbors(List<TabStripDragItem> logicalOrder, TabStripDragItem dragged)
   {
-    var srcIdx = _state.Tabs.FindIndex(t => t.Id == sourceTabId);
-    var dstIdx = _state.Tabs.FindIndex(t => t.Id == targetTabId);
-    if (srcIdx < 0 || dstIdx < 0 || srcIdx == dstIdx) return;
-    var item = _state.Tabs[srcIdx];
-    _state.Tabs.RemoveAt(srcIdx);
-    _state.Tabs.Insert(dstIdx, item);
+    double x = 0;
+    foreach (var item in logicalOrder)
+    {
+      var targetTranslateX = x - item.HomeLeft;
+      x += item.SlotWidth;
+      if (ReferenceEquals(item, dragged)) continue;
+      if (Math.Abs(targetTranslateX - item.TargetTranslateX) > 0.5)
+      {
+        item.TargetTranslateX = targetTranslateX;
+        var anim = new DoubleAnimation(targetTranslateX, TimeSpan.FromMilliseconds(175))
+        {
+          EasingFunction = new CubicEase { EasingMode = EasingMode.EaseOut },
+        };
+        item.Translate.BeginAnimation(TranslateTransform.XProperty, anim);
+      }
+    }
+  }
+
+  private void FinishTabStripDrag(TabStripDragItem dragged, List<TabStripDragItem>? order, bool reordered)
+  {
+    if (order is null)
+    {
+      PopulateTabStrip();
+      return;
+    }
+
+    double targetLeft = 0;
+    foreach (var item in order)
+    {
+      if (ReferenceEquals(item, dragged)) break;
+      targetLeft += item.SlotWidth;
+    }
+
+    var finalTranslateX = targetLeft - dragged.HomeLeft;
+    var finalIds = order.Select(i => i.Tab.Id).ToList();
+    var settleAnim = new DoubleAnimation(finalTranslateX, TimeSpan.FromMilliseconds(145))
+    {
+      EasingFunction = new CubicEase { EasingMode = EasingMode.EaseOut },
+    };
+    settleAnim.Completed += (_, _) =>
+    {
+      Panel.SetZIndex(dragged.Pill, 0);
+      if (reordered) CommitVisibleTabOrder(finalIds);
+      PopulateTabStrip();
+      if (_sidebarOpen) PopulateSidebar();
+    };
+    dragged.Translate.BeginAnimation(TranslateTransform.XProperty, settleAnim);
+  }
+
+  private void CommitVisibleTabOrder(IReadOnlyList<string> orderedVisibleIds)
+  {
+    var visibleIndices = new List<int>();
+    var visibleById = new Dictionary<string, TabEntry>(StringComparer.Ordinal);
+    for (var i = 0; i < _state.Tabs.Count; i++)
+    {
+      var t = _state.Tabs[i];
+      if (t.ProfileId == _state.ActiveProfileId && t.GroupId == _state.ActiveGroupId)
+      {
+        visibleIndices.Add(i);
+        visibleById[t.Id] = t;
+      }
+    }
+    if (visibleIndices.Count != orderedVisibleIds.Count) return;
+
+    var changed = false;
+    for (var k = 0; k < orderedVisibleIds.Count; k++)
+    {
+      if (!visibleById.TryGetValue(orderedVisibleIds[k], out var tab)) return;
+      var slotIdx = visibleIndices[k];
+      if (_state.Tabs[slotIdx].Id != tab.Id) changed = true;
+      _state.Tabs[slotIdx] = tab;
+    }
+    if (!changed) return;
+
     for (var i = 0; i < _state.Tabs.Count; i++)
       _state.Tabs[i] = _state.Tabs[i] with { Order = i };
     MarkLocalChange();
-    PopulateTabStrip();
-    if (_sidebarOpen) PopulateSidebar();
+  }
+
+  private void TogglePinTab(string tabId)
+  {
+    var idx = _state.Tabs.FindIndex(t => t.Id == tabId);
+    if (idx < 0) return;
+    _state.Tabs[idx] = _state.Tabs[idx] with { IsPinned = !_state.Tabs[idx].IsPinned };
+    var visible = VisibleTabs();
+    CommitVisibleTabOrder(visible.Select(t => t.Id).ToList());
+    MarkLocalChange();
+    RefreshWorkspaceUi();
+  }
+
+  private static bool IsDescendantOf(object? source, DependencyObject ancestor)
+  {
+    var cur = source as DependencyObject;
+    while (cur is not null)
+    {
+      if (ReferenceEquals(cur, ancestor)) return true;
+      cur = cur is Visual or System.Windows.Media.Media3D.Visual3D
+          ? VisualTreeHelper.GetParent(cur)
+          : LogicalTreeHelper.GetParent(cur);
+    }
+    return false;
   }
 
   private void PopulateSidebar()
@@ -1718,8 +2042,163 @@ internal sealed partial class SafariBrowserWindow : Window
     return card;
   }
 
+  private void CancelOverviewInteraction()
+  {
+    _overviewLongPressTimer.Stop();
+    if (_overviewPendingCard is { } pending && pending.Card.IsMouseCaptured)
+      pending.Card.ReleaseMouseCapture();
+    if (_overviewLiftedCard is { } lifted)
+      RestoreOverviewCardVisual(lifted);
+    _overviewPendingCard = null;
+    _overviewLiftedCard = null;
+    _overviewDraggedMoved = false;
+    _overviewDragChangedOrder = false;
+    _overviewPressCancelled = false;
+  }
+
+  private (int Cols, double StartX, double CanvasWidth, double CanvasHeight) GetOverviewGridMetrics(int count)
+  {
+    var availW = _overviewScroll.ViewportWidth > 80
+        ? _overviewScroll.ViewportWidth
+        : (_overviewScroll.ActualWidth > 80
+            ? _overviewScroll.ActualWidth
+            : Math.Max(640, ActualWidth - (_sidebarOpen ? SidebarExpandedWidth : 0)));
+    var cols = Math.Max(1, (int)Math.Floor((availW - OverviewPadX * 2 + OverviewCardGap) / (OverviewCardWidth + OverviewCardGap)));
+    var gridW = cols * OverviewCardWidth + Math.Max(0, cols - 1) * OverviewCardGap;
+    var startX = Math.Max(OverviewPadX, (availW - gridW) * 0.5);
+    var rows = count == 0 ? 1 : (count + cols - 1) / cols;
+    var canvasH = Math.Max(260, OverviewPadY * 2 + rows * OverviewCardHeight + Math.Max(0, rows - 1) * OverviewCardGap + 36);
+    var canvasW = Math.Max(availW, startX * 2 + gridW);
+    return (cols, startX, canvasW, canvasH);
+  }
+
+  private static (double X, double Y) GetOverviewSlot(int index, int cols, double startX)
+  {
+    var row = index / cols;
+    var col = index % cols;
+    return (startX + col * (OverviewCardWidth + OverviewCardGap), OverviewPadY + row * (OverviewCardHeight + OverviewCardGap));
+  }
+
+  private void LayoutOverviewCards(bool animate, OverviewCardEntry? skipEntry = null)
+  {
+    var (cols, startX, canvasW, canvasH) = GetOverviewGridMetrics(_overviewCards.Count);
+    _overviewCanvas.Width = canvasW;
+    _overviewCanvas.Height = canvasH;
+
+    for (var i = 0; i < _overviewCards.Count; i++)
+    {
+      var entry = _overviewCards[i];
+      var (slotX, slotY) = GetOverviewSlot(i, cols, startX);
+      if (ReferenceEquals(entry, skipEntry)) continue;
+
+      if (!animate)
+      {
+        entry.Translate.BeginAnimation(TranslateTransform.XProperty, null);
+        entry.Translate.BeginAnimation(TranslateTransform.YProperty, null);
+        entry.Translate.X = slotX;
+        entry.Translate.Y = slotY;
+        entry.TargetX = slotX;
+        entry.TargetY = slotY;
+      }
+      else if (Math.Abs(slotX - entry.TargetX) > 0.5 || Math.Abs(slotY - entry.TargetY) > 0.5)
+      {
+        entry.TargetX = slotX;
+        entry.TargetY = slotY;
+        var animX = new DoubleAnimation(slotX, TimeSpan.FromMilliseconds(220))
+        {
+          EasingFunction = new CubicEase { EasingMode = EasingMode.EaseOut },
+        };
+        var animY = new DoubleAnimation(slotY, TimeSpan.FromMilliseconds(220))
+        {
+          EasingFunction = new CubicEase { EasingMode = EasingMode.EaseOut },
+        };
+        entry.Translate.BeginAnimation(TranslateTransform.XProperty, animX);
+        entry.Translate.BeginAnimation(TranslateTransform.YProperty, animY);
+      }
+    }
+  }
+
+  private static void RestoreOverviewCardVisual(OverviewCardEntry entry)
+  {
+    SafariTheme.AnimateScale(entry.Scale, 1.0, 175);
+    SafariTheme.AnimateColor(entry.Background, SafariTheme.CardFillColor, 150);
+    entry.Card.BorderBrush = entry.IsActive ? SafariTheme.Accent : SafariTheme.SpecularBorder;
+    entry.Card.BorderThickness = new Thickness(entry.IsActive ? 2 : 1);
+    entry.Card.Effect = SafariTheme.GlassShadow(18, 0.4, 6);
+  }
+
+  private void OnOverviewLongPressTick(object? sender, EventArgs e)
+  {
+    _overviewLongPressTimer.Stop();
+    if (_overviewPendingCard is not { } entry || _overviewPressCancelled) return;
+    if (!entry.Card.IsMouseCaptured) return;
+
+    _overviewLiftedCard = entry;
+    _overviewDraggedMoved = false;
+    _overviewDragChangedOrder = false;
+
+    Panel.SetZIndex(entry.Card, 100);
+    entry.Card.BorderBrush = SafariTheme.Accent;
+    entry.Card.BorderThickness = new Thickness(2);
+    entry.Card.Effect = SafariTheme.GlassShadow(30, 0.62, 14);
+    SafariTheme.AnimateScale(entry.Scale, 1.06, 175);
+    SafariTheme.AnimateColor(entry.Background, SafariTheme.CardHoverColor, 140);
+  }
+
+  private void SettleLiftedOverviewCard(OverviewCardEntry entry, bool moved, bool changedOrder, bool openMenuIfUnmoved)
+  {
+    RestoreOverviewCardVisual(entry);
+
+    if (moved)
+    {
+      var (cols, startX, _, _) = GetOverviewGridMetrics(_overviewCards.Count);
+      var idx = _overviewCards.IndexOf(entry);
+      if (idx >= 0)
+      {
+        var (slotX, slotY) = GetOverviewSlot(idx, cols, startX);
+        entry.TargetX = slotX;
+        entry.TargetY = slotY;
+        var animX = new DoubleAnimation(slotX, TimeSpan.FromMilliseconds(185))
+        {
+          EasingFunction = new CubicEase { EasingMode = EasingMode.EaseOut },
+        };
+        var animY = new DoubleAnimation(slotY, TimeSpan.FromMilliseconds(185))
+        {
+          EasingFunction = new CubicEase { EasingMode = EasingMode.EaseOut },
+        };
+        animX.Completed += (_, _) => Panel.SetZIndex(entry.Card, 0);
+        entry.Translate.BeginAnimation(TranslateTransform.XProperty, animX);
+        entry.Translate.BeginAnimation(TranslateTransform.YProperty, animY);
+      }
+      else
+      {
+        Panel.SetZIndex(entry.Card, 0);
+      }
+
+      if (changedOrder && string.IsNullOrWhiteSpace(_overviewSearchBox.Text))
+      {
+        CommitVisibleTabOrder(_overviewCards.Select(c => c.Tab.Id).ToList());
+        PopulateTabStrip();
+        if (_sidebarOpen) PopulateSidebar();
+      }
+    }
+    else
+    {
+      Panel.SetZIndex(entry.Card, 0);
+      if (openMenuIfUnmoved)
+      {
+        Dispatcher.BeginInvoke(() =>
+        {
+          if (_showingOverview && _overviewCards.Contains(entry))
+            ShowTabContextPopup(entry.Card, entry.Tab);
+        }, DispatcherPriority.Input);
+      }
+    }
+  }
+
   private void PopulateTabOverview()
   {
+    CancelOverviewInteraction();
     _overviewGroupPills.Children.Clear();
     void AddGroupPill(string label, string? groupId)
     {
@@ -1738,7 +2217,8 @@ internal sealed partial class SafariBrowserWindow : Window
     foreach (var g in _state.Groups.Where(g => g.ProfileId == _state.ActiveProfileId && g.Id != PrivateGroupId))
       AddGroupPill(g.Name, g.Id);
 
-    _overviewGrid.Children.Clear();
+    _overviewCards.Clear();
+    _overviewCanvas.Children.Clear();
     var query = _overviewSearchBox.Text.Trim();
     var tabs = VisibleTabs()
         .Where(t => string.IsNullOrEmpty(query) ||
@@ -1748,8 +2228,13 @@ internal sealed partial class SafariBrowserWindow : Window
 
     foreach (var tab in tabs)
     {
-      var isActive = tab.Id == _state.ActiveTabId;
+      var currentTab = tab;
+      var isActive = currentTab.Id == _state.ActiveTabId;
       var scale = new ScaleTransform(1, 1);
+      var translate = new TranslateTransform(0, 0);
+      var transforms = new TransformGroup();
+      transforms.Children.Add(scale);
+      transforms.Children.Add(translate);
       var cardBg = new SolidColorBrush(SafariTheme.CardFillColor);
 
       var cardGrid = new Grid();
@@ -1758,12 +2243,21 @@ internal sealed partial class SafariBrowserWindow : Window
 
       // Card Header
       var topBar = new DockPanel { Margin = new Thickness(10, 0, 6, 0), VerticalAlignment = VerticalAlignment.Center };
-      var closeCardBtn = SafariTheme.CreateGlassButton(SafariIcons.Create(SafariIcon.Close, 10, SafariTheme.TextSecondary, 1.9), () => { _ = CloseTabAsync(tab.Id); }, "탭 닫기", 22, 22, 11);
+      var closeCardBtn = SafariTheme.CreateGlassButton(SafariIcons.Create(SafariIcon.Close, 10, SafariTheme.TextSecondary, 1.9), () => { _ = CloseTabAsync(currentTab.Id); }, "탭 닫기", 22, 22, 11);
       DockPanel.SetDock(closeCardBtn, Dock.Right);
       topBar.Children.Add(closeCardBtn);
+
+      if (currentTab.IsPinned)
+      {
+        var pinIcon = SafariIcons.Create(SafariIcon.Pin, 11.5, SafariTheme.Accent, 1.85);
+        if (pinIcon is FrameworkElement fePin) fePin.Margin = new Thickness(0, 0, 6, 0);
+        DockPanel.SetDock(pinIcon, Dock.Left);
+        topBar.Children.Add(pinIcon);
+      }
+
       topBar.Children.Add(new TextBlock
       {
-        Text = string.IsNullOrWhiteSpace(tab.Title) ? "새 탭" : tab.Title,
+        Text = string.IsNullOrWhiteSpace(currentTab.Title) ? "새 탭" : currentTab.Title,
         FontSize = 12,
         FontWeight = FontWeights.SemiBold,
         Foreground = SafariTheme.TextPrimary,
@@ -1775,7 +2269,7 @@ internal sealed partial class SafariBrowserWindow : Window
 
       // Preview Surface
       UIElement previewContent;
-      if (_thumbnails.TryGetValue(tab.Id, out var thumb))
+      if (_thumbnails.TryGetValue(currentTab.Id, out var thumb))
       {
         previewContent = new Image { Source = thumb, Stretch = Stretch.UniformToFill };
       }
@@ -1790,7 +2284,7 @@ internal sealed partial class SafariBrowserWindow : Window
             SafariIcons.Create(SafariIcon.Globe, 28, SafariTheme.TextMuted, 1.4),
             new TextBlock
             {
-              Text = HostName(tab.Url),
+              Text = HostName(currentTab.Url),
               FontSize = 11.5,
               Foreground = SafariTheme.TextMuted,
               HorizontalAlignment = HorizontalAlignment.Center,
@@ -1812,9 +2306,8 @@ internal sealed partial class SafariBrowserWindow : Window
 
       var card = new Border
       {
-        Width = 264,
-        Height = 192,
-        Margin = new Thickness(8),
+        Width = OverviewCardWidth,
+        Height = OverviewCardHeight,
         CornerRadius = new CornerRadius(15),
         Background = cardBg,
         BorderBrush = isActive ? SafariTheme.Accent : SafariTheme.SpecularBorder,
@@ -1822,29 +2315,182 @@ internal sealed partial class SafariBrowserWindow : Window
         Effect = SafariTheme.GlassShadow(18, 0.4, 6),
         Cursor = Cursors.Hand,
         RenderTransformOrigin = new Point(0.5, 0.5),
-        RenderTransform = scale,
+        RenderTransform = transforms,
+        ToolTip = "클릭: 탭 열기 · 길게 누르기: 순서 이동 / 메뉴",
         Child = cardGrid,
       };
+      Canvas.SetLeft(card, 0);
+      Canvas.SetTop(card, 0);
+
+      var entry = new OverviewCardEntry
+      {
+        Tab = currentTab,
+        Card = card,
+        Background = cardBg,
+        Scale = scale,
+        Translate = translate,
+        IsActive = isActive,
+      };
+      _overviewCards.Add(entry);
+      _overviewCanvas.Children.Add(card);
+
       card.MouseEnter += (_, _) =>
       {
-        SafariTheme.AnimateScale(scale, 1.03, 130);
+        if (_overviewPendingCard is not null || _overviewLiftedCard is not null) return;
+        SafariTheme.AnimateScale(scale, 1.025, 130);
         SafariTheme.AnimateColor(cardBg, SafariTheme.CardHoverColor, 110);
       };
       card.MouseLeave += (_, _) =>
       {
+        if (_overviewPendingCard is not null || _overviewLiftedCard is not null) return;
         SafariTheme.AnimateScale(scale, 1.0, 150);
         SafariTheme.AnimateColor(cardBg, SafariTheme.CardFillColor, 140);
       };
+      card.MouseLeftButtonDown += (_, e) =>
+      {
+        if (IsDescendantOf(e.OriginalSource, closeCardBtn)) return;
+        e.Handled = true;
+        ClosePopup();
+        _overviewLongPressTimer.Stop();
+        _overviewPendingCard = entry;
+        _overviewLiftedCard = null;
+        _overviewDraggedMoved = false;
+        _overviewDragChangedOrder = false;
+        _overviewPressCancelled = false;
+        _overviewPressCanvasPos = e.GetPosition(_overviewCanvas);
+        _overviewGrabOffsetX = _overviewPressCanvasPos.X - entry.TargetX;
+        _overviewGrabOffsetY = _overviewPressCanvasPos.Y - entry.TargetY;
+        SafariTheme.AnimateScale(scale, 0.985, 85);
+        card.CaptureMouse();
+        _overviewLongPressTimer.Start();
+      };
+      card.MouseMove += (_, e) =>
+      {
+        if (e.LeftButton != MouseButtonState.Pressed) return;
+
+        if (ReferenceEquals(_overviewLiftedCard, entry))
+        {
+          var pos = e.GetPosition(_overviewCanvas);
+          if (!_overviewDraggedMoved)
+          {
+            var dx = pos.X - _overviewPressCanvasPos.X;
+            var dy = pos.Y - _overviewPressCanvasPos.Y;
+            if (dx * dx + dy * dy <= 64) return;
+            _overviewDraggedMoved = true;
+          }
+
+          var desiredX = pos.X - _overviewGrabOffsetX;
+          var desiredY = pos.Y - _overviewGrabOffsetY;
+          translate.BeginAnimation(TranslateTransform.XProperty, null);
+          translate.BeginAnimation(TranslateTransform.YProperty, null);
+          translate.X = desiredX;
+          translate.Y = desiredY;
+
+          if (string.IsNullOrWhiteSpace(_overviewSearchBox.Text))
+          {
+            var (cols, startX, _, _) = GetOverviewGridMetrics(_overviewCards.Count);
+            var centerX = desiredX + OverviewCardWidth * 0.5;
+            var centerY = desiredY + OverviewCardHeight * 0.5;
+            var curIdx = _overviewCards.IndexOf(entry);
+            var targetIdx = -1;
+            for (var i = 0; i < _overviewCards.Count; i++)
+            {
+              if (_overviewCards[i].Tab.IsPinned != currentTab.IsPinned) continue;
+              var (sx, sy) = GetOverviewSlot(i, cols, startX);
+              var scx = sx + OverviewCardWidth * 0.5;
+              var scy = sy + OverviewCardHeight * 0.5;
+              if (Math.Abs(centerX - scx) <= OverviewCardWidth * 0.44 &&
+                  Math.Abs(centerY - scy) <= OverviewCardHeight * 0.44)
+              {
+                targetIdx = i;
+                break;
+              }
+            }
+            if (targetIdx >= 0 && targetIdx != curIdx && curIdx >= 0)
+            {
+              _overviewCards.RemoveAt(curIdx);
+              _overviewCards.Insert(targetIdx, entry);
+              _overviewDragChangedOrder = true;
+              LayoutOverviewCards(animate: true, skipEntry: entry);
+            }
+          }
+        }
+        else if (ReferenceEquals(_overviewPendingCard, entry) && !_overviewPressCancelled)
+        {
+          var pos = e.GetPosition(_overviewCanvas);
+          var dx = pos.X - _overviewPressCanvasPos.X;
+          var dy = pos.Y - _overviewPressCanvasPos.Y;
+          if (dx * dx + dy * dy > 144)
+          {
+            _overviewLongPressTimer.Stop();
+            _overviewPressCancelled = true;
+            SafariTheme.AnimateScale(scale, 1.0, 120);
+          }
+        }
+      };
       card.MouseLeftButtonUp += async (_, e) =>
       {
-        if (e.Handled) return;
+        if (!ReferenceEquals(_overviewPendingCard, entry) && !ReferenceEquals(_overviewLiftedCard, entry))
+          return;
         e.Handled = true;
-        _showingOverview = false;
-        _overviewLayer.Visibility = Visibility.Collapsed;
-        await SelectTabAsync(tab.Id);
+        _overviewLongPressTimer.Stop();
+        var wasLifted = ReferenceEquals(_overviewLiftedCard, entry);
+        var wasCancelled = _overviewPressCancelled;
+        var moved = _overviewDraggedMoved;
+        var changedOrder = _overviewDragChangedOrder;
+        _overviewPendingCard = null;
+        _overviewLiftedCard = null;
+        _overviewDraggedMoved = false;
+        _overviewDragChangedOrder = false;
+        _overviewPressCancelled = false;
+        if (card.IsMouseCaptured) card.ReleaseMouseCapture();
+
+        if (wasLifted)
+        {
+          SettleLiftedOverviewCard(entry, moved, changedOrder, openMenuIfUnmoved: true);
+        }
+        else
+        {
+          SafariTheme.AnimateScale(scale, 1.0, 110);
+          if (!wasCancelled)
+          {
+            _showingOverview = false;
+            _overviewLayer.Visibility = Visibility.Collapsed;
+            ApplyChromePreferences();
+            await SelectTabAsync(currentTab.Id);
+          }
+        }
       };
-      _overviewGrid.Children.Add(card);
+      card.LostMouseCapture += (_, _) =>
+      {
+        if (ReferenceEquals(_overviewLiftedCard, entry))
+        {
+          _overviewLongPressTimer.Stop();
+          var moved = _overviewDraggedMoved;
+          var changedOrder = _overviewDragChangedOrder;
+          _overviewPendingCard = null;
+          _overviewLiftedCard = null;
+          _overviewDraggedMoved = false;
+          _overviewDragChangedOrder = false;
+          _overviewPressCancelled = false;
+          SettleLiftedOverviewCard(entry, moved, changedOrder, openMenuIfUnmoved: false);
+        }
+        else if (ReferenceEquals(_overviewPendingCard, entry))
+        {
+          _overviewLongPressTimer.Stop();
+          _overviewPendingCard = null;
+          _overviewPressCancelled = false;
+          SafariTheme.AnimateScale(scale, 1.0, 110);
+        }
+      };
+      card.MouseRightButtonUp += (_, e) =>
+      {
+        e.Handled = true;
+        ShowTabContextPopup(card, currentTab);
+      };
     }
+
+    LayoutOverviewCards(animate: false);
   }
 
   private void ApplySurfaceMode()
@@ -2024,6 +2670,7 @@ internal sealed partial class SafariBrowserWindow : Window
 
   private List<TabEntry> VisibleTabs() => _state.Tabs
       .Where(t => t.ProfileId == _state.ActiveProfileId && t.GroupId == _state.ActiveGroupId)
+      .OrderByDescending(t => t.IsPinned)
       .ToList();
 
   private WpfWebView2? ActiveWebView() =>

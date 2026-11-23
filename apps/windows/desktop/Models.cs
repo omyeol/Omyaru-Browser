@@ -34,7 +34,8 @@ internal sealed record TabEntry(
     string ProfileId,
     string? GroupId,
     int Order = int.MaxValue,
-    string? ThumbnailBase64 = null)
+    string? ThumbnailBase64 = null,
+    bool IsPinned = false)
 {
   public override string ToString() => Title;
 }

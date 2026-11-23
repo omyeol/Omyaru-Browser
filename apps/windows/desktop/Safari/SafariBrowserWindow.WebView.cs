@@ -365,8 +365,10 @@ internal sealed partial class SafariBrowserWindow
       await CreateTabAsync(destination);
       return;
     }
+    var wasOverview = _showingOverview;
     _showingOverview = false;
     _overviewLayer.Visibility = Visibility.Collapsed;
+    if (wasOverview) ApplyChromePreferences();
     UpdateTab(_state.ActiveTabId, t => t with { Url = destination });
     if (!_addressInput.IsKeyboardFocusWithin)
       _addressInput.Text = DisplayAddress(destination);
@@ -402,8 +404,10 @@ internal sealed partial class SafariBrowserWindow
     var tab = new TabEntry(Guid.NewGuid().ToString("N"), url == "about:blank" ? "새 탭" : HostName(url), url, _state.ActiveProfileId, _state.ActiveGroupId);
     _state.Tabs.Add(tab);
     _state.ActiveTabId = tab.Id;
+    var wasOverview = _showingOverview;
     _showingOverview = false;
     _overviewLayer.Visibility = Visibility.Collapsed;
+    if (wasOverview) ApplyChromePreferences();
     MarkLocalChange();
     RefreshWorkspaceUi();
     await ActivateCurrentTabAsync();
@@ -848,11 +852,33 @@ internal sealed partial class SafariBrowserWindow
     var view = ActiveWebView();
     if (view?.CoreWebView2 is null) return false;
 
-    // 1. Verify Sidebar & Tab Overview GPU toggles cleanly
+    // 1. Verify Sidebar, Tab List (탭 목록) chrome isolation, and TabsAboveAddressBar layout switch
     ToggleSidebar();
     ToggleSidebar();
     ToggleTabOverview();
+    if (_favoritesBarHost.Visibility != Visibility.Collapsed ||
+        _tabStripHost.Visibility != Visibility.Collapsed ||
+        System.Windows.Controls.Grid.GetRow(_toolbarHost) != 0)
+      return false;
     ToggleTabOverview();
+
+    var prevTabsAbove = _preferences.TabsAboveAddressBar;
+    try
+    {
+      _preferences.TabsAboveAddressBar = true;
+      ApplyChromePreferences();
+      if (System.Windows.Controls.Grid.GetRow(_tabStripHost) != 0 || System.Windows.Controls.Grid.GetRow(_toolbarHost) != 1 || _tabStripHost.Visibility != Visibility.Visible)
+        return false;
+      _preferences.TabsAboveAddressBar = false;
+      ApplyChromePreferences();
+      if (System.Windows.Controls.Grid.GetRow(_toolbarHost) != 0 || System.Windows.Controls.Grid.GetRow(_tabStripHost) != 2)
+        return false;
+    }
+    finally
+    {
+      _preferences.TabsAboveAddressBar = prevTabsAbove;
+      ApplyChromePreferences();
+    }
 
     // 2. Verify Chrome MV3 + Firefox-metadata MV3 extension install/remove on real WebView2
     var profile = view.CoreWebView2.Profile;

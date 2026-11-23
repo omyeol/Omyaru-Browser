@@ -664,11 +664,12 @@ struct LiquidGlassTabCardContextPopover: View {
     var onDuplicate: () -> Void
     var onSelectTab: () -> Void
     var onMoveTab: () -> Void
+    var onCloseOtherTabs: () -> Void
     var onCloseTab: () -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            GlassMenuRow(title: "링크 복사하기", systemImage: "link") {
+            GlassMenuRow(title: "링크 복사하기", systemImage: "doc.on.doc") {
                 onCopyLink()
                 onDismiss()
             }
@@ -689,6 +690,15 @@ struct LiquidGlassTabCardContextPopover: View {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.14) { onMoveTab() }
             }
             Divider().background(Color.white.opacity(0.14))
+            GlassMenuRow(
+                title: "다른 탭 닫기",
+                systemImage: "xmark.circle",
+                iconColor: Color(red: 1.0, green: 0.42, blue: 0.42),
+                textColor: Color(red: 1.0, green: 0.46, blue: 0.46)
+            ) {
+                onCloseOtherTabs()
+                onDismiss()
+            }
             GlassMenuRow(
                 title: "탭 닫기",
                 systemImage: "xmark",

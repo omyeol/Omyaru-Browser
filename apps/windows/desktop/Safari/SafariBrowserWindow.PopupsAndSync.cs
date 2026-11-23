@@ -410,7 +410,7 @@ internal sealed partial class SafariBrowserWindow
     panel.Children.Add(SafariTheme.CreatePopoverRow(SafariIcon.Undo, "닫은 탭 다시 열기", () => { ClosePopup(); _ = ReopenClosedTabAsync(); }, "Ctrl+Shift+T"));
     panel.Children.Add(SafariTheme.CreatePopoverDivider());
     panel.Children.Add(SafariTheme.CreatePopoverRow(SafariIcon.Sidebar, _sidebarOpen ? "사이드바 숨기기" : "사이드바 표시", () => { ClosePopup(); ToggleSidebar(); }, "Ctrl+Shift+S"));
-    panel.Children.Add(SafariTheme.CreatePopoverRow(SafariIcon.TabOverview, "탭 모아보기", () => { ClosePopup(); ToggleTabOverview(); }, "Ctrl+Shift+O"));
+    panel.Children.Add(SafariTheme.CreatePopoverRow(SafariIcon.TabOverview, "탭 목록", () => { ClosePopup(); ToggleTabOverview(); }, "Ctrl+Shift+O"));
     panel.Children.Add(SafariTheme.CreatePopoverRow(SafariIcon.Bookshelf, "내장 책장 열기", () => ClosePopupThen(OpenBookshelfWindow)));
     panel.Children.Add(SafariTheme.CreatePopoverRow(SafariIcon.Sync, "Google Drive 동기화", () => ClosePopupThenAsync(ShowSyncDialogAsync)));
     panel.Children.Add(SafariTheme.CreatePopoverRow(SafariIcon.Extensions, "확장 프로그램 관리", () => ClosePopupThenAsync(ShowExtensionManagerAsync)));
@@ -425,17 +425,39 @@ internal sealed partial class SafariBrowserWindow
   private void ShowTabContextPopup(UIElement anchor, TabEntry tab)
   {
     var panel = new StackPanel();
+    if (!string.IsNullOrWhiteSpace(tab.Url) && !string.Equals(tab.Url, "about:blank", StringComparison.OrdinalIgnoreCase))
+    {
+      panel.Children.Add(SafariTheme.CreatePopoverRow(SafariIcon.Link, "링크 복사하기", () =>
+      {
+        ClosePopup();
+        try
+        {
+          System.Windows.Clipboard.SetText(tab.Url);
+          _syncStatus = "링크가 클립보드에 복사되었습니다.";
+          UpdateStatusText();
+        }
+        catch { }
+      }));
+    }
+    panel.Children.Add(SafariTheme.CreatePopoverRow(
+        tab.IsPinned ? SafariIcon.PinOff : SafariIcon.Pin,
+        tab.IsPinned ? "탭 고정 해제" : "탭 고정",
+        () =>
+        {
+          ClosePopup();
+          TogglePinTab(tab.Id);
+        }));
     panel.Children.Add(SafariTheme.CreatePopoverRow(SafariIcon.Duplicate, "탭 복제", () => { ClosePopup(); _ = DuplicateTabAsync(tab.Id); }));
     panel.Children.Add(SafariTheme.CreatePopoverRow(SafariIcon.Undo, "닫은 탭 다시 열기", () => { ClosePopup(); _ = ReopenClosedTabAsync(); }));
+    panel.Children.Add(SafariTheme.CreatePopoverDivider());
     panel.Children.Add(SafariTheme.CreatePopoverRow(SafariIcon.Close, "다른 탭 모두 닫기", () =>
     {
       ClosePopup();
-      foreach (var other in VisibleTabs().Where(t => t.Id != tab.Id).ToArray())
+      foreach (var other in VisibleTabs().Where(t => t.Id != tab.Id && !t.IsPinned).ToArray())
         _ = CloseTabAsync(other.Id);
     }));
-    panel.Children.Add(SafariTheme.CreatePopoverDivider());
     panel.Children.Add(SafariTheme.CreatePopoverRow(SafariIcon.Trash, "이 탭 닫기", () => { ClosePopup(); _ = CloseTabAsync(tab.Id); }, isDestructive: true));
-    ShowGlassPopup(anchor, panel, 210, 260);
+    ShowGlassPopup(anchor, panel, 224, 300);
   }
 
   private void ShowGroupContextPopup(UIElement anchor, TabGroupEntry group)
@@ -707,8 +729,9 @@ internal sealed partial class SafariBrowserWindow
         {
           _preferences = updated;
           DesktopPreferencesStore.Save(_preferences);
-          ApplyChromePreferences();
           PopulateFavoritesBar();
+          PopulateTabStrip();
+          ApplyChromePreferences();
           if (!_addressInput.IsKeyboardFocusWithin)
             _addressInput.Text = DisplayAddress(ActiveTab()?.Url ?? "about:blank");
         },

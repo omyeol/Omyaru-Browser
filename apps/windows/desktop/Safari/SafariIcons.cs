@@ -57,6 +57,8 @@ internal enum SafariIcon
   FolderPlus,
   Sort,
   MoreVertical,
+  Pin,
+  PinOff,
 }
 
 /// <summary>
@@ -349,6 +351,14 @@ internal static class SafariIcons
         Circle(12, 6.2, 1.5, filled: true);
         Circle(12, 12, 1.5, filled: true);
         Circle(12, 17.8, 1.5, filled: true);
+        break;
+
+      case SafariIcon.Pin:
+        Stroke("M 14.8,4.2 L 19.8,9.2 M 15.6,5.0 L 11.4,9.2 L 7.4,9.8 L 14.2,16.6 L 14.8,12.6 L 19.0,8.4 M 10.6,13.4 L 5.2,18.8", 1.55);
+        break;
+
+      case SafariIcon.PinOff:
+        Stroke("M 4.5,4.5 L 19.5,19.5 M 14.8,4.2 L 19.8,9.2 M 15.6,5.0 L 12.6,8.0 M 19.0,8.4 L 15.2,12.2 M 10.6,13.4 L 5.2,18.8", 1.55);
         break;
     }
 

@@ -1203,6 +1203,13 @@ struct PageToolsSheet: View {
 
 // MARK: - iOS 26 Safari Liquid Glass Fullscreen Tab Overview (Exact Reference Video 00:01, 00:11-00:26!)
 
+private struct TabCardFramePreferenceKey: PreferenceKey {
+    static var defaultValue: [UUID: CGRect] = [:]
+    static func reduce(value: inout [UUID: CGRect], nextValue: () -> [UUID: CGRect]) {
+        value.merge(nextValue(), uniquingKeysWith: { _, new in new })
+    }
+}
+
 struct TabOverview: View {
     @EnvironmentObject private var model: BrowserModel
     var onDismiss: () -> Void
@@ -1223,6 +1230,12 @@ struct TabOverview: View {
     @State private var batchMoveIDs: Set<UUID> = []
     @State private var showingCloseAllConfirm = false
     @State private var draggingTabID: UUID? = nil
+    @State private var dragPointerLocation: CGPoint? = nil
+    @State private var dragGrabOffset: CGSize = .zero
+    @State private var dragStartLocation: CGPoint? = nil
+    @State private var dragMovedBeyondThreshold = false
+    @State private var lastSwapTimestamp: TimeInterval = 0
+    @State private var tabFrames: [UUID: CGRect] = [:]
     @FocusState private var searchFieldFocused: Bool
 
     private func displayedTabs(for groupID: UUID) -> [BrowserTab] {
@@ -1264,6 +1277,7 @@ struct TabOverview: View {
                     }
                 }
                 .tabViewStyle(.page(indexDisplayMode: .never))
+                .scrollDisabled(draggingTabID != nil)
                 .animation(.spring(response: 0.34, dampingFraction: 0.86), value: pagedGroupID)
 
                 liquidGlassBottomCarouselBar
@@ -1386,6 +1400,11 @@ struct TabOverview: View {
                             onMoveTab: {
                                 batchMoveIDs = [targetTab.id]
                                 showingBatchMove = true
+                            },
+                            onCloseOtherTabs: {
+                                withAnimation(.spring(response: 0.28, dampingFraction: 0.82)) {
+                                    model.closeOtherTabs(keeping: targetTab.id)
+                                }
                             },
                             onCloseTab: {
                                 withAnimation(.spring(response: 0.28, dampingFraction: 0.82)) {
@@ -1584,6 +1603,7 @@ struct TabOverview: View {
                                     ForEach(groupTabs) { tab in
                                         safariTabCard(tab: tab, cardHeight: thumbHeight, isHeroSingle: false, outerGeo: outerGeo, scrollProxy: proxy, groupTabs: groupTabs)
                                             .id(tab.id)
+                                            .zIndex(draggingTabID == tab.id ? 100 : 0)
                                             .transition(.asymmetric(
                                                 insertion: .scale(scale: 0.90).combined(with: .opacity),
                                                 removal: .scale(scale: 0.72).combined(with: .opacity)
@@ -1592,12 +1612,19 @@ struct TabOverview: View {
                                 }
                                 .padding(.horizontal, 14)
                                 .padding(.bottom, 16)
-                                .animation(.spring(response: 0.30, dampingFraction: 0.82), value: groupTabs.map(\.id))
+                                .animation(.spring(response: 0.32, dampingFraction: 0.78), value: groupTabs.map(\.id))
                             }
                             .frame(minHeight: max(0, outerGeo.size.height - (headerTitle == nil ? 12 : 54)))
                         }
                     }
                     .padding(.bottom, 12)
+                }
+                .scrollDisabled(draggingTabID != nil)
+                .coordinateSpace(name: "tabGridSpace")
+                .onPreferenceChange(TabCardFramePreferenceKey.self) { frames in
+                    for (id, rect) in frames {
+                        tabFrames[id] = rect
+                    }
                 }
             }
         }
@@ -1616,6 +1643,17 @@ struct TabOverview: View {
         let isSelected = selectedTabIDs.contains(tab.id)
         let host = URL(string: tab.url)?.host?.replacingOccurrences(of: "^www\\.", with: "", options: .regularExpression)
         let cardLabel = tab.title.isEmpty || tab.title == "새 탭" ? (host ?? "새 탭") : tab.title
+
+        let isDraggingThis = draggingTabID == tab.id
+        let dragOffset: CGSize = {
+            guard isDraggingThis,
+                  let pointer = dragPointerLocation,
+                  let frame = tabFrames[tab.id] else { return .zero }
+            return CGSize(
+                width: (pointer.x - dragGrabOffset.width) - frame.midX,
+                height: (pointer.y - dragGrabOffset.height) - frame.midY
+            )
+        }()
 
         return VStack(spacing: 7) {
             ZStack(alignment: .topTrailing) {
@@ -1642,13 +1680,19 @@ struct TabOverview: View {
                 .overlay(
                     RoundedRectangle(cornerRadius: isHeroSingle ? 22 : 18, style: .continuous)
                         .strokeBorder(
-                            (selectionMode && isSelected)
-                                ? Color(red: 0.20, green: 0.56, blue: 1.0)
-                                : (isActive ? Color.white.opacity(0.55) : Color.white.opacity(0.14)),
-                            lineWidth: (isActive || (selectionMode && isSelected)) ? 2.0 : 0.9
+                            isDraggingThis
+                                ? Color.white.opacity(0.72)
+                                : (selectionMode && isSelected)
+                                    ? Color(red: 0.20, green: 0.56, blue: 1.0)
+                                    : (isActive ? Color.white.opacity(0.55) : Color.white.opacity(0.14)),
+                            lineWidth: (isDraggingThis || isActive || (selectionMode && isSelected)) ? 2.0 : 0.9
                         )
                 )
-                .shadow(color: .black.opacity(0.40), radius: isHeroSingle ? 18 : 10, y: 6)
+                .shadow(
+                    color: .black.opacity(isDraggingThis ? 0.62 : 0.40),
+                    radius: isDraggingThis ? 26 : (isHeroSingle ? 18 : 10),
+                    y: isDraggingThis ? 14 : 6
+                )
 
                 // Pinned Badge Top-Left
                 if tab.isPinned {
@@ -1669,7 +1713,7 @@ struct TabOverview: View {
                         .font(.system(size: 22))
                         .foregroundStyle(isSelected ? Color(red: 0.20, green: 0.56, blue: 1.0) : .white.opacity(0.75))
                         .padding(8)
-                } else if !isHeroSingle {
+                } else if !isHeroSingle && !isDraggingThis {
                     Button {
                         UIImpactFeedbackGenerator(style: .light).impactOccurred()
                         withAnimation(.spring(response: 0.28, dampingFraction: 0.82)) {
@@ -1707,8 +1751,20 @@ struct TabOverview: View {
             }
             .padding(.horizontal, 4)
         }
+        .background(
+            GeometryReader { geo in
+                Color.clear.preference(
+                    key: TabCardFramePreferenceKey.self,
+                    value: [tab.id: geo.frame(in: .named("tabGridSpace"))]
+                )
+            }
+        )
+        .scaleEffect(isDraggingThis ? 1.06 : 1.0)
+        .offset(dragOffset)
+        .animation(.spring(response: 0.28, dampingFraction: 0.78), value: isDraggingThis)
         .contentShape(Rectangle())
         .onTapGesture {
+            guard draggingTabID == nil else { return }
             if selectionMode {
                 if !selectedTabIDs.insert(tab.id).inserted {
                     selectedTabIDs.remove(tab.id)
@@ -1718,39 +1774,97 @@ struct TabOverview: View {
                 onDismiss()
             }
         }
-        .onLongPressGesture(minimumDuration: 0.42) {
-            guard !selectionMode else { return }
-            UIImpactFeedbackGenerator(style: .medium).impactOccurred()
-            withAnimation(.spring(response: 0.34, dampingFraction: 0.80)) {
-                contextMenuTab = tab
-            }
-        }
-        .simultaneousGesture(
-            LongPressGesture(minimumDuration: 0.55)
-                .sequenced(before: DragGesture(coordinateSpace: .global))
+        // Unified iOS 26 Safari gesture:
+        // Hold >= 0.28s lifts the card -> drag smoothly reorders grid with live spring swaps;
+        // release without dragging opens the floating Liquid Glass context menu (링크 복사하기, 탭 고정 등)!
+        .gesture(
+            LongPressGesture(minimumDuration: 0.28)
+                .sequenced(before: DragGesture(minimumDistance: 0, coordinateSpace: .named("tabGridSpace")))
                 .onChanged { value in
-                    guard !selectionMode && !searchMode && contextMenuTab == nil else { return }
-                    if case let .second(true, drag?) = value {
-                        draggingTabID = tab.id
-                        let y = drag.location.y
-                        let listIds = groupTabs.map(\.id)
-                        guard let currentIdx = listIds.firstIndex(of: tab.id) else { return }
-                        if y < 170 && currentIdx > 0 {
-                            let prevID = listIds[max(0, currentIdx - 1)]
-                            withAnimation(.easeInOut(duration: 0.18)) {
-                                model.moveVisibleTab(fromID: tab.id, toID: prevID)
-                                scrollProxy.scrollTo(prevID, anchor: .top)
+                    guard !selectionMode && contextMenuTab == nil else { return }
+                    switch value {
+                    case .first(true):
+                        break
+                    case .second(true, let drag):
+                        if draggingTabID != tab.id {
+                            UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+                            withAnimation(.spring(response: 0.26, dampingFraction: 0.76)) {
+                                draggingTabID = tab.id
                             }
-                        } else if y > outerGeo.size.height - 90 && currentIdx < listIds.count - 1 {
-                            let nextID = listIds[min(listIds.count - 1, currentIdx + 1)]
-                            withAnimation(.easeInOut(duration: 0.18)) {
-                                model.moveVisibleTab(fromID: tab.id, toID: nextID)
-                                scrollProxy.scrollTo(nextID, anchor: .bottom)
+                            dragMovedBeyondThreshold = false
+                            if let drag, let frame = tabFrames[tab.id] {
+                                dragStartLocation = drag.startLocation
+                                dragGrabOffset = CGSize(
+                                    width: drag.startLocation.x - frame.midX,
+                                    height: drag.startLocation.y - frame.midY
+                                )
+                                dragPointerLocation = drag.location
+                            } else {
+                                dragStartLocation = nil
+                                dragGrabOffset = .zero
+                                dragPointerLocation = nil
                             }
+                        }
+                        if let drag {
+                            if dragStartLocation == nil, let frame = tabFrames[tab.id] {
+                                dragStartLocation = drag.startLocation
+                                dragGrabOffset = CGSize(
+                                    width: drag.startLocation.x - frame.midX,
+                                    height: drag.startLocation.y - frame.midY
+                                )
+                            }
+                            dragPointerLocation = drag.location
+                            if let start = dragStartLocation {
+                                let dist = hypot(drag.location.x - start.x, drag.location.y - start.y)
+                                if dist > 12 {
+                                    dragMovedBeyondThreshold = true
+                                }
+                            }
+                            // Live grid slot hit-test & spring swap while dragging
+                            if dragMovedBeyondThreshold && !isHeroSingle && !searchMode {
+                                let now = Date().timeIntervalSinceReferenceDate
+                                if now - lastSwapTimestamp > 0.18 {
+                                    if let targetTab = groupTabs.first(where: { candidate in
+                                        candidate.id != tab.id &&
+                                        candidate.isPinned == tab.isPinned &&
+                                        (tabFrames[candidate.id]?.insetBy(dx: 10, dy: 10).contains(drag.location) ?? false)
+                                    }) {
+                                        lastSwapTimestamp = now
+                                        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                                        withAnimation(.spring(response: 0.32, dampingFraction: 0.78)) {
+                                            model.moveVisibleTab(fromID: tab.id, toID: targetTab.id)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    default:
+                        break
+                    }
+                }
+                .onEnded { value in
+                    let wasLifted = draggingTabID == tab.id
+                    let wasDragged = dragMovedBeyondThreshold
+                    withAnimation(.spring(response: 0.34, dampingFraction: 0.80)) {
+                        draggingTabID = nil
+                        dragPointerLocation = nil
+                        dragStartLocation = nil
+                        dragGrabOffset = .zero
+                        dragMovedBeyondThreshold = false
+                    }
+                    if wasLifted && !wasDragged {
+                        UIImpactFeedbackGenerator(style: .soft).impactOccurred()
+                        withAnimation(.spring(response: 0.34, dampingFraction: 0.80)) {
+                            contextMenuTab = tab
+                        }
+                    } else if case .first(true) = value {
+                        // Released right after long-press threshold before DragGesture received an event
+                        UIImpactFeedbackGenerator(style: .soft).impactOccurred()
+                        withAnimation(.spring(response: 0.34, dampingFraction: 0.80)) {
+                            contextMenuTab = tab
                         }
                     }
                 }
-                .onEnded { _ in draggingTabID = nil }
         )
     }
 
