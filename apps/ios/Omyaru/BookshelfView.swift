@@ -40,7 +40,8 @@ enum BookshelfPath {
 
     static func allDisplayFolders(_ folders: [String]) -> [String] {
         var seen = Set<String>()
-        var result: [String] = []
+        var roots: [String] = []
+        var childrenByParent: [String: [String]] = [:]
         for folder in folders {
             guard let norm = normalize(folder) else { continue }
             var ancestors: [String] = []
@@ -52,9 +53,29 @@ enum BookshelfPath {
             for path in ancestors.reversed() {
                 let key = path.lowercased()
                 if seen.insert(key).inserted {
-                    result.append(path)
+                    let parentKey = parent(path).lowercased()
+                    if parentKey.isEmpty {
+                        roots.append(path)
+                    } else {
+                        childrenByParent[parentKey, default: []].append(path)
+                    }
                 }
             }
+        }
+        var result: [String] = []
+        var visited = Set<String>()
+        func visit(_ path: String) {
+            let key = path.lowercased()
+            guard visited.insert(key).inserted else { return }
+            result.append(path)
+            if let children = childrenByParent[key] {
+                for child in children {
+                    visit(child)
+                }
+            }
+        }
+        for root in roots {
+            visit(root)
         }
         return result
     }
@@ -347,10 +368,25 @@ final class ShelfModel: ObservableObject {
         }
     }
 
+    func isFolderExpanded(_ path: String) -> Bool {
+        let key = (BookshelfPath.normalize(path) ?? path).lowercased()
+        return expandedFolders.contains(key) || expandedFolders.contains(path)
+    }
+
+    func toggleFolderExpanded(_ path: String) {
+        let key = (BookshelfPath.normalize(path) ?? path).lowercased()
+        if isFolderExpanded(path) {
+            expandedFolders.remove(key)
+            expandedFolders.remove(path)
+        } else {
+            expandedFolders.insert(key)
+        }
+    }
+
     func expandAncestors(of path: String) {
-        var cur = path
+        var cur = BookshelfPath.normalize(path) ?? path
         while !cur.isEmpty {
-            expandedFolders.insert(cur)
+            expandedFolders.insert(cur.lowercased())
             cur = BookshelfPath.parent(cur)
         }
     }
@@ -1401,7 +1437,7 @@ struct BookshelfFolderTreeSheet: View {
     private func isVisible(_ path: String) -> Bool {
         var p = BookshelfPath.parent(path)
         while !p.isEmpty {
-            if !model.expandedFolders.contains(p) { return false }
+            if !model.isFolderExpanded(p) { return false }
             p = BookshelfPath.parent(p)
         }
         return true
@@ -1525,7 +1561,7 @@ struct BookshelfFolderTreeSheet: View {
         let leaf = BookshelfPath.leaf(path)
         let children = availableFolders.filter { BookshelfPath.parent($0).caseInsensitiveCompare(path) == .orderedSame }
         let hasChildren = !children.isEmpty
-        let isExpanded = model.expandedFolders.contains(path)
+        let isExpanded = model.isFolderExpanded(path)
         let isSelected = isMoveMode
             ? (selectedTargetParent.caseInsensitiveCompare(path) == .orderedSame)
             : (model.activeFolder.caseInsensitiveCompare(path) == .orderedSame)
@@ -1537,8 +1573,7 @@ struct BookshelfFolderTreeSheet: View {
             }
             if hasChildren {
                 Button {
-                    if isExpanded { model.expandedFolders.remove(path) }
-                    else { model.expandedFolders.insert(path) }
+                    model.toggleFolderExpanded(path)
                 } label: {
                     Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
                         .font(.caption.weight(.bold))

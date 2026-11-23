@@ -57,7 +57,7 @@ def main() -> None:
                 "buildVersion": build_version,
                 "date": date.today().isoformat(),
                 "localizedDescription": (
-                    f"v{version} (build {build_version}): High-speed parallel Google Drive sync (multi-core off-MainActor PBKDF2, "
+                    f"v{version} (build {build_version}): Fixed hierarchical bookshelf folder tree ordering so nested subfolders always group strictly under their parent; high-speed parallel Google Drive sync, "
                     "6x concurrent chunk & batch transfers, single appDataFolder listing, persistent KeyRing cache, delta-only CRDT shelf replica), "
                     "shared sync folder picker with per-account subfolder (<Folder>/<account>) & kernel flock cross-app sync lock for zero duplication with Umtomi, "
                     "and automatic LiveContainer Live Activity fallback (live-updating progress notification + floating top sync pill)."
