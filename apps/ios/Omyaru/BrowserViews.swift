@@ -2612,7 +2612,7 @@ struct TabOverview: View {
                 removal: .scale(scale: 0.72).combined(with: .opacity)
             ))
         } else {
-            Color.clear.frame(maxWidth: .infinity, height: 1)
+            Color.clear.frame(maxWidth: .infinity).frame(height: 1)
         }
     }
 
