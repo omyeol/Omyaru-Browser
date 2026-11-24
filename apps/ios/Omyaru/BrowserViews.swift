@@ -38,6 +38,16 @@ struct BrowserScreen: View {
     @State private var newFavTitle = ""
     @State private var newFavURL = ""
     @State private var updateMessage: String? = nil
+    @State private var heroMorphVisible = false
+    @State private var heroMorphImage: UIImage? = nil
+    @State private var heroMorphFallbackColor: Color = Color(red: 0.08, green: 0.09, blue: 0.11)
+    @State private var heroMorphRect: CGRect = .zero
+    @State private var heroMorphCornerRadius: CGFloat = 0
+    @State private var heroMorphBorderColor: Color = .clear
+    @State private var heroMorphHiddenTabID: UUID? = nil
+    @State private var heroMorphToken = UUID()
+    @State private var pendingOpenHeroTabID: UUID? = nil
+    @State private var overviewMorphProgress: CGFloat = 1.0
     @FocusState private var addressFocused: Bool
 
     private var anyDarkOverlayPresented: Bool {
@@ -124,13 +134,14 @@ struct BrowserScreen: View {
                 }
                 .environment(\.colorScheme, .dark)
                 .ignoresSafeArea(.container, edges: isBottomBar ? .bottom : [])
+                .opacity((showTabs || heroMorphVisible) ? 0.0 : 1.0)
+                .animation(.easeOut(duration: 0.16), value: showTabs || heroMorphVisible)
                 .animation(.spring(response: 0.30, dampingFraction: 0.84), value: model.isChromeCollapsed)
                 .animation(.easeInOut(duration: 0.2), value: model.status)
             }
-            .blur(radius: showTabs ? 14 : 0)
-            .opacity(showTabs ? 0.72 : 1.0)
-            .allowsHitTesting(!showTabs && !showPageTools && !showBrowserMenu)
-            .animation(.spring(response: 0.28, dampingFraction: 0.88), value: showTabs)
+            .blur(radius: showTabs ? Double(overviewMorphProgress) * 14 : 0)
+            .opacity(showTabs ? max(0.35, 1.0 - Double(overviewMorphProgress) * 0.45) : 1.0)
+            .allowsHitTesting(!showTabs && !heroMorphVisible && !showPageTools && !showBrowserMenu)
 
             // Exact Video 00:06->00:08 Morphing Liquid Glass Page Tools Popover
             LiquidGlassMorphContainer(
@@ -183,23 +194,69 @@ struct BrowserScreen: View {
             }
             .environment(\.colorScheme, .dark)
 
-            // Exact Video 00:00->00:01->00:04 Fullscreen Liquid Glass Tab Overview (zero black bottom flash on dismiss!)
+            // Exact Safari Shared-Element Hero Zoom Tab Overview (matches KakaoTalk_20261124_195552958.mp4!)
             if showTabs {
-                TabOverview(onDismiss: {
-                    withAnimation(.spring(response: 0.28, dampingFraction: 0.88)) {
-                        showTabs = false
+                TabOverview(
+                    morphProgress: overviewMorphProgress,
+                    hiddenHeroTabID: heroMorphHiddenTabID,
+                    onCardRectsUpdated: {
+                        tryLaunchPendingOpenHeroFlight()
+                    },
+                    onSelectTabWithHero: { tabID, sourceRect, isHero in
+                        closeTabOverviewWithHero(selectedTabID: tabID, sourceRect: sourceRect, isHero: isHero)
+                    },
+                    onDismiss: {
+                        let activeID = model.activeID
+                        closeTabOverviewWithHero(
+                            selectedTabID: activeID,
+                            sourceRect: model.tabCardThumbRects[activeID],
+                            isHero: model.tabCardIsHeroMap[activeID] ?? false
+                        )
                     }
-                })
+                )
                 .environmentObject(model)
                 .environment(\.colorScheme, .dark)
-                .transition(.asymmetric(
-                    insertion: .opacity.combined(with: .scale(scale: 1.04)),
-                    removal: .opacity.combined(with: .scale(scale: 1.03))
-                ))
                 .zIndex(20)
             }
+
+            // Flying Shared-Element Hero Card (Web <-> Tab Overview exact Safari morph!)
+            if heroMorphVisible {
+                GeometryReader { overlayGeo in
+                    let origin = overlayGeo.frame(in: .global).origin
+                    let localRect = CGRect(
+                        x: heroMorphRect.minX - origin.x,
+                        y: heroMorphRect.minY - origin.y,
+                        width: max(1, heroMorphRect.width),
+                        height: max(1, heroMorphRect.height)
+                    )
+                    ZStack {
+                        heroMorphFallbackColor
+                        if let img = heroMorphImage {
+                            Image(uiImage: img)
+                                .resizable()
+                                .scaledToFill()
+                                .frame(width: localRect.width, height: localRect.height, alignment: .top)
+                                .clipped()
+                        }
+                    }
+                    .frame(width: localRect.width, height: localRect.height)
+                    .clipShape(RoundedRectangle(cornerRadius: heroMorphCornerRadius, style: .continuous))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: heroMorphCornerRadius, style: .continuous)
+                            .strokeBorder(heroMorphBorderColor, lineWidth: heroMorphBorderColor == .clear ? 0 : 2.6)
+                    )
+                    .shadow(
+                        color: .black.opacity(heroMorphCornerRadius > 2 ? 0.48 : 0.0),
+                        radius: heroMorphCornerRadius > 2 ? 22 : 0,
+                        y: heroMorphCornerRadius > 2 ? 10 : 0
+                    )
+                    .position(x: localRect.midX, y: localRect.midY)
+                }
+                .ignoresSafeArea()
+                .allowsHitTesting(false)
+                .zIndex(40)
+            }
         }
-        .animation(.spring(response: 0.28, dampingFraction: 0.88), value: showTabs)
         .sheet(isPresented: $showBookmarks) {
             BookmarksSheet()
                 .environmentObject(model)
@@ -1051,14 +1108,7 @@ struct BrowserScreen: View {
             _ = model.newTab()
             if model.preferences.showKeyboardOnNewTab { addressFocused = true }
         case .tabs:
-            model.captureSnapshot(for: model.activeID)
-            addressFocused = false
-            showPageTools = false
-            showBrowserMenu = false
-            UIImpactFeedbackGenerator(style: .light).impactOccurred()
-            withAnimation(.spring(response: 0.36, dampingFraction: 0.86)) {
-                showTabs = true
-            }
+            openTabOverviewWithHero()
         case .menu:
             UIImpactFeedbackGenerator(style: .light).impactOccurred()
             withAnimation(.spring(response: 0.34, dampingFraction: 0.80)) {
@@ -1100,6 +1150,129 @@ struct BrowserScreen: View {
             showCloseAllConfirm = true
         case .settings:
             showSettings = true
+        }
+    }
+
+    private func profileBorderColor(for tabID: UUID) -> Color {
+        if let tab = model.tabs.first(where: { $0.id == tabID }) {
+            let groupProfileID = model.groups.first(where: { $0.id == tab.groupID })?.profileID ?? tab.profileID
+            if let hex = model.profiles.first(where: { $0.id == groupProfileID })?.colorHex {
+                return Color(hex: hex)
+            }
+        }
+        return Color(hex: model.activeProfile.colorHex)
+    }
+
+    private func openTabOverviewWithHero() {
+        let activeID = model.activeID
+        let liveImg = model.captureLiveHeroSnapshot(for: activeID) ?? model.tabSnapshots[activeID]
+        model.captureSnapshot(for: activeID)
+        addressFocused = false
+        showPageTools = false
+        showBrowserMenu = false
+        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+
+        let screen = UIScreen.main.bounds
+        let token = UUID()
+        heroMorphToken = token
+        pendingOpenHeroTabID = activeID
+        heroMorphImage = liveImg
+        heroMorphFallbackColor = model.isStartPage
+            ? Color(red: 0.08, green: 0.08, blue: 0.09)
+            : Color(uiColor: model.activePageTopUIColor ?? UIColor(red: 0.08, green: 0.09, blue: 0.11, alpha: 1.0))
+        heroMorphRect = screen
+        heroMorphCornerRadius = 38
+        heroMorphBorderColor = .clear
+        heroMorphHiddenTabID = activeID
+        overviewMorphProgress = 0.0
+        heroMorphVisible = true
+        showTabs = true
+
+        // Fallback trigger if TabOverview preference callback already had rects or takes >40ms (e.g. list mode)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.045) {
+            guard heroMorphToken == token, pendingOpenHeroTabID == activeID else { return }
+            let fallbackRect = model.tabCardThumbRects[activeID] ?? CGRect(
+                x: screen.midX - 88,
+                y: screen.midY - 120,
+                width: 176,
+                height: 220
+            )
+            let isHero = model.tabCardIsHeroMap[activeID] ?? (model.visibleTabs.count == 1)
+            launchOpenHeroFlight(tabID: activeID, targetRect: fallbackRect, isHero: isHero, token: token)
+        }
+    }
+
+    private func tryLaunchPendingOpenHeroFlight() {
+        guard let tabID = pendingOpenHeroTabID,
+              let rect = model.tabCardThumbRects[tabID],
+              rect.width > 20, rect.height > 20 else { return }
+        let isHero = model.tabCardIsHeroMap[tabID] ?? false
+        launchOpenHeroFlight(tabID: tabID, targetRect: rect, isHero: isHero, token: heroMorphToken)
+    }
+
+    private func launchOpenHeroFlight(tabID: UUID, targetRect: CGRect, isHero: Bool, token: UUID) {
+        guard heroMorphToken == token, pendingOpenHeroTabID == tabID else { return }
+        pendingOpenHeroTabID = nil
+        let accent = profileBorderColor(for: tabID)
+        withAnimation(.spring(response: 0.36, dampingFraction: 0.85)) {
+            heroMorphRect = targetRect
+            heroMorphCornerRadius = isHero ? 22 : 18
+            heroMorphBorderColor = accent
+            overviewMorphProgress = 1.0
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+            guard heroMorphToken == token else { return }
+            heroMorphVisible = false
+            heroMorphHiddenTabID = nil
+        }
+    }
+
+    private func closeTabOverviewWithHero(selectedTabID: UUID, sourceRect: CGRect?, isHero: Bool) {
+        let token = UUID()
+        heroMorphToken = token
+        pendingOpenHeroTabID = nil
+
+        let targetTab = model.tabs.first(where: { $0.id == selectedTabID })
+        if selectedTabID != model.activeID {
+            model.select(selectedTabID)
+        }
+        let screen = UIScreen.main.bounds
+        let startRect: CGRect
+        if let sourceRect, sourceRect.width > 20, sourceRect.height > 20 {
+            startRect = sourceRect
+        } else if let cached = model.tabCardThumbRects[selectedTabID], cached.width > 20, cached.height > 20 {
+            startRect = cached
+        } else {
+            startRect = CGRect(x: screen.midX - 88, y: screen.midY - 120, width: 176, height: 220)
+        }
+
+        heroMorphImage = model.tabSnapshots[selectedTabID]
+        heroMorphFallbackColor = (targetTab?.url == "about:blank" || targetTab == nil)
+            ? Color(red: 0.08, green: 0.08, blue: 0.09)
+            : Color(uiColor: model.tabTopColors[selectedTabID] ?? UIColor(red: 0.08, green: 0.09, blue: 0.11, alpha: 1.0))
+        heroMorphRect = startRect
+        heroMorphCornerRadius = isHero ? 22 : 18
+        heroMorphBorderColor = profileBorderColor(for: selectedTabID)
+        heroMorphHiddenTabID = selectedTabID
+        overviewMorphProgress = 1.0
+        heroMorphVisible = true
+
+        DispatchQueue.main.async {
+            guard heroMorphToken == token else { return }
+            withAnimation(.spring(response: 0.34, dampingFraction: 0.86)) {
+                heroMorphRect = screen
+                heroMorphCornerRadius = 0
+                heroMorphBorderColor = .clear
+                overviewMorphProgress = 0.0
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.31) {
+                guard heroMorphToken == token else { return }
+                showTabs = false
+                heroMorphHiddenTabID = nil
+                withAnimation(.easeOut(duration: 0.08)) {
+                    heroMorphVisible = false
+                }
+            }
         }
     }
 
@@ -1437,6 +1610,10 @@ private struct TabCardGestureOverlay: UIViewRepresentable {
 
 struct TabOverview: View {
     @EnvironmentObject private var model: BrowserModel
+    var morphProgress: CGFloat = 1.0
+    var hiddenHeroTabID: UUID? = nil
+    var onCardRectsUpdated: () -> Void = {}
+    var onSelectTabWithHero: (UUID, CGRect?, Bool) -> Void = { _, _, _ in }
     var onDismiss: () -> Void
 
     @Namespace private var pillNamespace
@@ -1611,6 +1788,8 @@ struct TabOverview: View {
                     .zIndex(95)
             }
         }
+        .blur(radius: (1.0 - morphProgress) * 18)
+        .opacity(Double(morphProgress))
         .onAppear {
             pagedGroupID = model.activeGroupID
         }
@@ -1817,8 +1996,15 @@ struct TabOverview: View {
                 }
                 .scrollDisabled(draggingTabID != nil || contextMenuTab != nil)
                 .onPreferenceChange(TabCardFramePreferenceKey.self) { frames in
+                    let currentCardH = isSingleHero ? heroH : gridThumbHeight
                     for (id, rect) in frames {
                         tabFrames[id] = rect
+                        let thumbRect = CGRect(x: rect.minX, y: rect.minY, width: rect.width, height: currentCardH)
+                        model.tabCardThumbRects[id] = thumbRect
+                        model.tabCardIsHeroMap[id] = isSingleHero
+                    }
+                    if !frames.isEmpty {
+                        onCardRectsUpdated()
                     }
                 }
             }
@@ -1978,9 +2164,10 @@ struct TabOverview: View {
                     y: contextMenuExpanded ? clampedCenterY : rawLocalRect.midY
                 )
                 .onTapGesture {
+                    let thumbRect = contextMenuSourceRect
+                    let isHero = contextMenuIsHero
                     dismissContextMenu {
-                        model.select(targetTab.id)
-                        onDismiss()
+                        onSelectTabWithHero(targetTab.id, thumbRect, isHero)
                     }
                 }
 
@@ -2039,6 +2226,8 @@ struct TabOverview: View {
     ) -> some View {
         let isActive = tab.id == model.activeID
         let isSelected = selectedTabIDs.contains(tab.id)
+        let groupProfileID = model.groups.first(where: { $0.id == tab.groupID })?.profileID ?? tab.profileID
+        let profileColor = Color(hex: model.profiles.first(where: { $0.id == groupProfileID })?.colorHex ?? model.activeProfile.colorHex)
 
         return ZStack(alignment: .topTrailing) {
             Group {
@@ -2047,7 +2236,7 @@ struct TabOverview: View {
                         .resizable()
                         .scaledToFill()
                         .frame(maxWidth: .infinity)
-                        .frame(height: cardHeight)
+                        .frame(height: cardHeight, alignment: .top)
                         .clipped()
                 } else {
                     ZStack {
@@ -2068,12 +2257,16 @@ struct TabOverview: View {
                             ? Color.white.opacity(0.32)
                             : (selectionMode && isSelected)
                                 ? Color(red: 0.20, green: 0.56, blue: 1.0)
-                                : (isActive ? Color.white.opacity(0.55) : Color.white.opacity(0.14)),
-                        lineWidth: (isLiftedOverlay || isActive || (selectionMode && isSelected)) ? 1.6 : 0.9
+                                : (isActive ? profileColor : Color.white.opacity(0.14)),
+                        lineWidth: (isActive && !isLiftedOverlay && !(selectionMode && isSelected))
+                            ? 2.6
+                            : ((isLiftedOverlay || (selectionMode && isSelected)) ? 1.8 : 0.9)
                     )
             )
             .shadow(
-                color: .black.opacity(isLiftedOverlay ? 0.56 : 0.40),
+                color: isLiftedOverlay
+                    ? .black.opacity(0.56)
+                    : (isActive ? profileColor.opacity(0.36) : .black.opacity(0.40)),
                 radius: isLiftedOverlay ? 28 : (isHeroSingle ? 18 : 10),
                 y: isLiftedOverlay ? 14 : 6
             )
@@ -2155,13 +2348,14 @@ struct TabOverview: View {
     ) -> some View {
         let isDraggingThis = draggingTabID == tab.id
         let isContextMenuThis = contextMenuTab?.id == tab.id
+        let isHeroHiddenThis = hiddenHeroTabID == tab.id
 
         return safariTabCardVisual(
             tab: tab,
             cardHeight: cardHeight,
             isHeroSingle: isHeroSingle,
             isLiftedOverlay: false,
-            hideThumbnail: isContextMenuThis
+            hideThumbnail: isContextMenuThis || isHeroHiddenThis
         )
         .opacity(isDraggingThis ? 0.0 : 1.0)
         .background(
@@ -2175,7 +2369,7 @@ struct TabOverview: View {
         .overlay(
             TabCardGestureOverlay(
                 isLongPressEnabled: !selectionMode && contextMenuTab == nil && !isSettlingDrop,
-                excludeTopRightCloseSize: (!selectionMode && !isHeroSingle && !isDraggingThis && !isContextMenuThis) ? 38 : 0,
+                excludeTopRightCloseSize: (!selectionMode && !isHeroSingle && !isDraggingThis && !isContextMenuThis && !isHeroHiddenThis) ? 38 : 0,
                 onTap: {
                     guard draggingTabID == nil && contextMenuTab == nil else { return }
                     if selectionMode {
@@ -2183,8 +2377,10 @@ struct TabOverview: View {
                             selectedTabIDs.remove(tab.id)
                         }
                     } else {
-                        model.select(tab.id)
-                        onDismiss()
+                        let sourceThumbRect = tabFrames[tab.id].map {
+                            CGRect(x: $0.minX, y: $0.minY, width: $0.width, height: cardHeight)
+                        } ?? model.tabCardThumbRects[tab.id]
+                        onSelectTabWithHero(tab.id, sourceThumbRect, isHeroSingle)
                     }
                 },
                 onLongPressBegan: { screenPt in
@@ -2267,7 +2463,7 @@ struct TabOverview: View {
             )
         )
         .overlay(alignment: .topTrailing) {
-            if !selectionMode && !isHeroSingle && !isDraggingThis && !isContextMenuThis {
+            if !selectionMode && !isHeroSingle && !isDraggingThis && !isContextMenuThis && !isHeroHiddenThis {
                 Button {
                     UIImpactFeedbackGenerator(style: .light).impactOccurred()
                     withAnimation(.spring(response: 0.28, dampingFraction: 0.82)) {
@@ -2390,8 +2586,7 @@ struct TabOverview: View {
             if selectionMode {
                 if !selectedTabIDs.insert(tab.id).inserted { selectedTabIDs.remove(tab.id) }
             } else {
-                model.select(tab.id)
-                onDismiss()
+                onSelectTabWithHero(tab.id, nil, false)
             }
         }
         .onLongPressGesture(minimumDuration: 0.20) {

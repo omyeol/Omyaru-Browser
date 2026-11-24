@@ -647,7 +647,7 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
     static let defaultProfileID = UUID(uuidString: "00000000-0000-0000-0000-000000000010")!
     static let defaultGroupID = UUID(uuidString: "00000000-0000-0000-0000-000000000002")!
     static let appVersionName = "0.15.18"
-    static let appBuildNumber = 96
+    static let appBuildNumber = 97
 
     var isApplyingRemoteSync: Bool = false
 
@@ -700,6 +700,8 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
     private var webViews: [UUID: WKWebView] = [:]
     private var loadedTabIDs: Set<UUID> = []
     private var lastActiveTabByGroup: [UUID: UUID] = [:]
+    var tabCardThumbRects: [UUID: CGRect] = [:]
+    var tabCardIsHeroMap: [UUID: Bool] = [:]
     private var compiledContentRuleList: WKContentRuleList? = nil
     private var lastScrollOffsetY: CGFloat = 0
     private var toolbarScrollAccumulator: CGFloat = 0
@@ -1143,7 +1145,11 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
         guard preferences.showTabThumbnails, let view = webViews[id],
               let tab = tabs.first(where: { $0.id == id }), tab.url != "about:blank" else { return }
         let config = WKSnapshotConfiguration()
-        config.snapshotWidth = 280
+        config.snapshotWidth = 380
+        let topSafe = view.safeAreaInsets.top
+        if topSafe > 4 && view.bounds.height > topSafe + 120 {
+            config.rect = CGRect(x: 0, y: topSafe, width: view.bounds.width, height: view.bounds.height - topSafe)
+        }
         view.takeSnapshot(with: config) { [weak self] image, _ in
             guard let self, let image else { return }
             self.tabSnapshots[id] = image
@@ -1154,6 +1160,31 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
                 }
             }
         }
+    }
+
+    /// Synchronous ~3ms live capture of the active WebView viewport for zero-latency Safari Hero Zoom morph!
+    func captureLiveHeroSnapshot(for id: UUID) -> UIImage? {
+        guard let tab = tabs.first(where: { $0.id == id }), tab.url != "about:blank" else {
+            return tabSnapshots[id]
+        }
+        guard let view = webViews[id], view.bounds.width > 10, view.bounds.height > 10 else {
+            return tabSnapshots[id]
+        }
+        let topSafe = view.safeAreaInsets.top
+        let cropTop = (topSafe > 4 && view.bounds.height > topSafe + 120) ? topSafe : 0
+        let targetSize = CGSize(width: view.bounds.width, height: max(1, view.bounds.height - cropTop))
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = min(UIScreen.main.scale, 2.0)
+        format.opaque = true
+        let renderer = UIGraphicsImageRenderer(size: targetSize, format: format)
+        let img = renderer.image { ctx in
+            ctx.cgContext.translateBy(x: 0, y: -cropTop)
+            view.drawHierarchy(in: view.bounds, afterScreenUpdates: false)
+        }
+        if preferences.showTabThumbnails {
+            tabSnapshots[id] = img
+        }
+        return img
     }
 
     // MARK: - Per-Site Content Blocking Toggle (Android PageToolsDialog Parity!)
