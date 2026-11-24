@@ -1,3 +1,18 @@
+# 2026-11-24 Antigravity: iOS 탭 목록 릴리스 전용 컨텍스트 메뉴(`autoPeekTask` 제거) + 하단 탭 그룹 필 스와이프 전환 (`iOS build 93`)
+
+- 작업 워크스페이스: `E:/DEV/CODEX/BROWSER`
+- 사용자 요청:
+  1. 탭 목록에서 길게 누르고 있는 동안 자동으로 컨텍스트 메뉴가 뜨지 않고 **손을 떼었을 때만** 컨텍스트 메뉴가 뜨도록 수정
+  2. 탭 목록 하단의 탭 그룹 필(`개인정보 보호`, `3개의 탭`, 그룹 목록 등)을 탭하는 것뿐 아니라 **좌우 스와이프**로도 그룹 이동 가능하게 추가
+- 해결 (`apps/ios/Omyaru/BrowserViews.swift`, `Info.plist`, `OmyaruApp.swift`):
+  1. **릴리스 전용 컨텍스트 메뉴 (`autoPeekTask` 제거)**:
+     - `build 92`에서 추가했던 `0.42초` 정지 홀드 자동 팝업(`autoPeekTask`)을 제거해, 손가락을 대고 있는 동안에는 카드가 들린 상태로 드래그 대기만 유지하고 **움직이지 않고 손을 떼는 순간(0ms)**에만 Safari 제자리 썸네일 부각 + 앵커형 Liquid Glass 컨텍스트 메뉴가 열리도록 수정.
+  2. **하단 탭 그룹 필 좌우 스와이프 / 연속 스크럽 전환 (`liquidGlassBottomCarouselBar`)**:
+     - 하단 중앙 Liquid Glass 캡슐 필 내부 `ScrollView`에 `.scrollDisabled(true)`를 적용하고 `.simultaneousGesture(DragGesture(minimumDistance: 12))`를 결합해, 짧은 좌우 플릭(`±24pt` 또는 예측 속도) 및 연속 가로 드래그(`68pt` 스텝, 실시간 러버밴드 `pillDragVisualOffset` + `UISelectionFeedbackGenerator` 햅틱)로 탭 그룹과 상단 `TabView(.page)`가 함께 자연스럽게 전환되도록 구현(`pillDidDrag` 가드로 스와이프 시 오탭 방지, 기존 탭 전환·현재 그룹 탭 시 그룹 관리 시트 유지).
+  - iOS 빌드 번호: `92` → **`93`** (`Info.plist`, `OmyaruApp.swift`).
+
+---
+
 # 2026-11-24 Antigravity: iOS 탭 목록 Safari 제자리 썸네일 들림 + 앵커형 Liquid Glass 컨텍스트 메뉴 (`KakaoTalk_20261124_165439782.mp4` 완전 재현) (`iOS build 92`)
 
 - 작업 워크스페이스: `E:/DEV/CODEX/BROWSER`

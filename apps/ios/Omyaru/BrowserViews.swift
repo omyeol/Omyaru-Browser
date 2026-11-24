@@ -1367,7 +1367,10 @@ struct TabOverview: View {
     @State private var contextMenuStartScale: CGFloat = 1.0
     @State private var contextMenuExpanded = false
     @State private var contextMenuSessionID = UUID()
-    @State private var autoPeekTask: Task<Void, Never>? = nil
+    @State private var pillDragStartIndex: Int? = nil
+    @State private var pillDragLastSteppedIndex: Int? = nil
+    @State private var pillDragVisualOffset: CGFloat = 0
+    @State private var pillDidDrag = false
     @State private var newGroupName = ""
     @State private var showingNewGroup = false
     @State private var showingGroupManager = false
@@ -1512,10 +1515,6 @@ struct TabOverview: View {
                 safariTabContextOverlay(for: targetTab)
                     .zIndex(95)
             }
-        }
-        .onDisappear {
-            autoPeekTask?.cancel()
-            autoPeekTask = nil
         }
         .onAppear {
             pagedGroupID = model.activeGroupID
@@ -1767,8 +1766,6 @@ struct TabOverview: View {
         isHero: Bool,
         startScale: CGFloat
     ) {
-        autoPeekTask?.cancel()
-        autoPeekTask = nil
         contextMenuSessionID = UUID()
         contextMenuSourceRect = thumbRect
         contextMenuIsHero = isHero
@@ -1777,7 +1774,7 @@ struct TabOverview: View {
         contextMenuTab = tab
         UIImpactFeedbackGenerator(style: .medium).impactOccurred()
         DispatchQueue.main.async {
-            withAnimation(.spring(response: 0.28, dampingFraction: 0.80)) {
+            withAnimation(.spring(response: 0.26, dampingFraction: 0.82)) {
                 contextMenuExpanded = true
             }
         }
@@ -2113,10 +2110,8 @@ struct TabOverview: View {
                         height: cardHeight + 24
                     )
                     let frame = tabFrames[tab.id] ?? fallbackFrame
-                    let thumbRect = CGRect(x: frame.minX, y: frame.minY, width: frame.width, height: cardHeight)
                     let center = CGPoint(x: frame.midX, y: frame.midY)
-                    let sessionToken = UUID()
-                    dragSessionID = sessionToken
+                    dragSessionID = UUID()
                     dragCardWidth = frame.width
                     dragCardThumbHeight = cardHeight
                     dragCardIsHero = isHeroSingle
@@ -2133,26 +2128,6 @@ struct TabOverview: View {
                     withAnimation(.spring(response: 0.16, dampingFraction: 0.80)) {
                         dragCardScale = 1.06
                     }
-
-                    // Auto-peek just like Safari video: if finger holds still (+0.24s -> ~0.42s total), bloom context menu right in place!
-                    autoPeekTask?.cancel()
-                    autoPeekTask = Task { @MainActor in
-                        try? await Task.sleep(nanoseconds: 240_000_000)
-                        guard !Task.isCancelled,
-                              dragSessionID == sessionToken,
-                              draggingTabID == tab.id,
-                              !dragMovedBeyondThreshold,
-                              !isSettlingDrop,
-                              contextMenuTab == nil else { return }
-                        draggingTabID = nil
-                        dragCardScale = 1.0
-                        dragFirstLocation = nil
-                        dragMovedBeyondThreshold = false
-                        dragOriginIndex = nil
-                        dragTargetIndex = nil
-                        dragSlotFrames = []
-                        openContextMenu(for: tab, thumbRect: thumbRect, isHero: isHeroSingle, startScale: 1.06)
-                    }
                 },
                 onLongPressChanged: { screenPt in
                     guard draggingTabID == tab.id && !isSettlingDrop else { return }
@@ -2164,8 +2139,6 @@ struct TabOverview: View {
                     let dy = screenPt.y - firstLoc.y
                     if !dragMovedBeyondThreshold {
                         guard hypot(dx, dy) > 16 else { return }
-                        autoPeekTask?.cancel()
-                        autoPeekTask = nil
                         dragMovedBeyondThreshold = true
                     }
                     let nextCenter = CGPoint(
@@ -2191,14 +2164,10 @@ struct TabOverview: View {
                     }
                 },
                 onLongPressEnded: {
-                    autoPeekTask?.cancel()
-                    autoPeekTask = nil
                     guard draggingTabID == tab.id else { return }
                     finalizeActiveTabDrag(in: groupTabs)
                 },
                 onLongPressCancelled: {
-                    autoPeekTask?.cancel()
-                    autoPeekTask = nil
                     guard draggingTabID == tab.id && !isSettlingDrop else { return }
                     draggingTabID = nil
                     dragCardScale = 1.0
@@ -2235,8 +2204,6 @@ struct TabOverview: View {
 
     private func finalizeActiveTabDrag(in groupTabs: [BrowserTab]) {
         guard let dragID = draggingTabID, !isSettlingDrop else { return }
-        autoPeekTask?.cancel()
-        autoPeekTask = nil
         let liftedTab = groupTabs.first(where: { $0.id == dragID }) ?? model.tabs.first(where: { $0.id == dragID })
         let wasDragged = dragMovedBeyondThreshold
         let originIdx = dragOriginIndex
@@ -2380,6 +2347,7 @@ struct TabOverview: View {
                             ForEach(model.workspaceGroupIDs, id: \.self) { groupID in
                                 let isCurrent = pagedGroupID == groupID
                                 Button {
+                                    guard !pillDidDrag else { return }
                                     if isCurrent {
                                         showingGroupManager = true
                                     } else {
@@ -2413,7 +2381,9 @@ struct TabOverview: View {
                         }
                         .padding(.horizontal, 26)
                         .frame(minHeight: 46)
+                        .offset(x: pillDragVisualOffset)
                     }
+                    .scrollDisabled(true)
                     .onAppear {
                         DispatchQueue.main.async {
                             stripProxy.scrollTo(pagedGroupID, anchor: .center)
@@ -2442,6 +2412,62 @@ struct TabOverview: View {
                     LiquidGlassShapeBackground(shape: Capsule(), tintOpacity: 0.36, rimOpacity: 0.34, specularOpacity: 0.22, shadowRadius: 12)
                 )
                 .clipShape(Capsule())
+                .contentShape(Capsule())
+                .simultaneousGesture(
+                    DragGesture(minimumDistance: 12)
+                        .onChanged { value in
+                            let ids = model.workspaceGroupIDs
+                            guard ids.count > 1 else { return }
+                            guard abs(value.translation.width) > abs(value.translation.height) * 0.75 else { return }
+                            pillDidDrag = true
+                            if pillDragStartIndex == nil {
+                                let start = ids.firstIndex(of: pagedGroupID) ?? 0
+                                pillDragStartIndex = start
+                                pillDragLastSteppedIndex = start
+                            }
+                            guard let startIdx = pillDragStartIndex else { return }
+                            let stepWidth: CGFloat = 68
+                            let rawSteps = Int((-value.translation.width / stepWidth).rounded(.towardZero))
+                            let targetIdx = min(ids.count - 1, max(0, startIdx + rawSteps))
+                            let remainder = value.translation.width + CGFloat(targetIdx - startIdx) * stepWidth
+                            pillDragVisualOffset = max(-22, min(22, remainder * 0.35))
+
+                            if targetIdx != pillDragLastSteppedIndex {
+                                pillDragLastSteppedIndex = targetIdx
+                                UISelectionFeedbackGenerator().selectionChanged()
+                                withAnimation(.spring(response: 0.32, dampingFraction: 0.84)) {
+                                    pagedGroupID = ids[targetIdx]
+                                }
+                            }
+                        }
+                        .onEnded { value in
+                            let ids = model.workspaceGroupIDs
+                            if ids.count > 1, let startIdx = pillDragStartIndex, pillDragLastSteppedIndex == startIdx {
+                                let effectiveDX = abs(value.predictedEndTranslation.width) > abs(value.translation.width)
+                                    ? value.predictedEndTranslation.width
+                                    : value.translation.width
+                                if effectiveDX < -24 && startIdx + 1 < ids.count {
+                                    UISelectionFeedbackGenerator().selectionChanged()
+                                    withAnimation(.spring(response: 0.32, dampingFraction: 0.84)) {
+                                        pagedGroupID = ids[startIdx + 1]
+                                    }
+                                } else if effectiveDX > 24 && startIdx - 1 >= 0 {
+                                    UISelectionFeedbackGenerator().selectionChanged()
+                                    withAnimation(.spring(response: 0.32, dampingFraction: 0.84)) {
+                                        pagedGroupID = ids[startIdx - 1]
+                                    }
+                                }
+                            }
+                            withAnimation(.spring(response: 0.28, dampingFraction: 0.82)) {
+                                pillDragVisualOffset = 0
+                            }
+                            pillDragStartIndex = nil
+                            pillDragLastSteppedIndex = nil
+                            DispatchQueue.main.async {
+                                pillDidDrag = false
+                            }
+                        }
+                )
             }
 
             // Vibrant iOS 26 Safari Blue Checkmark Circle (✓)
