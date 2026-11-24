@@ -59,6 +59,7 @@ final class HeroBrowserHostView: UIView {
     private var lastBoundsSize: CGSize = .zero
     private var lastSafeTop: CGFloat = 0
     private var fallbackImageSize: CGSize = .zero
+    var onDidResetToFullScreen: (() -> Void)?
 
     override init(frame: CGRect) {
         super.init(frame: frame)
@@ -217,6 +218,8 @@ final class HeroBrowserHostView: UIView {
             isInMorphPose = false
             isUserInteractionEnabled = true
             layoutBaseFullScreen()
+            layoutIfNeeded()
+            onDidResetToFullScreen?()
 
         case .shrinkToCard(let rect, let corner, let borderColor, let safeTop):
             isInMorphPose = true
@@ -304,12 +307,14 @@ private struct HeroBrowserHostRepresentable: UIViewRepresentable {
     let isWebViewCommitted: Bool
     let safeTop: CGFloat
     let command: HeroMorphCommand
+    let onDidResetToFullScreen: () -> Void
 
     func makeUIView(context: Context) -> HeroBrowserHostView {
         HeroBrowserHostView()
     }
 
     func updateUIView(_ view: HeroBrowserHostView, context: Context) {
+        view.onDidResetToFullScreen = onDidResetToFullScreen
         view.updateContent(
             webView: webView,
             fallbackSnapshot: fallbackSnapshot,
@@ -325,6 +330,7 @@ private struct SafariStartPageHeroModifier: ViewModifier, Animatable {
     var progress: CGFloat
     let isMorphing: Bool
     let screenSize: CGSize
+    let safeTop: CGFloat
     let cardRect: CGRect
     let cardCornerRadius: CGFloat
     let borderColor: Color
@@ -348,12 +354,11 @@ private struct SafariStartPageHeroModifier: ViewModifier, Animatable {
         let scale = max(0.05, curW / w)
         let corner: CGFloat = isMorphing ? (46 * (1 - t) + cardCornerRadius * t) : 0
         let borderAlpha = Double(min(1.0, max(0.0, (t - 0.10) / 0.72)))
-        let offsetX = (curX + curW * 0.5) - (w * 0.5)
-        let offsetY = (curY + curH * 0.5) - (h * 0.5)
 
         content
             .frame(width: w, height: h)
             .scaleEffect(isMorphing ? scale : 1.0, anchor: .topLeading)
+            .offset(x: 0, y: isMorphing ? (-safeTop * scale * t) : 0)
             .frame(
                 width: isMorphing ? curW : w,
                 height: isMorphing ? curH : h,
@@ -366,7 +371,10 @@ private struct SafariStartPageHeroModifier: ViewModifier, Animatable {
                         .strokeBorder(borderColor.opacity(borderAlpha), lineWidth: 2.6)
                 }
             }
-            .offset(x: isMorphing ? offsetX : 0, y: isMorphing ? offsetY : 0)
+            .position(
+                x: isMorphing ? (curX + curW * 0.5) : (w * 0.5),
+                y: isMorphing ? (curY + curH * 0.5) : (h * 0.5)
+            )
     }
 }
 
@@ -424,7 +432,6 @@ struct BrowserScreen: View {
     var body: some View {
         let isBottomBar = model.preferences.addressBarPosition == .bottom
         let safeTop = screenSafeAreaInsets.top
-        let screenSize = UIScreen.main.bounds.size
         let pageBackdropColor: Color = {
             if showTabs || isHeroMorphing {
                 return Color(red: 0.09, green: 0.10, blue: 0.12)
@@ -447,22 +454,33 @@ struct BrowserScreen: View {
             ZStack {
                 if let tab = model.activeTab {
                     if model.isStartPage {
-                        ZStack {
-                            Color(red: 0.08, green: 0.08, blue: 0.09).ignoresSafeArea()
-                            startPageView
-                                .padding(.top, isHeroMorphing ? safeTop : 0)
-                        }
-                        .ignoresSafeArea(edges: isHeroMorphing ? .all : [])
-                        .modifier(
-                            SafariStartPageHeroModifier(
-                                progress: heroMorphProgress,
-                                isMorphing: isHeroMorphing,
-                                screenSize: screenSize,
-                                cardRect: heroTargetRect,
-                                cardCornerRadius: heroTargetCornerRadius,
-                                borderColor: Color(uiColor: heroTargetBorderColor)
+                        GeometryReader { rootGeo in
+                            let w = max(1, rootGeo.size.width)
+                            let h = max(1, rootGeo.size.height)
+                            let rootOrigin = rootGeo.frame(in: .global).origin
+                            let localCard = (heroTargetRect.width > 20 && heroTargetRect.height > 20)
+                                ? heroTargetRect.offsetBy(dx: -rootOrigin.x, dy: -rootOrigin.y)
+                                : CGRect(x: w * 0.5 - 88, y: h * 0.5 - 115, width: 176, height: 230)
+                            ZStack {
+                                Color(red: 0.08, green: 0.08, blue: 0.09)
+                                startPageView
+                                    .padding(.top, safeTop)
+                                    .padding(.bottom, screenSafeAreaInsets.bottom)
+                            }
+                            .frame(width: w, height: h)
+                            .modifier(
+                                SafariStartPageHeroModifier(
+                                    progress: heroMorphProgress,
+                                    isMorphing: isHeroMorphing,
+                                    screenSize: CGSize(width: w, height: h),
+                                    safeTop: safeTop,
+                                    cardRect: localCard,
+                                    cardCornerRadius: heroTargetCornerRadius,
+                                    borderColor: Color(uiColor: heroTargetBorderColor)
+                                )
                             )
-                        )
+                        }
+                        .ignoresSafeArea()
                     } else {
                         ZStack {
                             HeroBrowserHostRepresentable(
@@ -471,7 +489,10 @@ struct BrowserScreen: View {
                                 topColor: model.tabTopColors[tab.id] ?? UIColor(red: 0.08, green: 0.09, blue: 0.11, alpha: 1.0),
                                 isWebViewCommitted: model.committedTabIDs.contains(tab.id),
                                 safeTop: safeTop,
-                                command: heroMorphCommand
+                                command: heroMorphCommand,
+                                onDidResetToFullScreen: {
+                                    model.unfreezeAllHeroMorphScrollInsets()
+                                }
                             )
                             .ignoresSafeArea()
 
@@ -1630,7 +1651,7 @@ struct BrowserScreen: View {
                 heroMorphProgress = 1.0
             }
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.38) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.39) {
             guard heroMorphToken == token else { return }
             var endTx = Transaction()
             endTx.disablesAnimations = true
@@ -1640,7 +1661,9 @@ struct BrowserScreen: View {
                 heroMorphProgress = 0.0
                 heroMorphCommand = HeroMorphCommand(kind: .idle)
             }
-            model.unfreezeAllHeroMorphScrollInsets()
+            if model.isStartPage {
+                model.unfreezeAllHeroMorphScrollInsets()
+            }
         }
     }
 
@@ -1706,7 +1729,7 @@ struct BrowserScreen: View {
                 toolbarVisible = true
             }
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.37) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.40) {
             guard heroMorphToken == token else { return }
             var endTx = Transaction()
             endTx.disablesAnimations = true
@@ -1718,7 +1741,9 @@ struct BrowserScreen: View {
                 toolbarVisible = true
                 heroMorphCommand = HeroMorphCommand(kind: .idle)
             }
-            model.unfreezeAllHeroMorphScrollInsets()
+            if model.isStartPage {
+                model.unfreezeAllHeroMorphScrollInsets()
+            }
         }
     }
 
@@ -2106,10 +2131,9 @@ struct TabOverview: View {
     private func displayedTabs(for groupID: UUID) -> [BrowserTab] {
         let q = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         let raw = model.tabs(forGroup: groupID)
-        let filtered = q.isEmpty ? raw : raw.filter {
+        return q.isEmpty ? raw : raw.filter {
             $0.title.lowercased().contains(q) || $0.url.lowercased().contains(q)
         }
-        return model.preferences.tabsStartFromBottom ? Array(filtered.reversed()) : filtered
     }
 
     var body: some View {
@@ -2179,7 +2203,7 @@ struct TabOverview: View {
                 isPresented: showTopMenu,
                 alignment: .topTrailing,
                 anchor: .topTrailing,
-                edgeInsets: EdgeInsets(top: 62, leading: 16, bottom: 0, trailing: 14),
+                edgeInsets: EdgeInsets(top: 70, leading: 16, bottom: 0, trailing: 14),
                 onDismiss: { showTopMenu = false }
             ) {
                 LiquidGlassTabOverviewMenuPopover(
@@ -2360,7 +2384,7 @@ struct TabOverview: View {
             }
         }
         .padding(.horizontal, 14)
-        .padding(.top, 8)
+        .padding(.top, 16)
         .padding(.bottom, 6)
     }
 
@@ -2425,6 +2449,7 @@ struct TabOverview: View {
                                 LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 12), count: colCount), spacing: 14) {
                                     ForEach(Array(groupTabs.enumerated()), id: \.element.id) { idx, tab in
                                         safariTabCard(tab: tab, index: idx, cardHeight: gridThumbHeight, isHeroSingle: false, outerGeo: outerGeo, scrollProxy: proxy, groupTabs: groupTabs)
+                                            .id(tab.id)
                                             .offset(visualShiftOffset(for: idx, groupID: groupID))
                                             .animation(.spring(response: 0.28, dampingFraction: 0.80), value: dragTargetIndex)
                                             .transition(.asymmetric(
@@ -2442,6 +2467,13 @@ struct TabOverview: View {
                     .padding(.bottom, 12)
                 }
                 .scrollDisabled(draggingTabID != nil || contextMenuTab != nil)
+                .onAppear {
+                    if groupTabs.contains(where: { $0.id == model.activeID }) {
+                        proxy.scrollTo(model.activeID, anchor: .center)
+                    } else if model.preferences.tabsStartFromBottom, let lastID = groupTabs.last?.id {
+                        proxy.scrollTo(lastID, anchor: .bottom)
+                    }
+                }
                 .onPreferenceChange(TabCardFramePreferenceKey.self) { frames in
                     let currentCardH = isSingleHero ? heroH : gridThumbHeight
                     for (id, rect) in frames {
