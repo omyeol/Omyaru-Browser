@@ -1,3 +1,19 @@
+# 2026-11-24 Antigravity: iOS 탭 목록 길게 누르기 시 정지 상태에서 카드 자동 이동·핑퐁 완전 해결 — 네이티브 UIKit `UILongPressGestureRecognizer` 페이지 단위 통합 (`iOS build 87`)
+
+- 작업 워크스페이스: `E:/DEV/CODEX/BROWSER`
+- 사용자 요청:
+  - `KakaoTalk_20261124_115939363.mp4` 영상처럼 iOS 탭 목록에서 손가락을 가만히 대고 길게 누르고 있는데 카드가 좌우로 스스로 튕기며 자리를 계속 바꾸는 현상 해결
+- 원인 (`KakaoTalk_20261124_115939363.mp4` 분석):
+  1. `TabView(.page)`(`UIPageViewController`)가 각 페이지를 별도 `UIHostingController`로 감싸기 때문에, `TabView` 바깥 `ZStack`에 선언된 `.coordinateSpace(name: "overviewRootSpace")`가 내부 페이지의 `GeometryReader`/`DragGesture`와 원점이 어긋나 길게 누르는 순간 카드가 좌상단으로 순간 이동함.
+  2. `LazyVGrid` 내부의 `ForEach` 카드 셀 자체에 SwiftUI `DragGesture`가 붙어 있어, `moveVisibleTab`으로 셀이 좌↔우 열을 이동하는 순간 `DragGesture.location`이 셀 이동량만큼 튀면서 손가락이 정지한 상태에서도 0.24초마다 0번↔1번 슬롯을 무한 핑퐁 스왑함.
+- 해결 (`apps/ios/Omyaru/BrowserViews.swift`, `Info.plist`, `OmyaruApp.swift`):
+  - **페이지 로컬 `"tabPageSpace"` + 네이티브 UIKit `TabGridLongPressBridge` (`UILongPressGestureRecognizer`) 도입**:
+    - 개별 `ForEach` 카드에서 SwiftUI `LongPressGesture`/`DragGesture`를 완전히 제거하고, 각 그룹 페이지의 정적 `ZStack`(`.coordinateSpace(name: "tabPageSpace")`) 내부에서 카드 프레임 측정·플로팅 오버레이 배치·UIKit `UILongPressGestureRecognizer`(`minimumPressDuration = 0.28`, `allowableMovement = 12`) 터치 좌표(`recognizer.location(in: anchorView)`)를 **100% 동일한 단일 페이지 좌표계**로 통일.
+    - 제스처 인식기가 페이지 루트 `UIHostingController.view`(고정 뷰)에 붙어 있으므로 `LazyVGrid` 카드가 자리를 바꿔도 터치 좌표가 절대 튀지 않으며, 손가락이 12pt 이내로 정지해 있는 동안 카드는 0.001pt도 움직이지 않음.
+  - iOS 빌드 번호: `86` → **`87`** (`Info.plist`, `OmyaruApp.swift`).
+
+---
+
 # 2026-11-24 Antigravity: iOS 탭 목록 길게 누르기 떨림(부들부들) 근본 해결 — 전용 플로팅 드래그 오버레이 분리 (`iOS build 86`)
 
 - 작업 워크스페이스: `E:/DEV/CODEX/BROWSER`
