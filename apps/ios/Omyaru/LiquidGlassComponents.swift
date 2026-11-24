@@ -785,10 +785,11 @@ struct LiquidGlassTabOverviewMenuPopover: View {
     }
 }
 
-// MARK: - 4. Tab Card Long-Press Liquid Glass Context Menu (Exact Frames 00:12 & 00:14!)
+// MARK: - 4. Tab Card Long-Press Liquid Glass Context Menu (Exact Safari Video Match!)
 
 struct LiquidGlassTabCardContextPopover: View {
     let tab: BrowserTab
+    var canCloseOtherTabs: Bool = true
     var onDismiss: () -> Void
     var onCopyLink: () -> Void
     var onTogglePin: () -> Void
@@ -798,15 +799,24 @@ struct LiquidGlassTabCardContextPopover: View {
     var onCloseOtherTabs: () -> Void
     var onCloseTab: () -> Void
 
+    private var hasWebURL: Bool {
+        let trimmed = tab.url.trimmingCharacters(in: .whitespacesAndNewlines)
+        return !trimmed.isEmpty && trimmed != "about:blank"
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            GlassMenuRow(title: "링크 복사하기", systemImage: "doc.on.doc") {
-                onCopyLink()
-                onDismiss()
+            if hasWebURL {
+                GlassMenuRow(title: "링크 복사하기", systemImage: "link") {
+                    onCopyLink()
+                    onDismiss()
+                }
             }
-            GlassMenuRow(title: tab.isPinned ? "탭 고정 해제" : "탭 고정", systemImage: tab.isPinned ? "pin.slash" : "pin") {
-                onTogglePin()
-                onDismiss()
+            if hasWebURL || tab.isPinned {
+                GlassMenuRow(title: tab.isPinned ? "탭 고정 해제" : "탭 고정", systemImage: tab.isPinned ? "pin.slash" : "pin") {
+                    onTogglePin()
+                    onDismiss()
+                }
             }
             GlassMenuRow(title: "탭 복제", systemImage: "plus.square.on.square") {
                 onDuplicate()
@@ -818,26 +828,30 @@ struct LiquidGlassTabCardContextPopover: View {
             }
             GlassMenuRow(title: "탭 이동", systemImage: "arrow.right", trailingChevron: true) {
                 onDismiss()
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.14) { onMoveTab() }
-            }
-            Divider().background(Color.white.opacity(0.14))
-            GlassMenuRow(
-                title: "다른 탭 닫기",
-                systemImage: "xmark.circle",
-                iconColor: Color(red: 1.0, green: 0.42, blue: 0.42),
-                textColor: Color(red: 1.0, green: 0.46, blue: 0.46)
-            ) {
-                onCloseOtherTabs()
-                onDismiss()
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.16) { onMoveTab() }
             }
             GlassMenuRow(
                 title: "탭 닫기",
                 systemImage: "xmark",
-                iconColor: Color(red: 1.0, green: 0.38, blue: 0.38),
-                textColor: Color(red: 1.0, green: 0.42, blue: 0.42)
+                iconColor: Color(red: 1.0, green: 0.34, blue: 0.34),
+                textColor: Color(red: 1.0, green: 0.38, blue: 0.38)
             ) {
                 onCloseTab()
                 onDismiss()
+            }
+            if canCloseOtherTabs {
+                Divider()
+                    .background(Color.white.opacity(0.14))
+                    .padding(.vertical, 3)
+                GlassMenuRow(
+                    title: "다른 탭 닫기",
+                    systemImage: "xmark",
+                    iconColor: Color(red: 1.0, green: 0.34, blue: 0.34),
+                    textColor: Color(red: 1.0, green: 0.38, blue: 0.38)
+                ) {
+                    onCloseOtherTabs()
+                    onDismiss()
+                }
             }
         }
         .padding(.vertical, 6)
@@ -845,10 +859,10 @@ struct LiquidGlassTabCardContextPopover: View {
         .background(
             LiquidGlassShapeBackground(
                 shape: RoundedRectangle(cornerRadius: 26, style: .continuous),
-                tintOpacity: 0.62,
-                rimOpacity: 0.40,
-                specularOpacity: 0.22,
-                shadowRadius: 24
+                tintOpacity: 0.64,
+                rimOpacity: 0.34,
+                specularOpacity: 0.18,
+                shadowRadius: 26
             )
         )
         .clipShape(RoundedRectangle(cornerRadius: 26, style: .continuous))

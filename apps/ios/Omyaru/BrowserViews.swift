@@ -1362,6 +1362,12 @@ struct TabOverview: View {
     @State private var useGridLayout = true
     @State private var showTopMenu = false
     @State private var contextMenuTab: BrowserTab? = nil
+    @State private var contextMenuSourceRect: CGRect = .zero
+    @State private var contextMenuIsHero = false
+    @State private var contextMenuStartScale: CGFloat = 1.0
+    @State private var contextMenuExpanded = false
+    @State private var contextMenuSessionID = UUID()
+    @State private var autoPeekTask: Task<Void, Never>? = nil
     @State private var newGroupName = ""
     @State private var showingNewGroup = false
     @State private var showingGroupManager = false
@@ -1424,7 +1430,7 @@ struct TabOverview: View {
                     }
                 }
                 .tabViewStyle(.page(indexDisplayMode: .never))
-                .scrollDisabled(draggingTabID != nil)
+                .scrollDisabled(draggingTabID != nil || contextMenuTab != nil)
                 .animation(.spring(response: 0.34, dampingFraction: 0.86), value: pagedGroupID)
 
                 liquidGlassBottomCarouselBar
@@ -1501,94 +1507,15 @@ struct TabOverview: View {
                 )
             }
 
-            // Exact Video Frames 00:12 & 00:14: Floating Liquid Glass Tab Card Long-Press Menu!
-            LiquidGlassMorphContainer(
-                isPresented: contextMenuTab != nil,
-                alignment: .center,
-                anchor: .center,
-                edgeInsets: EdgeInsets(top: 120, leading: 24, bottom: 80, trailing: 24),
-                animationResponse: 0.20,
-                animationDamping: 0.88,
-                initialScale: 0.86,
-                initialBlur: 3,
-                onDismiss: { contextMenuTab = nil }
-            ) {
-                if let targetTab = contextMenuTab {
-                    VStack(spacing: 16) {
-                        // Lifted Mini Preview Card
-                        VStack(spacing: 6) {
-                            ZStack {
-                                Color(red: 0.12, green: 0.13, blue: 0.16)
-                                if let snap = model.tabSnapshots[targetTab.id] {
-                                    Image(uiImage: snap)
-                                        .resizable()
-                                        .scaledToFill()
-                                        .frame(width: 196, height: 150)
-                                        .clipped()
-                                } else {
-                                    Image(systemName: targetTab.url == "about:blank" ? "sparkles" : "globe")
-                                        .font(.largeTitle)
-                                        .foregroundStyle(.white.opacity(0.45))
-                                }
-                            }
-                            .frame(width: 196, height: 150)
-                            .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
-                            .overlay(
-                                RoundedRectangle(cornerRadius: 18, style: .continuous)
-                                    .strokeBorder(Color.white.opacity(0.28), lineWidth: 1)
-                            )
-                            .shadow(color: .black.opacity(0.48), radius: 22, y: 10)
-
-                            Text(targetTab.title)
-                                .font(.caption.weight(.semibold))
-                                .foregroundStyle(.white)
-                                .lineLimit(1)
-                                .frame(maxWidth: 220)
-                        }
-
-                        LiquidGlassTabCardContextPopover(
-                            tab: targetTab,
-                            onDismiss: {
-                                withAnimation(.spring(response: 0.28, dampingFraction: 0.84)) { contextMenuTab = nil }
-                            },
-                            onCopyLink: {
-                                UIPasteboard.general.string = targetTab.url
-                                model.status = "링크를 복사했습니다."
-                            },
-                            onTogglePin: {
-                                withAnimation(.spring(response: 0.28, dampingFraction: 0.84)) {
-                                    model.togglePinTab(targetTab.id)
-                                }
-                            },
-                            onDuplicate: {
-                                withAnimation(.spring(response: 0.28, dampingFraction: 0.82)) {
-                                    model.duplicateTab(targetTab.id)
-                                }
-                            },
-                            onSelectTab: {
-                                withAnimation(.spring(response: 0.28, dampingFraction: 0.84)) {
-                                    selectionMode = true
-                                    selectedTabIDs.insert(targetTab.id)
-                                }
-                            },
-                            onMoveTab: {
-                                batchMoveIDs = [targetTab.id]
-                                showingBatchMove = true
-                            },
-                            onCloseOtherTabs: {
-                                withAnimation(.spring(response: 0.28, dampingFraction: 0.82)) {
-                                    model.closeOtherTabs(keeping: targetTab.id)
-                                }
-                            },
-                            onCloseTab: {
-                                withAnimation(.spring(response: 0.28, dampingFraction: 0.82)) {
-                                    model.close(targetTab.id)
-                                }
-                            }
-                        )
-                    }
-                }
+            // Exact Safari Video Match: In-Place Lifted Tab Thumbnail Preview + Anchored Liquid Glass Context Menu!
+            if let targetTab = contextMenuTab {
+                safariTabContextOverlay(for: targetTab)
+                    .zIndex(95)
             }
+        }
+        .onDisappear {
+            autoPeekTask?.cancel()
+            autoPeekTask = nil
         }
         .onAppear {
             pagedGroupID = model.activeGroupID
@@ -1794,7 +1721,7 @@ struct TabOverview: View {
                     }
                     .padding(.bottom, 12)
                 }
-                .scrollDisabled(draggingTabID != nil)
+                .scrollDisabled(draggingTabID != nil || contextMenuTab != nil)
                 .onPreferenceChange(TabCardFramePreferenceKey.self) { frames in
                     for (id, rect) in frames {
                         tabFrames[id] = rect
@@ -1827,78 +1754,288 @@ struct TabOverview: View {
         return CGSize(width: to.midX - from.midX, height: to.midY - from.midY)
     }
 
+    private var windowSafeAreaInsets: UIEdgeInsets {
+        let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+        return scenes.first(where: { $0.activationState == .foregroundActive })?.keyWindow?.safeAreaInsets
+            ?? scenes.first?.keyWindow?.safeAreaInsets
+            ?? UIEdgeInsets(top: 54, left: 0, bottom: 34, right: 0)
+    }
+
+    private func openContextMenu(
+        for tab: BrowserTab,
+        thumbRect: CGRect,
+        isHero: Bool,
+        startScale: CGFloat
+    ) {
+        autoPeekTask?.cancel()
+        autoPeekTask = nil
+        contextMenuSessionID = UUID()
+        contextMenuSourceRect = thumbRect
+        contextMenuIsHero = isHero
+        contextMenuStartScale = startScale
+        contextMenuExpanded = false
+        contextMenuTab = tab
+        UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+        DispatchQueue.main.async {
+            withAnimation(.spring(response: 0.28, dampingFraction: 0.80)) {
+                contextMenuExpanded = true
+            }
+        }
+    }
+
+    private func dismissContextMenu(afterDismiss: (() -> Void)? = nil) {
+        guard contextMenuTab != nil else { return }
+        let token = contextMenuSessionID
+        contextMenuStartScale = 1.0
+        withAnimation(.spring(response: 0.23, dampingFraction: 0.86)) {
+            contextMenuExpanded = false
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.21) {
+            guard contextMenuSessionID == token else { return }
+            contextMenuTab = nil
+            afterDismiss?()
+        }
+    }
+
+    private func safariTabContextOverlay(for targetTab: BrowserTab) -> some View {
+        let groupCount = model.tabs(forGroup: targetTab.groupID).count
+        let canCloseOthers = groupCount > 1
+        let trimmedURL = targetTab.url.trimmingCharacters(in: .whitespacesAndNewlines)
+        let hasWebURL = !trimmedURL.isEmpty && trimmedURL != "about:blank"
+        let estimatedRows: CGFloat = 4 + (hasWebURL ? 1 : 0) + ((hasWebURL || targetTab.isPinned) ? 1 : 0) + (canCloseOthers ? 1 : 0)
+        let estimatedMenuH: CGFloat = estimatedRows * 44 + (canCloseOthers ? 10 : 0) + 14
+        let menuWidth: CGFloat = 244
+        let menuGap: CGFloat = 12
+        let safe = windowSafeAreaInsets
+
+        return GeometryReader { overlayGeo in
+            let origin = overlayGeo.frame(in: .global).origin
+            let screenW = overlayGeo.size.width
+            let screenH = overlayGeo.size.height
+            let topBound = max(54, safe.top + 12)
+            let bottomBound = screenH - max(22, safe.bottom + 14)
+
+            let rawLocalRect: CGRect = {
+                if contextMenuSourceRect.width > 20 && contextMenuSourceRect.height > 20 {
+                    return CGRect(
+                        x: contextMenuSourceRect.minX - origin.x,
+                        y: contextMenuSourceRect.minY - origin.y,
+                        width: contextMenuSourceRect.width,
+                        height: contextMenuSourceRect.height
+                    )
+                }
+                let fallbackW = min(210, screenW * 0.54)
+                let fallbackH = min(230, fallbackW * 1.18)
+                return CGRect(
+                    x: (screenW - fallbackW) * 0.5,
+                    y: max(topBound + 24, (screenH - fallbackH - menuGap - estimatedMenuH) * 0.45),
+                    width: fallbackW,
+                    height: fallbackH
+                )
+            }()
+
+            let maxAllowedPreviewH = max(130, (bottomBound - topBound) - menuGap - estimatedMenuH)
+            let baseScale: CGFloat = contextMenuIsHero ? 0.90 : 1.07
+            let targetScale = max(0.62, min(baseScale, maxAllowedPreviewH / max(1, rawLocalRect.height)))
+            let scaledW = rawLocalRect.width * targetScale
+            let scaledH = rawLocalRect.height * targetScale
+
+            let clampedCenterX = min(max(rawLocalRect.midX, 12 + scaledW * 0.5), screenW - 12 - scaledW * 0.5)
+            let minCenterY = topBound + scaledH * 0.5
+            let maxCenterY = max(minCenterY, bottomBound - estimatedMenuH - menuGap - scaledH * 0.5)
+            let clampedCenterY = max(minCenterY, min(rawLocalRect.midY, maxCenterY))
+
+            let scaledLeft = clampedCenterX - scaledW * 0.5
+            let scaledRight = clampedCenterX + scaledW * 0.5
+            let scaledBottom = clampedCenterY + scaledH * 0.5
+
+            let isLeftColumn = rawLocalRect.midX < screenW * 0.45
+            let isRightColumn = rawLocalRect.midX > screenW * 0.55
+
+            let menuLeft: CGFloat = {
+                if isLeftColumn {
+                    return min(max(14, scaledLeft), screenW - 14 - menuWidth)
+                } else if isRightColumn {
+                    return max(14, min(screenW - 14 - menuWidth, scaledRight - menuWidth))
+                } else {
+                    return max(14, min(screenW - 14 - menuWidth, clampedCenterX - menuWidth * 0.5))
+                }
+            }()
+            let menuTop = min(scaledBottom + menuGap, max(topBound + 40, bottomBound - estimatedMenuH))
+            let menuAnchor: UnitPoint = isLeftColumn ? .topLeading : (isRightColumn ? .topTrailing : .top)
+
+            ZStack(alignment: .topLeading) {
+                // Full-screen smooth dim backdrop behind lifted card + menu (exact Safari scrim!)
+                Color.black.opacity(contextMenuExpanded ? 0.48 : 0.0)
+                    .ignoresSafeArea()
+                    .contentShape(Rectangle())
+                    .onTapGesture {
+                        dismissContextMenu()
+                    }
+
+                // In-Place Lifted Tab Thumbnail Preview (exact card shape, scales cleanly above dimmed backdrop!)
+                safariTabThumbnailView(
+                    tab: targetTab,
+                    cardHeight: rawLocalRect.height,
+                    isHeroSingle: contextMenuIsHero,
+                    isLiftedOverlay: true,
+                    showSelectionBadge: false
+                )
+                .frame(width: rawLocalRect.width, height: rawLocalRect.height)
+                .scaleEffect(contextMenuExpanded ? targetScale : contextMenuStartScale)
+                .position(
+                    x: contextMenuExpanded ? clampedCenterX : rawLocalRect.midX,
+                    y: contextMenuExpanded ? clampedCenterY : rawLocalRect.midY
+                )
+                .onTapGesture {
+                    dismissContextMenu {
+                        model.select(targetTab.id)
+                        onDismiss()
+                    }
+                }
+
+                // Anchored Liquid Glass Context Menu directly beneath the lifted card!
+                LiquidGlassTabCardContextPopover(
+                    tab: targetTab,
+                    canCloseOtherTabs: canCloseOthers,
+                    onDismiss: {
+                        dismissContextMenu()
+                    },
+                    onCopyLink: {
+                        UIPasteboard.general.string = targetTab.url
+                        model.status = "링크를 복사했습니다."
+                    },
+                    onTogglePin: {
+                        withAnimation(.spring(response: 0.28, dampingFraction: 0.84)) {
+                            model.togglePinTab(targetTab.id)
+                        }
+                    },
+                    onDuplicate: {
+                        withAnimation(.spring(response: 0.28, dampingFraction: 0.82)) {
+                            model.duplicateTab(targetTab.id)
+                        }
+                    },
+                    onSelectTab: {
+                        withAnimation(.spring(response: 0.28, dampingFraction: 0.84)) {
+                            selectionMode = true
+                            selectedTabIDs.insert(targetTab.id)
+                        }
+                    },
+                    onMoveTab: {
+                        batchMoveIDs = [targetTab.id]
+                        showingBatchMove = true
+                    },
+                    onCloseOtherTabs: {
+                        withAnimation(.spring(response: 0.28, dampingFraction: 0.82)) {
+                            model.closeOtherTabs(keeping: targetTab.id)
+                        }
+                    },
+                    onCloseTab: {
+                        withAnimation(.spring(response: 0.28, dampingFraction: 0.82)) {
+                            model.close(targetTab.id)
+                        }
+                    }
+                )
+                .scaleEffect(contextMenuExpanded ? 1.0 : 0.28, anchor: menuAnchor)
+                .blur(radius: contextMenuExpanded ? 0 : 6)
+                .opacity(contextMenuExpanded ? 1.0 : 0.0)
+                .offset(x: menuLeft, y: menuTop)
+            }
+        }
+        .ignoresSafeArea()
+    }
+
+    // Pure thumbnail rounded card body shared by grid slot, floating drag overlay, and in-place context menu preview
+    private func safariTabThumbnailView(
+        tab: BrowserTab,
+        cardHeight: CGFloat,
+        isHeroSingle: Bool,
+        isLiftedOverlay: Bool,
+        showSelectionBadge: Bool = true
+    ) -> some View {
+        let isActive = tab.id == model.activeID
+        let isSelected = selectedTabIDs.contains(tab.id)
+
+        return ZStack(alignment: .topTrailing) {
+            Group {
+                if let snap = model.tabSnapshots[tab.id] {
+                    Image(uiImage: snap)
+                        .resizable()
+                        .scaledToFill()
+                        .frame(maxWidth: .infinity)
+                        .frame(height: cardHeight)
+                        .clipped()
+                } else {
+                    ZStack {
+                        Color(red: 0.08, green: 0.09, blue: 0.11)
+                        Image(systemName: tab.url == "about:blank" ? "sparkles" : "safari")
+                            .font(.system(size: isHeroSingle ? 40 : 28))
+                            .foregroundStyle(.white.opacity(0.22))
+                    }
+                    .frame(maxWidth: .infinity)
+                    .frame(height: cardHeight)
+                }
+            }
+            .clipShape(RoundedRectangle(cornerRadius: isHeroSingle ? 22 : 18, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: isHeroSingle ? 22 : 18, style: .continuous)
+                    .strokeBorder(
+                        isLiftedOverlay
+                            ? Color.white.opacity(0.32)
+                            : (selectionMode && isSelected)
+                                ? Color(red: 0.20, green: 0.56, blue: 1.0)
+                                : (isActive ? Color.white.opacity(0.55) : Color.white.opacity(0.14)),
+                        lineWidth: (isLiftedOverlay || isActive || (selectionMode && isSelected)) ? 1.6 : 0.9
+                    )
+            )
+            .shadow(
+                color: .black.opacity(isLiftedOverlay ? 0.56 : 0.40),
+                radius: isLiftedOverlay ? 28 : (isHeroSingle ? 18 : 10),
+                y: isLiftedOverlay ? 14 : 6
+            )
+
+            // Pinned Badge Top-Left
+            if tab.isPinned {
+                HStack {
+                    Image(systemName: "pin.fill")
+                        .font(.system(size: 10, weight: .bold))
+                        .foregroundStyle(.white)
+                        .padding(5)
+                        .background(Color.blue.opacity(0.85), in: Circle())
+                        .padding(8)
+                    Spacer()
+                }
+            }
+
+            // Selection Checkmark at Top-Right (Close × button is layered ABOVE TabCardGestureOverlay in safariTabCard!)
+            if showSelectionBadge && selectionMode {
+                Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
+                    .font(.system(size: 22))
+                    .foregroundStyle(isSelected ? Color(red: 0.20, green: 0.56, blue: 1.0) : .white.opacity(0.75))
+                    .padding(8)
+            }
+        }
+    }
+
     // Pure visual body shared by grid card and lifted floating drag overlay
     private func safariTabCardVisual(
         tab: BrowserTab,
         cardHeight: CGFloat,
         isHeroSingle: Bool,
-        isLiftedOverlay: Bool
+        isLiftedOverlay: Bool,
+        hideThumbnail: Bool = false
     ) -> some View {
-        let isActive = tab.id == model.activeID
-        let isSelected = selectedTabIDs.contains(tab.id)
         let host = URL(string: tab.url)?.host?.replacingOccurrences(of: "^www\\.", with: "", options: .regularExpression)
         let cardLabel = tab.title.isEmpty || tab.title == "새 탭" ? (host ?? "새 탭") : tab.title
 
         return VStack(spacing: 7) {
-            ZStack(alignment: .topTrailing) {
-                Group {
-                    if let snap = model.tabSnapshots[tab.id] {
-                        Image(uiImage: snap)
-                            .resizable()
-                            .scaledToFill()
-                            .frame(maxWidth: .infinity)
-                            .frame(height: cardHeight)
-                            .clipped()
-                    } else {
-                        ZStack {
-                            Color(red: 0.08, green: 0.09, blue: 0.11)
-                            Image(systemName: tab.url == "about:blank" ? "sparkles" : "safari")
-                                .font(.system(size: isHeroSingle ? 40 : 28))
-                                .foregroundStyle(.white.opacity(0.22))
-                        }
-                        .frame(maxWidth: .infinity)
-                        .frame(height: cardHeight)
-                    }
-                }
-                .clipShape(RoundedRectangle(cornerRadius: isHeroSingle ? 22 : 18, style: .continuous))
-                .overlay(
-                    RoundedRectangle(cornerRadius: isHeroSingle ? 22 : 18, style: .continuous)
-                        .strokeBorder(
-                            isLiftedOverlay
-                                ? Color.white.opacity(0.75)
-                                : (selectionMode && isSelected)
-                                    ? Color(red: 0.20, green: 0.56, blue: 1.0)
-                                    : (isActive ? Color.white.opacity(0.55) : Color.white.opacity(0.14)),
-                            lineWidth: (isLiftedOverlay || isActive || (selectionMode && isSelected)) ? 2.0 : 0.9
-                        )
-                )
-                .shadow(
-                    color: .black.opacity(isLiftedOverlay ? 0.62 : 0.40),
-                    radius: isLiftedOverlay ? 26 : (isHeroSingle ? 18 : 10),
-                    y: isLiftedOverlay ? 14 : 6
-                )
-
-                // Pinned Badge Top-Left
-                if tab.isPinned {
-                    HStack {
-                        Image(systemName: "pin.fill")
-                            .font(.system(size: 10, weight: .bold))
-                            .foregroundStyle(.white)
-                            .padding(5)
-                            .background(Color.blue.opacity(0.85), in: Circle())
-                            .padding(8)
-                        Spacer()
-                    }
-                }
-
-                // Selection Checkmark at Top-Right (Close × button is layered ABOVE TabCardGestureOverlay in safariTabCard!)
-                if selectionMode {
-                    Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
-                        .font(.system(size: 22))
-                        .foregroundStyle(isSelected ? Color(red: 0.20, green: 0.56, blue: 1.0) : .white.opacity(0.75))
-                        .padding(8)
-                }
-            }
+            safariTabThumbnailView(
+                tab: tab,
+                cardHeight: cardHeight,
+                isHeroSingle: isHeroSingle,
+                isLiftedOverlay: isLiftedOverlay
+            )
+            .opacity(hideThumbnail ? 0.0 : 1.0)
 
             // Icon + Title cleanly BELOW the Card (Exact Video Frames 00:01 & 00:16-00:20!)
             HStack(spacing: 5) {
@@ -1922,8 +2059,7 @@ struct TabOverview: View {
     }
 
     // Exact Video Frames 00:01 & 00:16-00:20 Tab Card
-    // Reliable SwiftUI LongPress -> DragGesture(.global) on a NEVER-MOVING slot!
-    // Neighbors visually shift via dragTargetIndex during drag, and model order commits cleanly on release -> ZERO jitter, ZERO ping-pong!
+    // Native UIKit LongPress -> in-place Safari Context Menu (auto-peek on motionless hold OR instant on release) + 120fps drag reorder!
     private func safariTabCard(
         tab: BrowserTab,
         index: Int,
@@ -1934,12 +2070,14 @@ struct TabOverview: View {
         groupTabs: [BrowserTab]
     ) -> some View {
         let isDraggingThis = draggingTabID == tab.id
+        let isContextMenuThis = contextMenuTab?.id == tab.id
 
         return safariTabCardVisual(
             tab: tab,
             cardHeight: cardHeight,
             isHeroSingle: isHeroSingle,
-            isLiftedOverlay: false
+            isLiftedOverlay: false,
+            hideThumbnail: isContextMenuThis
         )
         .opacity(isDraggingThis ? 0.0 : 1.0)
         .background(
@@ -1953,9 +2091,9 @@ struct TabOverview: View {
         .overlay(
             TabCardGestureOverlay(
                 isLongPressEnabled: !selectionMode && contextMenuTab == nil && !isSettlingDrop,
-                excludeTopRightCloseSize: (!selectionMode && !isHeroSingle && !isDraggingThis) ? 38 : 0,
+                excludeTopRightCloseSize: (!selectionMode && !isHeroSingle && !isDraggingThis && !isContextMenuThis) ? 38 : 0,
                 onTap: {
-                    guard draggingTabID == nil else { return }
+                    guard draggingTabID == nil && contextMenuTab == nil else { return }
                     if selectionMode {
                         if !selectedTabIDs.insert(tab.id).inserted {
                             selectedTabIDs.remove(tab.id)
@@ -1975,8 +2113,10 @@ struct TabOverview: View {
                         height: cardHeight + 24
                     )
                     let frame = tabFrames[tab.id] ?? fallbackFrame
+                    let thumbRect = CGRect(x: frame.minX, y: frame.minY, width: frame.width, height: cardHeight)
                     let center = CGPoint(x: frame.midX, y: frame.midY)
-                    dragSessionID = UUID()
+                    let sessionToken = UUID()
+                    dragSessionID = sessionToken
                     dragCardWidth = frame.width
                     dragCardThumbHeight = cardHeight
                     dragCardIsHero = isHeroSingle
@@ -1993,6 +2133,26 @@ struct TabOverview: View {
                     withAnimation(.spring(response: 0.16, dampingFraction: 0.80)) {
                         dragCardScale = 1.06
                     }
+
+                    // Auto-peek just like Safari video: if finger holds still (+0.24s -> ~0.42s total), bloom context menu right in place!
+                    autoPeekTask?.cancel()
+                    autoPeekTask = Task { @MainActor in
+                        try? await Task.sleep(nanoseconds: 240_000_000)
+                        guard !Task.isCancelled,
+                              dragSessionID == sessionToken,
+                              draggingTabID == tab.id,
+                              !dragMovedBeyondThreshold,
+                              !isSettlingDrop,
+                              contextMenuTab == nil else { return }
+                        draggingTabID = nil
+                        dragCardScale = 1.0
+                        dragFirstLocation = nil
+                        dragMovedBeyondThreshold = false
+                        dragOriginIndex = nil
+                        dragTargetIndex = nil
+                        dragSlotFrames = []
+                        openContextMenu(for: tab, thumbRect: thumbRect, isHero: isHeroSingle, startScale: 1.06)
+                    }
                 },
                 onLongPressChanged: { screenPt in
                     guard draggingTabID == tab.id && !isSettlingDrop else { return }
@@ -2003,7 +2163,9 @@ struct TabOverview: View {
                     let dx = screenPt.x - firstLoc.x
                     let dy = screenPt.y - firstLoc.y
                     if !dragMovedBeyondThreshold {
-                        guard hypot(dx, dy) > 18 else { return }
+                        guard hypot(dx, dy) > 16 else { return }
+                        autoPeekTask?.cancel()
+                        autoPeekTask = nil
                         dragMovedBeyondThreshold = true
                     }
                     let nextCenter = CGPoint(
@@ -2029,10 +2191,14 @@ struct TabOverview: View {
                     }
                 },
                 onLongPressEnded: {
+                    autoPeekTask?.cancel()
+                    autoPeekTask = nil
                     guard draggingTabID == tab.id else { return }
                     finalizeActiveTabDrag(in: groupTabs)
                 },
                 onLongPressCancelled: {
+                    autoPeekTask?.cancel()
+                    autoPeekTask = nil
                     guard draggingTabID == tab.id && !isSettlingDrop else { return }
                     draggingTabID = nil
                     dragCardScale = 1.0
@@ -2045,7 +2211,7 @@ struct TabOverview: View {
             )
         )
         .overlay(alignment: .topTrailing) {
-            if !selectionMode && !isHeroSingle && !isDraggingThis {
+            if !selectionMode && !isHeroSingle && !isDraggingThis && !isContextMenuThis {
                 Button {
                     UIImpactFeedbackGenerator(style: .light).impactOccurred()
                     withAnimation(.spring(response: 0.28, dampingFraction: 0.82)) {
@@ -2069,26 +2235,36 @@ struct TabOverview: View {
 
     private func finalizeActiveTabDrag(in groupTabs: [BrowserTab]) {
         guard let dragID = draggingTabID, !isSettlingDrop else { return }
+        autoPeekTask?.cancel()
+        autoPeekTask = nil
         let liftedTab = groupTabs.first(where: { $0.id == dragID }) ?? model.tabs.first(where: { $0.id == dragID })
         let wasDragged = dragMovedBeyondThreshold
         let originIdx = dragOriginIndex
         let targetIdx = dragTargetIndex
         let slots = dragSlotFrames
+        let savedThumbHeight = dragCardThumbHeight
+        let savedWidth = dragCardWidth
+        let savedIsHero = dragCardIsHero
+        let savedScale = dragCardScale
 
         dragFirstLocation = nil
         dragMovedBeyondThreshold = false
 
         if !wasDragged, let liftedTab {
-            // Held and released WITHOUT moving -> INSTANTLY open floating Liquid Glass context menu!
+            // Quick hold & release WITHOUT moving -> INSTANTLY open in-place Safari lifted thumbnail + anchored context menu!
+            let frame = tabFrames[liftedTab.id] ?? CGRect(
+                x: dragOriginCenter.x - savedWidth * 0.5,
+                y: dragOriginCenter.y - (savedThumbHeight + 22) * 0.5,
+                width: savedWidth,
+                height: savedThumbHeight + 22
+            )
+            let thumbRect = CGRect(x: frame.minX, y: frame.minY, width: frame.width, height: savedThumbHeight)
             draggingTabID = nil
             dragCardScale = 1.0
             dragOriginIndex = nil
             dragTargetIndex = nil
             dragSlotFrames = []
-            UIImpactFeedbackGenerator(style: .soft).impactOccurred()
-            withAnimation(.spring(response: 0.20, dampingFraction: 0.88)) {
-                contextMenuTab = liftedTab
-            }
+            openContextMenu(for: liftedTab, thumbRect: thumbRect, isHero: savedIsHero, startScale: max(1.02, savedScale))
             return
         }
 
@@ -2166,10 +2342,7 @@ struct TabOverview: View {
         }
         .onLongPressGesture(minimumDuration: 0.20) {
             guard !selectionMode else { return }
-            UIImpactFeedbackGenerator(style: .medium).impactOccurred()
-            withAnimation(.spring(response: 0.20, dampingFraction: 0.88)) {
-                contextMenuTab = tab
-            }
+            openContextMenu(for: tab, thumbRect: .zero, isHero: false, startScale: 0.96)
         }
     }
 
