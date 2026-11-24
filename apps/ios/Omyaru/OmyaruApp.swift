@@ -647,7 +647,7 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
     static let defaultProfileID = UUID(uuidString: "00000000-0000-0000-0000-000000000010")!
     static let defaultGroupID = UUID(uuidString: "00000000-0000-0000-0000-000000000002")!
     static let appVersionName = "0.15.18"
-    static let appBuildNumber = 99
+    static let appBuildNumber = 100
 
     var isApplyingRemoteSync: Bool = false
 
@@ -703,6 +703,7 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
     private var lastActiveTabByGroup: [UUID: UUID] = [:]
     private var pullRefreshStartedAt: [UUID: Date] = [:]
     private var frozenInsetTabIDs: Set<UUID> = []
+    private var isAdjustingMorphInsets = false
     var tabCardThumbRects: [UUID: CGRect] = [:]
     var tabCardIsHeroMap: [UUID: Bool] = [:]
     private var compiledContentRuleList: WKContentRuleList? = nil
@@ -1260,23 +1261,31 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
         let topInset = sv.adjustedContentInset.top > 4 ? sv.adjustedContentInset.top : fallbackSafeTop
         let bottomInset = sv.adjustedContentInset.bottom
         frozenInsetTabIDs.insert(id)
+        isAdjustingMorphInsets = true
         sv.contentInsetAdjustmentBehavior = .never
         sv.contentInset = UIEdgeInsets(top: topInset, left: 0, bottom: bottomInset, right: 0)
-        sv.setContentOffset(savedOffset, animated: false)
+        if abs(sv.contentOffset.y - savedOffset.y) > 0.5 {
+            sv.setContentOffset(savedOffset, animated: false)
+        }
+        isAdjustingMorphInsets = false
     }
 
     func unfreezeAllHeroMorphScrollInsets() {
         guard !frozenInsetTabIDs.isEmpty else { return }
         let ids = frozenInsetTabIDs
         frozenInsetTabIDs.removeAll()
+        isAdjustingMorphInsets = true
         for id in ids {
             guard let view = webViews[id] else { continue }
             let sv = view.scrollView
             let savedOffset = sv.contentOffset
             sv.contentInsetAdjustmentBehavior = .always
             applyContentInsets(to: view)
-            sv.setContentOffset(savedOffset, animated: false)
+            if abs(sv.contentOffset.y - savedOffset.y) > 0.5 {
+                sv.setContentOffset(savedOffset, animated: false)
+            }
         }
+        isAdjustingMorphInsets = false
     }
 
     // MARK: - Per-Site Content Blocking Toggle (Android PageToolsDialog Parity!)
@@ -1429,6 +1438,7 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
     }
 
     func scrollViewDidScroll(_ scrollView: UIScrollView) {
+        if isAdjustingMorphInsets { return }
         let viewportH = max(1, scrollView.bounds.height)
         let contentH = scrollView.contentSize.height
         let scrollable = contentH - viewportH

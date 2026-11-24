@@ -401,6 +401,7 @@ struct BrowserScreen: View {
     @State private var newFavURL = ""
     @State private var updateMessage: String? = nil
     @State private var isHeroMorphing = false
+    @State private var isExpandingToWeb = false
     @State private var heroMorphCommand = HeroMorphCommand(kind: .idle)
     @State private var heroMorphProgress: CGFloat = 0.0
     @State private var heroTargetRect: CGRect = .zero
@@ -414,7 +415,7 @@ struct BrowserScreen: View {
     @FocusState private var addressFocused: Bool
 
     private var anyDarkOverlayPresented: Bool {
-        showTabs || showBookmarks || showBookmarkEdit || showHistory || showDownloads
+        (showTabs && !isExpandingToWeb) || showBookmarks || showBookmarkEdit || showHistory || showDownloads
             || showBookshelf || showCaptureMenu || showLiveCapture || showWatermarkRemover
             || showDriveSync || showExtensions || showNetworkPrivacy || showSettings
             || showProfiles || showCloseAllConfirm || sharePayload != nil
@@ -425,6 +426,9 @@ struct BrowserScreen: View {
         let safeTop = screenSafeAreaInsets.top
         let screenSize = UIScreen.main.bounds.size
         let pageBackdropColor: Color = {
+            if showTabs || isHeroMorphing {
+                return Color(red: 0.09, green: 0.10, blue: 0.12)
+            }
             if model.isStartPage {
                 return Color(red: 0.08, green: 0.08, blue: 0.09)
             }
@@ -620,6 +624,7 @@ struct BrowserScreen: View {
             .environment(\.colorScheme, .dark)
             .zIndex(30)
         }
+        .environment(\.isLiquidGlassEnabled, model.preferences.liquidGlassUi)
         .sheet(isPresented: $showBookmarks) {
             BookmarksSheet()
                 .environmentObject(model)
@@ -1567,6 +1572,7 @@ struct BrowserScreen: View {
         var tx = Transaction()
         tx.disablesAnimations = true
         withTransaction(tx) {
+            isExpandingToWeb = false
             heroTargetRect = initialRect
             heroTargetCornerRadius = initialIsHero ? 22 : 18
             heroTargetBorderColor = UIColor(profileBorderColor(for: activeID))
@@ -1576,7 +1582,7 @@ struct BrowserScreen: View {
             isHeroMorphing = true
             showTabs = true
         }
-        withAnimation(.easeOut(duration: 0.12)) {
+        withAnimation(.easeOut(duration: 0.08)) {
             toolbarVisible = false
         }
 
@@ -1662,6 +1668,7 @@ struct BrowserScreen: View {
         var tx = Transaction()
         tx.disablesAnimations = true
         withTransaction(tx) {
+            isExpandingToWeb = true
             heroTargetRect = startRect
             heroTargetCornerRadius = corner
             heroTargetBorderColor = borderUI
@@ -1704,6 +1711,7 @@ struct BrowserScreen: View {
             withTransaction(endTx) {
                 showTabs = false
                 isHeroMorphing = false
+                isExpandingToWeb = false
                 heroMorphHiddenTabID = nil
                 toolbarVisible = true
                 heroMorphCommand = HeroMorphCommand(kind: .idle)
@@ -2104,21 +2112,23 @@ struct TabOverview: View {
 
     var body: some View {
         ZStack {
-            // Ambient Frosted Liquid Glass Backdrop (soft radial glow over blurred live browser)
+            // Solid dark charcoal base stays opaque during Hero Zoom morph so white pages NEVER bleed outside the shrinking border!
             ZStack {
-                Color.black.opacity(0.36).ignoresSafeArea()
-                Rectangle().fill(.ultraThinMaterial).opacity(0.72).ignoresSafeArea()
-                RadialGradient(
-                    colors: [
-                        Color(hex: model.activeProfile.colorHex).opacity(0.16),
-                        Color(red: 0.16, green: 0.11, blue: 0.14).opacity(0.24),
-                        Color.black.opacity(0.45)
-                    ],
-                    center: .topLeading,
-                    startRadius: 40,
-                    endRadius: 540
-                )
-                .ignoresSafeArea()
+                Color(red: 0.09, green: 0.10, blue: 0.12).ignoresSafeArea()
+                if model.preferences.liquidGlassUi {
+                    Rectangle().fill(.ultraThinMaterial).opacity(0.45).ignoresSafeArea()
+                    RadialGradient(
+                        colors: [
+                            Color(hex: model.activeProfile.colorHex).opacity(0.16),
+                            Color(red: 0.16, green: 0.11, blue: 0.14).opacity(0.22),
+                            Color.black.opacity(0.35)
+                        ],
+                        center: .topLeading,
+                        startRadius: 40,
+                        endRadius: 540
+                    )
+                    .ignoresSafeArea()
+                }
             }
 
             VStack(spacing: 0) {
@@ -2137,6 +2147,8 @@ struct TabOverview: View {
 
                 liquidGlassBottomCarouselBar
             }
+            .scaleEffect(0.94 + 0.06 * morphProgress)
+            .opacity(Double(morphProgress))
 
             // Full-screen floating lifted tab card in exact .global screen coordinates (zero TabView offset mismatch!)
             if let dragID = draggingTabID,
@@ -2224,8 +2236,6 @@ struct TabOverview: View {
                     .zIndex(95)
             }
         }
-        .scaleEffect(0.93 + 0.07 * morphProgress)
-        .opacity(Double(morphProgress))
         .onAppear {
             pagedGroupID = model.activeGroupID
         }

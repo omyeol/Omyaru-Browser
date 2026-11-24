@@ -1,9 +1,21 @@
 import SwiftUI
 import UIKit
 
-// MARK: - iOS 26 Safari Liquid Glass Design Primitives (Modeled on Reference Video)
+// MARK: - iOS 26 Safari Liquid Glass Design Primitives (Solid Flat by Default, Liquid Glass Only When Enabled)
+
+private struct LiquidGlassEnabledKey: EnvironmentKey {
+    static let defaultValue: Bool = false
+}
+
+extension EnvironmentValues {
+    var isLiquidGlassEnabled: Bool {
+        get { self[LiquidGlassEnabledKey.self] }
+        set { self[LiquidGlassEnabledKey.self] = newValue }
+    }
+}
 
 struct LiquidGlassShapeBackground<S: InsettableShape>: View {
+    @Environment(\.isLiquidGlassEnabled) private var isLiquidGlassEnabled
     let shape: S
     var tintOpacity: Double = 0.46
     var rimOpacity: Double = 0.34
@@ -11,36 +23,45 @@ struct LiquidGlassShapeBackground<S: InsettableShape>: View {
     var shadowRadius: CGFloat = 14
 
     var body: some View {
-        ZStack {
-            shape.fill(.ultraThinMaterial)
-            shape.fill(Color(red: 0.08, green: 0.09, blue: 0.11, opacity: tintOpacity))
-            shape.fill(
-                LinearGradient(
-                    colors: [
-                        Color.white.opacity(specularOpacity),
-                        Color.white.opacity(specularOpacity * 0.22),
-                        Color.clear
-                    ],
-                    startPoint: .topLeading,
-                    endPoint: .bottomTrailing
+        if isLiquidGlassEnabled {
+            ZStack {
+                shape.fill(.ultraThinMaterial)
+                shape.fill(Color(red: 0.08, green: 0.09, blue: 0.11, opacity: tintOpacity))
+                shape.fill(
+                    LinearGradient(
+                        colors: [
+                            Color.white.opacity(specularOpacity),
+                            Color.white.opacity(specularOpacity * 0.22),
+                            Color.clear
+                        ],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    )
+                )
+            }
+            .overlay(
+                shape.strokeBorder(
+                    LinearGradient(
+                        colors: [
+                            Color.white.opacity(rimOpacity),
+                            Color.white.opacity(rimOpacity * 0.32),
+                            Color.white.opacity(rimOpacity * 0.65)
+                        ],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    ),
+                    lineWidth: 1.0
                 )
             )
+            .shadow(color: Color.black.opacity(0.36), radius: shadowRadius, x: 0, y: 6)
+        } else {
+            shape
+                .fill(Color(red: 0.175, green: 0.180, blue: 0.198))
+                .overlay(
+                    shape.strokeBorder(Color.white.opacity(0.09), lineWidth: 0.8)
+                )
+                .shadow(color: Color.black.opacity(0.22), radius: min(8, shadowRadius), x: 0, y: 3)
         }
-        .overlay(
-            shape.strokeBorder(
-                LinearGradient(
-                    colors: [
-                        Color.white.opacity(rimOpacity),
-                        Color.white.opacity(rimOpacity * 0.32),
-                        Color.white.opacity(rimOpacity * 0.65)
-                    ],
-                    startPoint: .topLeading,
-                    endPoint: .bottomTrailing
-                ),
-                lineWidth: 1.0
-            )
-        )
-        .shadow(color: Color.black.opacity(0.36), radius: shadowRadius, x: 0, y: 6)
     }
 }
 
@@ -54,6 +75,7 @@ struct LiquidGlassPressStyle: ButtonStyle {
 }
 
 struct LiquidGlassCircleButton: View {
+    @Environment(\.isLiquidGlassEnabled) private var isLiquidGlassEnabled
     let systemImage: String
     var size: CGFloat = 44
     var iconSize: CGFloat = 17
@@ -64,26 +86,32 @@ struct LiquidGlassCircleButton: View {
         Button(action: action) {
             ZStack {
                 if let tint {
-                    Circle()
-                        .fill(
-                            LinearGradient(
-                                colors: [tint.opacity(0.95), tint],
-                                startPoint: .topLeading,
-                                endPoint: .bottomTrailing
-                            )
-                        )
-                        .overlay(
-                            Circle()
-                                .strokeBorder(
-                                    LinearGradient(
-                                        colors: [Color.white.opacity(0.55), Color.white.opacity(0.12)],
-                                        startPoint: .topLeading,
-                                        endPoint: .bottomTrailing
-                                    ),
-                                    lineWidth: 1.0
+                    if isLiquidGlassEnabled {
+                        Circle()
+                            .fill(
+                                LinearGradient(
+                                    colors: [tint.opacity(0.95), tint],
+                                    startPoint: .topLeading,
+                                    endPoint: .bottomTrailing
                                 )
-                        )
-                        .shadow(color: tint.opacity(0.45), radius: 10, y: 4)
+                            )
+                            .overlay(
+                                Circle()
+                                    .strokeBorder(
+                                        LinearGradient(
+                                            colors: [Color.white.opacity(0.55), Color.white.opacity(0.12)],
+                                            startPoint: .topLeading,
+                                            endPoint: .bottomTrailing
+                                        ),
+                                        lineWidth: 1.0
+                                    )
+                            )
+                            .shadow(color: tint.opacity(0.45), radius: 10, y: 4)
+                    } else {
+                        Circle()
+                            .fill(tint)
+                            .shadow(color: Color.black.opacity(0.24), radius: 6, y: 2)
+                    }
                 } else {
                     LiquidGlassShapeBackground(shape: Circle(), tintOpacity: 0.36, rimOpacity: 0.36, specularOpacity: 0.24, shadowRadius: 10)
                 }
