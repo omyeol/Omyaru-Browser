@@ -12,7 +12,6 @@ struct OmyaruApp: App {
     @ObservedObject private var appLock = AppLockManager.shared
     @ObservedObject private var driveSync = DriveSyncManager.shared
     @ObservedObject private var sharedFolder = SharedSyncFolderManager.shared
-    @ObservedObject private var liveActivity = OmyaruSyncLiveActivityController.shared
     @State private var showInitialSyncFolderPrompt = false
     @State private var promptedFolderThisLaunch = false
 
@@ -21,20 +20,6 @@ struct OmyaruApp: App {
             ZStack {
                 BrowserScreen()
                     .environmentObject(browser)
-
-                if liveActivity.liveBannerVisible && !appLock.isLocked {
-                    VStack {
-                        OmyaruInAppLiveSyncPill(
-                            live: liveActivity,
-                            onCancel: { driveSync.cancelActiveSync() }
-                        )
-                        .padding(.top, 6)
-                        .padding(.horizontal, 14)
-                        Spacer()
-                    }
-                    .transition(.move(edge: .top).combined(with: .opacity))
-                    .zIndex(90)
-                }
 
                 if appLock.isLocked {
                     AppLockOverlayView()
@@ -53,7 +38,6 @@ struct OmyaruApp: App {
                         }
                 }
             }
-            .animation(.spring(response: 0.34, dampingFraction: 0.85), value: liveActivity.liveBannerVisible)
             .preferredColorScheme(browser.preferences.pageColorScheme.swiftUIColorScheme)
             .sheet(isPresented: $showInitialSyncFolderPrompt) {
                 SharedSyncFolderSetupSheet(
@@ -83,6 +67,7 @@ struct OmyaruApp: App {
                 case .background:
                     appLock.lockIfNeeded()
                     browser.persist()
+                    OmyaruSyncLiveActivityController.shared.onAppMovedToBackground(isSyncing: driveSync.busy)
                     if browser.preferences.clearDataOnExit {
                         Task { await browser.clearBrowsingData() }
                     }
@@ -96,6 +81,7 @@ struct OmyaruApp: App {
                     }
                 case .active:
                     OmyaruBackgroundSyncScheduler.shared.browserRef = browser
+                    OmyaruSyncLiveActivityController.shared.onAppMovedToForeground()
                     if driveSync.isConnected && sharedFolder.needsInitialFolderSetup && !promptedFolderThisLaunch {
                         promptedFolderThisLaunch = true
                         showInitialSyncFolderPrompt = true
@@ -112,63 +98,6 @@ struct OmyaruApp: App {
                 browser.open(url.absoluteString)
             }
         }
-    }
-}
-
-private struct OmyaruInAppLiveSyncPill: View {
-    @ObservedObject var live: OmyaruSyncLiveActivityController
-    let onCancel: () -> Void
-
-    var body: some View {
-        let pct = Int((min(1.0, max(0.0, live.liveBannerProgress)) * 100).rounded())
-        HStack(spacing: 10) {
-            Image(systemName: live.liveBannerIsError ? "exclamationmark.icloud.fill" : (pct >= 100 ? "checkmark.icloud.fill" : "arrow.triangle.2.circlepath.icloud.fill"))
-                .font(.system(size: 15, weight: .semibold))
-                .foregroundStyle(live.liveBannerIsError ? .orange : (pct >= 100 ? .green : Color(red: 0.36, green: 0.59, blue: 1.0)))
-
-            VStack(alignment: .leading, spacing: 3) {
-                HStack(spacing: 6) {
-                    Text(live.liveBannerPhase.isEmpty ? "동기화" : live.liveBannerPhase)
-                        .font(.caption.weight(.bold))
-                        .foregroundStyle(.white)
-                    if live.liveBannerTotal > 0 {
-                        Text("\(live.liveBannerCompleted)/\(live.liveBannerTotal)")
-                            .font(.caption2.monospacedDigit())
-                            .foregroundStyle(.white.opacity(0.75))
-                    }
-                    Spacer(minLength: 4)
-                    Text("\(pct)%")
-                        .font(.caption.monospacedDigit().weight(.bold))
-                        .foregroundStyle(.white)
-                }
-
-                ProgressView(value: min(1.0, max(0.0, live.liveBannerProgress)))
-                    .tint(live.liveBannerIsError ? .orange : (pct >= 100 ? .green : Color(red: 0.36, green: 0.59, blue: 1.0)))
-                    .scaleEffect(x: 1, y: 0.7, anchor: .center)
-
-                Text(live.liveBannerDetail)
-                    .font(.caption2)
-                    .foregroundStyle(.white.opacity(0.78))
-                    .lineLimit(1)
-            }
-
-            if pct < 100 && !live.liveBannerIsError {
-                Button(action: onCancel) {
-                    Image(systemName: "xmark.circle.fill")
-                        .font(.system(size: 16))
-                        .foregroundStyle(.white.opacity(0.7))
-                }
-                .buttonStyle(.plain)
-            }
-        }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 9)
-        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: 18, style: .continuous)
-                .strokeBorder(.white.opacity(0.18), lineWidth: 0.8)
-        )
-        .shadow(color: .black.opacity(0.32), radius: 12, x: 0, y: 5)
     }
 }
 
@@ -526,7 +455,7 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
     static let defaultProfileID = UUID(uuidString: "00000000-0000-0000-0000-000000000010")!
     static let defaultGroupID = UUID(uuidString: "00000000-0000-0000-0000-000000000002")!
     static let appVersionName = "0.15.18"
-    static let appBuildNumber = 88
+    static let appBuildNumber = 89
 
     var isApplyingRemoteSync: Bool = false
 

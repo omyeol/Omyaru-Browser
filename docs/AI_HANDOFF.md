@@ -1,3 +1,16 @@
+# 2026-11-24 Antigravity: iOS 포그라운드 상단 동기화 배너 제거 · 백그라운드 전용 진행 알림 · 동기화 창 상단 진행률 카드 표시 (`iOS build 89`)
+
+- 작업 워크스페이스: `E:/DEV/CODEX/BROWSER`
+- 사용자 요청:
+  - 브라우저·탭 목록 화면 상단을 가리던 플로팅 동기화 배너(`OmyaruInAppLiveSyncPill`) 제거, 동기화 진행 알림은 백그라운드 상태에서만 표시하고, 앱 내에서는 동기화 창(`DriveSyncSheet`) 진입 시 진행률을 표시
+- 해결 (`apps/ios/Omyaru/OmyaruApp.swift`, `BackgroundSyncAndLiveActivity.swift`, `DriveSyncEngine.swift`, `Info.plist`):
+  1. **포그라운드 플로팅 배너 제거 (`OmyaruApp.swift`)**: `OmyaruInAppLiveSyncPill` 상단 오버레이를 완전히 제거해 앱 사용 중 상단 버튼/화면 가림 해소.
+  2. **백그라운드 전용 진행 알림 (`BackgroundSyncAndLiveActivity.swift`, `OmyaruApp.swift`)**: `shouldPostBackgroundNotification`(`startedInBackground || applicationState != .active`) 가드를 적용하고, `willPresent`에서 포그라운드 배너 표시 차단(`completionHandler([])`). 동기화 중 백그라운드 전환 시 `onAppMovedToBackground`로 진행 알림을 즉시 띄우고, 포그라운드 복귀 시 `onAppMovedToForeground`로 알림 자동 정리.
+  3. **동기화 창 상단 실시간 진행률 카드 (`DriveSyncEngine.swift`)**: `DriveSyncSheet` 최상단에 단계(`준비 중`/`탭·프로필`/`책장 동기화` 등)·항목 수(`done/total`)·퍼센트(`%`)·진행 바·상세 문구가 실시간으로 표시되는 카드를 배치.
+  - iOS 빌드 번호: `88` → **`89`** (`Info.plist`, `OmyaruApp.swift`).
+
+---
+
 # 2026-11-24 Antigravity: iOS 탭 목록 길게 누르기 완전 복구 + `.global` 정밀 좌표 + 드래그 중 무변경 시각 슬롯 시프트 (`iOS build 88`)
 
 - 작업 워크스페이스: `E:/DEV/CODEX/BROWSER`

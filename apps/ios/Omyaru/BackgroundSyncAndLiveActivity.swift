@@ -18,7 +18,8 @@ final class OmyaruSyncNotificationDelegate: NSObject, UNUserNotificationCenterDe
         withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
     ) {
         if notification.request.identifier == OmyaruSyncLiveActivityController.fallbackNotificationID {
-            completionHandler([.list])
+            // Never show a sync notification banner while Omyaru is active in foreground
+            completionHandler([])
         } else {
             completionHandler([.banner, .list])
         }
@@ -37,6 +38,30 @@ final class OmyaruSyncLiveActivityController: ObservableObject {
     private var lastFallbackPostAt: Date = .distantPast
     private var usingFallbackNotification: Bool = false
     private var fallbackEnabled: Bool = false
+    private var startedInBackground: Bool = false
+
+    private var shouldPostBackgroundNotification: Bool {
+        startedInBackground || UIApplication.shared.applicationState != .active
+    }
+
+    func onAppMovedToBackground(isSyncing: Bool) {
+        guard fallbackEnabled, isSyncing else { return }
+        if usingFallbackNotification || isRunningInLiveContainer {
+            postFallbackProgressNotification(
+                phase: liveBannerPhase.isEmpty ? "동기화" : liveBannerPhase,
+                detail: liveBannerDetail.isEmpty ? "Google Drive 동기화 진행 중..." : liveBannerDetail,
+                progress: liveBannerProgress,
+                done: liveBannerCompleted,
+                total: liveBannerTotal,
+                force: true
+            )
+        }
+    }
+
+    func onAppMovedToForeground() {
+        startedInBackground = false
+        UNUserNotificationCenter.current().removeDeliveredNotifications(withIdentifiers: [Self.fallbackNotificationID])
+    }
 
     @Published private(set) var liveBannerVisible: Bool = false
     @Published private(set) var liveBannerPhase: String = ""
@@ -106,6 +131,7 @@ final class OmyaruSyncLiveActivityController: ObservableObject {
         liveBannerTotal = 0
         liveBannerIsError = false
         fallbackEnabled = enabled
+        startedInBackground = isBackground
         usingFallbackNotification = false
 
         guard enabled else { return }
@@ -144,17 +170,21 @@ final class OmyaruSyncLiveActivityController: ObservableObject {
                 } catch {
                     await MainActor.run {
                         self.usingFallbackNotification = true
-                        self.postFallbackProgressNotification(phase: phase, detail: detail, progress: clamped, done: 0, total: 0, force: true)
+                        if self.shouldPostBackgroundNotification {
+                            self.postFallbackProgressNotification(phase: phase, detail: detail, progress: clamped, done: 0, total: 0, force: true)
+                        }
                     }
                 }
             }
             return
         }
         #endif
-        // LiveContainer or Live Activities disabled -> continuously updated progress notification + in-app live pill!
+        // LiveContainer or Live Activities disabled -> only post system notification when app is in background!
         usingFallbackNotification = true
         requestFallbackNotificationPermissionIfNeeded()
-        postFallbackProgressNotification(phase: phase, detail: detail, progress: clamped, done: 0, total: 0, force: true)
+        if shouldPostBackgroundNotification {
+            postFallbackProgressNotification(phase: phase, detail: detail, progress: clamped, done: 0, total: 0, force: true)
+        }
     }
 
     func update(
@@ -197,7 +227,7 @@ final class OmyaruSyncLiveActivityController: ObservableObject {
         }
         #endif
 
-        if fallbackEnabled && (usingFallbackNotification || isRunningInLiveContainer) {
+        if fallbackEnabled && (usingFallbackNotification || isRunningInLiveContainer) && shouldPostBackgroundNotification {
             postFallbackProgressNotification(phase: phase, detail: detail, progress: clamped, done: completedItems, total: totalItems, force: force)
         }
     }
@@ -234,7 +264,7 @@ final class OmyaruSyncLiveActivityController: ObservableObject {
         }
         #endif
 
-        if fallbackEnabled && (usingFallbackNotification || isRunningInLiveContainer) {
+        if fallbackEnabled && (usingFallbackNotification || isRunningInLiveContainer) && shouldPostBackgroundNotification {
             postFallbackNotification(
                 title: isError ? "Omyaru 동기화 \(phase)" : "Omyaru 동기화 완료",
                 body: detail
@@ -246,6 +276,7 @@ final class OmyaruSyncLiveActivityController: ObservableObject {
         } else {
             UNUserNotificationCenter.current().removeDeliveredNotifications(withIdentifiers: [Self.fallbackNotificationID])
         }
+        startedInBackground = false
         usingFallbackNotification = false
     }
 

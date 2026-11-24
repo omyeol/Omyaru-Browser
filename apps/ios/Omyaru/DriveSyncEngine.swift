@@ -2546,6 +2546,7 @@ struct DriveSyncSheet: View {
     @ObservedObject var shelf: ShelfModel
     @ObservedObject var sync: DriveSyncManager = .shared
     @ObservedObject var sharedFolder: SharedSyncFolderManager = .shared
+    @ObservedObject var live: OmyaruSyncLiveActivityController = .shared
 
     @State private var exportingBundle = false
     @State private var importingBundle = false
@@ -2574,6 +2575,39 @@ struct DriveSyncSheet: View {
                             }
                         }
                         .padding(.vertical, 4)
+
+                        // Live Sync Progress Card inside the Sync Sheet (never covers browser/tab screens!)
+                        if sync.busy || live.liveBannerVisible {
+                            let displayProg = sync.progress ?? live.liveBannerProgress
+                            let pct = Int((min(1.0, max(0.0, displayProg)) * 100).rounded())
+                            let phaseLabel = live.liveBannerPhase.isEmpty ? (sync.busy ? "동기화 중" : "완료") : live.liveBannerPhase
+                            let detailLabel = live.liveBannerDetail.isEmpty ? sync.status : live.liveBannerDetail
+                            VStack(alignment: .leading, spacing: 8) {
+                                HStack(spacing: 8) {
+                                    Image(systemName: live.liveBannerIsError ? "exclamationmark.icloud.fill" : (!sync.busy && pct >= 100 ? "checkmark.icloud.fill" : "arrow.triangle.2.circlepath.icloud.fill"))
+                                        .foregroundStyle(live.liveBannerIsError ? .orange : (!sync.busy && pct >= 100 ? .green : Color.blue))
+                                    Text(phaseLabel)
+                                        .font(.subheadline.weight(.semibold))
+                                    if live.liveBannerTotal > 0 {
+                                        Text("\(live.liveBannerCompleted)/\(live.liveBannerTotal)")
+                                            .font(.caption.monospacedDigit())
+                                            .foregroundStyle(.secondary)
+                                    }
+                                    Spacer()
+                                    Text("\(pct)%")
+                                        .font(.subheadline.monospacedDigit().weight(.bold))
+                                        .foregroundStyle(live.liveBannerIsError ? .orange : (!sync.busy && pct >= 100 ? .green : Color.blue))
+                                }
+                                ProgressView(value: min(1.0, max(0.0, displayProg)))
+                                    .tint(live.liveBannerIsError ? .orange : (!sync.busy && pct >= 100 ? .green : Color.blue))
+                                if !detailLabel.isEmpty {
+                                    Text(detailLabel)
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
+                            .padding(.vertical, 6)
+                        }
 
                         Button {
                             if sharedFolder.needsInitialFolderSetup {
@@ -2624,13 +2658,13 @@ struct DriveSyncSheet: View {
 
                         Toggle("백그라운드 동기화", isOn: $sync.backgroundSyncEnabled)
 
-                        Toggle("실시간 현황 / 진행 알림 표시", isOn: $sync.liveActivityEnabled)
+                        Toggle("백그라운드 진행 알림 / 실시간 현황", isOn: $sync.liveActivityEnabled)
 
                         if OmyaruSyncLiveActivityController.shared.isRunningInLiveContainer {
                             HStack(alignment: .top, spacing: 8) {
                                 Image(systemName: "info.circle.fill")
                                     .foregroundStyle(.orange)
-                                Text("LiveContainer 실행 감지됨 · iOS 구조상 위젯 확장(ActivityKit)이 제한되어 실시간 진행 알림과 앱 상단 라이브 바로 자동 대체됩니다. 잠금화면 실시간 현황(Dynamic Island)을 사용하려면 AltStore/SideStore에 단독 설치해 주세요.")
+                                Text("LiveContainer 실행 감지됨 · 앱 사용 중에는 화면을 가리지 않고 이 동기화 창 안에서 진행률을 표시하며, 백그라운드 전환 시 진행 알림으로 자동 안내합니다.")
                                     .font(.caption2)
                                     .foregroundStyle(.secondary)
                             }
@@ -2687,17 +2721,7 @@ struct DriveSyncSheet: View {
                         .padding(.vertical, 4)
                     }
 
-                    if let prog = sync.progress {
-                        ProgressView(value: prog) {
-                            Text("동기화 진행 중")
-                                .font(.caption)
-                        } currentValueLabel: {
-                            Text("\(Int((prog * 100).rounded()))%")
-                                .font(.caption.monospacedDigit())
-                        }
-                    }
-
-                    if !sync.status.isEmpty {
+                    if !sync.busy && !live.liveBannerVisible && !sync.status.isEmpty {
                         Text(sync.status)
                             .font(.caption)
                             .foregroundStyle(.secondary)
