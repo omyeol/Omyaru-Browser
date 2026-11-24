@@ -8,7 +8,7 @@
     <Nullable>enable</Nullable>
     <AssemblyName>Omyaru</AssemblyName>
     <RootNamespace>PrivacyBrowser.Desktop</RootNamespace>
-    <Version>0.5.8</Version>
+    <Version>0.5.9</Version>
     <Company>Omyeol</Company>
     <Product>Omyaru Browser</Product>
     <Title>Omyaru Browser</Title>

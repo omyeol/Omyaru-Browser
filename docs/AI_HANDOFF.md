@@ -1,3 +1,25 @@
+# 2026-11-24 Antigravity: iOS·PC·Android 공통 Safari 공유 요소 히어로 줌 모프(웹 ↔ 탭 목록, `KakaoTalk_20261124_195552958.mp4`) + iOS 활성 탭 프로필 색상 테두리·상단 기준 썸네일 (`iOS build 97` / `PC v0.5.9` / `Android v0.15.19`)
+
+- 작업 워크스페이스: `E:/DEV/CODEX/BROWSER`
+- 사용자 요청:
+  1. iOS 탭 목록에서 현재 선택 중인 탭 테두리 색을 해당 탭 그룹이 속한 프로필 색상으로 지정
+  2. iOS 탭 목록 썸네일이 화면 중간이 아닌 맨 위부터 보이도록 수정
+  3. 웹 서핑 ↔ 탭 목록 전환 시 `KakaoTalk_20261124_195552958.mp4` 영상처럼 공유 요소 히어로 줌 모프 애니메이션 구현 (iOS · PC · Android 모두 적용)
+- 해결:
+  1. **iOS (`apps/ios/Omyaru/BrowserViews.swift`, `OmyaruApp.swift`, `Info.plist`, `build 97`)**:
+     - **프로필 색상 활성 테두리**: `safariTabThumbnailView`에서 현재 탭이 속한 탭 그룹의 프로필 색상(`profileColor`, `2.6pt` + 은은한 프로필 글로우)으로 활성 탭 테두리를 표시.
+     - **상단 기준 썸네일**: `safariTabThumbnailView`의 이미지 프레임을 `.frame(height: cardHeight, alignment: .top)`으로 수정하고, `captureSnapshot`·`captureLiveHeroSnapshot`에서 상단 다이나믹 아일랜드 안전 영역을 트리밍(`380pt` 해상도)해 페이지 맨 위 헤더부터 선명하게 표시.
+     - **Safari 히어로 줌 모프 (`openTabOverviewWithHero` / `closeTabOverviewWithHero`)**: 동기 라이브 캡처(`captureLiveHeroSnapshot`) 후 전체 화면 ↔ 해당 탭 카드의 정확한 글로벌 썸네일 좌표(`tabCardThumbRects`) 사이를 둥근 모서리(`38pt ↔ 18pt`)·프로필 테두리와 함께 스프링 비행(`.spring(response: 0.36/0.34, dampingFraction: 0.85/0.86)`)하며 배경 탭 목록은 블러(`18 ↔ 0`)·페이드로 전환.
+  2. **PC Windows WPF (`apps/windows/desktop/Safari/SafariBrowserWindow.cs`, `PrivacyBrowser.Desktop.csproj`, `DesktopSettings.cs`, `SafariSettingsWindow.cs`, `v0.5.9`)**:
+     - `_overviewHeroCanvas` + `_overviewHeroCard` 공유 요소 오버레이 신설: 웹 → 탭 목록(`OpenTabOverviewWithHero`, `270ms CubicEase Out`) 및 탭 선택/닫기 → 웹(`CloseTabOverviewWithHeroAsync`, `250ms CubicEase Out`) 시 전체 뷰포트 ↔ 해당 탭 카드 좌표로 썸네일이 직선 모프하며 배경 `_overviewLayer`가 블러(`BlurEffect 16 ↔ 0`)·스케일(`0.95 ↔ 1.0`)·페이드 전환.
+     - PC 탭 목록도 활성 탭 테두리를 프로필 색상으로 적용하고 썸네일을 상단 정렬(`VerticalAlignment.Top`).
+     - 빌드 및 검증: `artifacts/releases/Omyaru-v0.5.9-win-x64/Omyaru.exe`, `--self-test` = `0`, `--smoke-test` = `0`.
+  3. **Android (`apps/android/app/src/main/java/dev/privacybrowser/app/UniformTransitionDrawable.kt`, `BrowserActivity.kt`, `build.gradle.kts`, `v0.15.19` / `versionCode 77`)**:
+     - `UniformTransitionDrawable`에 둥근 모서리 보간 클리핑(`fromCornerRadius` ↔ `toCornerRadius`) 및 프로필 색상 테두리 추가.
+     - `showTabSwitcher`(웹 → 탭 목록, `300ms`)·`animateTabOpen`(탭 카드 / 완료 버튼 → 웹, `290ms`) 양방향 모두 `PathInterpolator(0.22, 1, 0.36, 1)` + Android 12+ 배경 `RenderEffect` 블러(`14dp ↔ 0`) + 스케일(`0.94 ↔ 1.0`) 연동, 활성 탭 카드 테두리도 프로필 색상(`activeProfile.color`)으로 통일.
+
+---
+
 # 2026-11-24 Antigravity: iOS 팝업 편집 버튼 제거(설정 전용) + 모든 하위 설정(VPN·동기화·확장·프로필·잠금) 설정 내부 통합 + 설정 다크 모드 복원 + 하단 URL 아일랜드 높이 2번 사진(Safari) 정밀 일치 (`iOS build 96`)
 
 - 작업 워크스페이스: `E:/DEV/CODEX/BROWSER`

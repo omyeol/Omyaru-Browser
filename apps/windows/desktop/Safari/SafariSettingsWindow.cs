@@ -181,7 +181,7 @@ internal sealed class SafariSettingsWindow : Window
             () => _working.CollectDiagnostics, value => { _working.CollectDiagnostics = value; ApplyLive(); }));
 
     AddSection("도움말 및 정보",
-        InfoRow(SafariIcon.Settings, "Omyaru", "Windows 0.5.8 · macOS Safari 스타일 GPU 데스크톱"));
+        InfoRow(SafariIcon.Settings, "Omyaru", "Windows 0.5.9 · macOS Safari 스타일 GPU 데스크톱"));
 
     Content = root;
   }

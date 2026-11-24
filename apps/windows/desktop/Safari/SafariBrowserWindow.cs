@@ -7,6 +7,7 @@ using System.Windows.Controls.Primitives;
 using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Media.Animation;
+using System.Windows.Media.Effects;
 using System.Windows.Media.Imaging;
 using System.Windows.Shell;
 using System.Windows.Threading;
@@ -70,6 +71,10 @@ internal sealed partial class SafariBrowserWindow : Window
   private readonly Grid _webViewLayer = new();
   private readonly ScrollViewer _startPageLayer = new();
   private readonly Grid _overviewLayer = new();
+  private readonly Canvas _overviewHeroCanvas = new() { Visibility = Visibility.Collapsed, IsHitTestVisible = false, ClipToBounds = true };
+  private readonly Border _overviewHeroCard = new();
+  private readonly Image _overviewHeroImage = new() { Stretch = Stretch.UniformToFill, VerticalAlignment = VerticalAlignment.Top, HorizontalAlignment = HorizontalAlignment.Center };
+  private int _overviewHeroToken;
   private readonly Border _statusBarHost = new();
   private readonly TextBlock _statusText = new();
   private readonly Border _statusSyncPill = new();
@@ -336,6 +341,13 @@ internal sealed partial class SafariBrowserWindow : Window
 
     BuildTabOverview();
     _contentHost.Children.Add(_overviewLayer);
+
+    _overviewHeroCard.Background = new SolidColorBrush(Color.FromRgb(22, 24, 30));
+    _overviewHeroCard.ClipToBounds = true;
+    _overviewHeroCard.Child = _overviewHeroImage;
+    _overviewHeroCard.Effect = SafariTheme.GlassShadow(24, 0.52, 8);
+    _overviewHeroCanvas.Children.Add(_overviewHeroCard);
+    _contentHost.Children.Add(_overviewHeroCanvas);
 
     BuildFindPopup();
     Grid.SetRow(_contentHost, 3);
@@ -1166,48 +1178,214 @@ internal sealed partial class SafariBrowserWindow : Window
     SafariTheme.AnimateDouble(_sidebarHost, FrameworkElement.WidthProperty, _sidebarOpen ? SidebarExpandedWidth : 0, 220);
   }
 
-  // Smooth GPU Tab List (탭 목록) Morph (Scale + Opacity, 210ms CubicEase Out)
+  private Rect ComputeOverviewCardHostRect(OverviewCardEntry entry)
+  {
+    var hostW = Math.Max(320, _contentHost.ActualWidth);
+    var hostH = Math.Max(240, _contentHost.ActualHeight);
+    var scrollOrigin = new Point(0, 64);
+    try
+    {
+      if (_overviewScroll.IsLoaded && _contentHost.IsLoaded)
+        scrollOrigin = _overviewScroll.TranslatePoint(new Point(0, 0), _contentHost);
+    }
+    catch { }
+    var x = scrollOrigin.X + entry.TargetX - _overviewScroll.HorizontalOffset;
+    var y = scrollOrigin.Y + entry.TargetY - _overviewScroll.VerticalOffset;
+    return new Rect(
+        Math.Clamp(x, -OverviewCardWidth, hostW),
+        Math.Clamp(y, -OverviewCardHeight, hostH),
+        OverviewCardWidth,
+        OverviewCardHeight);
+  }
+
+  private void ClearOverviewHeroLayer()
+  {
+    _overviewHeroCard.BeginAnimation(Canvas.LeftProperty, null);
+    _overviewHeroCard.BeginAnimation(Canvas.TopProperty, null);
+    _overviewHeroCard.BeginAnimation(FrameworkElement.WidthProperty, null);
+    _overviewHeroCard.BeginAnimation(FrameworkElement.HeightProperty, null);
+    _overviewHeroCanvas.BeginAnimation(OpacityProperty, null);
+    _overviewHeroCanvas.Visibility = Visibility.Collapsed;
+    _overviewHeroCanvas.Opacity = 1;
+    _overviewLayer.Effect = null;
+  }
+
+  private Brush ActiveProfileBorderBrush()
+  {
+    var c = SafariTheme.FromArgbUint(ActiveProfile().Color);
+    return SafariTheme.Frozen(c);
+  }
+
+  // Exact Safari Shared-Element Hero Zoom Morph (Web <-> Tab List, matches KakaoTalk_20261124_195552958.mp4!)
   internal void ToggleTabOverview()
   {
     CancelOverviewInteraction();
     _overviewSelectionMode = false;
     _overviewSelectedIds.Clear();
     UpdateOverviewSelectionHeader();
-    _showingOverview = !_showingOverview;
-    ApplyChromePreferences();
-    if (_showingOverview)
+    if (!_showingOverview)
     {
-      _webViewLayer.Visibility = Visibility.Collapsed;
-      _startPageLayer.Visibility = Visibility.Collapsed;
-      _overviewLayer.Visibility = Visibility.Visible;
-      PopulateTabOverview();
-      Dispatcher.BeginInvoke(() =>
-      {
-        if (_showingOverview && _overviewLiftedCard is null)
-          LayoutOverviewCards(animate: false);
-      }, DispatcherPriority.Loaded);
-      _overviewScale.ScaleX = 0.94;
-      _overviewScale.ScaleY = 0.94;
-      _overviewLayer.Opacity = 0;
-      SafariTheme.AnimateScale(_overviewScale, 1.0, 210);
-      SafariTheme.AnimateDouble(_overviewLayer, OpacityProperty, 1.0, 190);
+      OpenTabOverviewWithHero();
     }
     else
     {
-      var fadeOut = new DoubleAnimation(0, TimeSpan.FromMilliseconds(150))
+      var activeEntry = _overviewCards.FirstOrDefault(c => c.Tab.Id == _state.ActiveTabId);
+      _ = CloseTabOverviewWithHeroAsync(_state.ActiveTabId, activeEntry);
+    }
+  }
+
+  private void OpenTabOverviewWithHero()
+  {
+    var token = ++_overviewHeroToken;
+    ClearOverviewHeroLayer();
+    _showingOverview = true;
+    ApplyChromePreferences();
+
+    _webViewLayer.Visibility = Visibility.Collapsed;
+    _startPageLayer.Visibility = Visibility.Collapsed;
+    _overviewLayer.Visibility = Visibility.Visible;
+    PopulateTabOverview();
+    LayoutOverviewCards(animate: false);
+    _overviewLayer.UpdateLayout();
+
+    var hostW = Math.Max(320, _contentHost.ActualWidth);
+    var hostH = Math.Max(240, _contentHost.ActualHeight);
+    var activeEntry = _overviewCards.FirstOrDefault(c => c.Tab.Id == _state.ActiveTabId);
+    BitmapSource? activeThumb = null;
+    var hasThumb = _state.ActiveTabId is not null && _thumbnails.TryGetValue(_state.ActiveTabId, out activeThumb);
+
+    if (activeEntry is not null && hasThumb && activeThumb is not null && hostW > 320 && hostH > 240)
+    {
+      var targetRect = ComputeOverviewCardHostRect(activeEntry);
+      activeEntry.Card.Opacity = 0;
+
+      var blur = new BlurEffect { Radius = 16 };
+      _overviewLayer.Effect = blur;
+      _overviewScale.ScaleX = 0.95;
+      _overviewScale.ScaleY = 0.95;
+      _overviewLayer.Opacity = 0;
+
+      _overviewHeroImage.Source = activeThumb;
+      _overviewHeroCard.CornerRadius = new CornerRadius(15);
+      _overviewHeroCard.BorderBrush = ActiveProfileBorderBrush();
+      _overviewHeroCard.BorderThickness = new Thickness(2);
+      Canvas.SetLeft(_overviewHeroCard, 0);
+      Canvas.SetTop(_overviewHeroCard, 0);
+      _overviewHeroCard.Width = hostW;
+      _overviewHeroCard.Height = hostH;
+      _overviewHeroCanvas.Opacity = 1;
+      _overviewHeroCanvas.Visibility = Visibility.Visible;
+
+      var ease = new CubicEase { EasingMode = EasingMode.EaseOut };
+      var dur = TimeSpan.FromMilliseconds(270);
+      var animLeft = new DoubleAnimation(0, targetRect.X, dur) { EasingFunction = ease };
+      var animTop = new DoubleAnimation(0, targetRect.Y, dur) { EasingFunction = ease };
+      var animW = new DoubleAnimation(hostW, targetRect.Width, dur) { EasingFunction = ease };
+      var animH = new DoubleAnimation(hostH, targetRect.Height, dur) { EasingFunction = ease };
+      var animBlur = new DoubleAnimation(16, 0, dur) { EasingFunction = ease };
+
+      animH.Completed += (_, _) =>
       {
-        EasingFunction = new CubicEase { EasingMode = EasingMode.EaseIn },
+        if (_overviewHeroToken != token) return;
+        activeEntry.Card.Opacity = 1;
+        ClearOverviewHeroLayer();
       };
-      fadeOut.Completed += (_, _) =>
+
+      _overviewHeroCard.BeginAnimation(Canvas.LeftProperty, animLeft);
+      _overviewHeroCard.BeginAnimation(Canvas.TopProperty, animTop);
+      _overviewHeroCard.BeginAnimation(FrameworkElement.WidthProperty, animW);
+      _overviewHeroCard.BeginAnimation(FrameworkElement.HeightProperty, animH);
+      blur.BeginAnimation(BlurEffect.RadiusProperty, animBlur);
+      SafariTheme.AnimateScale(_overviewScale, 1.0, 270);
+      SafariTheme.AnimateDouble(_overviewLayer, OpacityProperty, 1.0, 240);
+    }
+    else
+    {
+      _overviewScale.ScaleX = 0.94;
+      _overviewScale.ScaleY = 0.94;
+      _overviewLayer.Opacity = 0;
+      SafariTheme.AnimateScale(_overviewScale, 1.0, 220);
+      SafariTheme.AnimateDouble(_overviewLayer, OpacityProperty, 1.0, 200);
+    }
+  }
+
+  private async Task CloseTabOverviewWithHeroAsync(string? targetTabId, OverviewCardEntry? sourceEntry)
+  {
+    var token = ++_overviewHeroToken;
+    ClearOverviewHeroLayer();
+    _showingOverview = false;
+    ApplyChromePreferences();
+
+    var hostW = Math.Max(320, _contentHost.ActualWidth);
+    var hostH = Math.Max(240, _contentHost.ActualHeight);
+    var entry = sourceEntry ?? _overviewCards.FirstOrDefault(c => c.Tab.Id == targetTabId);
+    var resolvedTabId = targetTabId ?? _state.ActiveTabId;
+    BitmapSource? thumb = null;
+    var hasThumb = resolvedTabId is not null && _thumbnails.TryGetValue(resolvedTabId, out thumb);
+
+    if (entry is not null && hasThumb && thumb is not null && hostW > 320 && hostH > 240)
+    {
+      var startRect = ComputeOverviewCardHostRect(entry);
+      entry.Card.Opacity = 0;
+
+      var blur = new BlurEffect { Radius = 0 };
+      _overviewLayer.Effect = blur;
+
+      _overviewHeroImage.Source = thumb;
+      _overviewHeroCard.CornerRadius = new CornerRadius(15);
+      _overviewHeroCard.BorderBrush = ActiveProfileBorderBrush();
+      _overviewHeroCard.BorderThickness = new Thickness(2);
+      Canvas.SetLeft(_overviewHeroCard, startRect.X);
+      Canvas.SetTop(_overviewHeroCard, startRect.Y);
+      _overviewHeroCard.Width = startRect.Width;
+      _overviewHeroCard.Height = startRect.Height;
+      _overviewHeroCanvas.Opacity = 1;
+      _overviewHeroCanvas.Visibility = Visibility.Visible;
+
+      var ease = new CubicEase { EasingMode = EasingMode.EaseOut };
+      var dur = TimeSpan.FromMilliseconds(250);
+      var animLeft = new DoubleAnimation(startRect.X, 0, dur) { EasingFunction = ease };
+      var animTop = new DoubleAnimation(startRect.Y, 0, dur) { EasingFunction = ease };
+      var animW = new DoubleAnimation(startRect.Width, hostW, dur) { EasingFunction = ease };
+      var animH = new DoubleAnimation(startRect.Height, hostH, dur) { EasingFunction = ease };
+      var animBlur = new DoubleAnimation(0, 16, dur) { EasingFunction = ease };
+      var animFadeOut = new DoubleAnimation(1, 0, TimeSpan.FromMilliseconds(220)) { EasingFunction = ease };
+
+      var tcs = new TaskCompletionSource<bool>();
+      animH.Completed += (_, _) => tcs.TrySetResult(true);
+
+      _overviewHeroCard.BeginAnimation(Canvas.LeftProperty, animLeft);
+      _overviewHeroCard.BeginAnimation(Canvas.TopProperty, animTop);
+      _overviewHeroCard.BeginAnimation(FrameworkElement.WidthProperty, animW);
+      _overviewHeroCard.BeginAnimation(FrameworkElement.HeightProperty, animH);
+      blur.BeginAnimation(BlurEffect.RadiusProperty, animBlur);
+      SafariTheme.AnimateScale(_overviewScale, 0.95, 240);
+      _overviewLayer.BeginAnimation(OpacityProperty, animFadeOut);
+
+      await tcs.Task;
+      if (_overviewHeroToken != token) return;
+
+      _overviewLayer.Visibility = Visibility.Collapsed;
+      _overviewLayer.Effect = null;
+      if (resolvedTabId is not null && resolvedTabId != _state.ActiveTabId)
+        await SelectTabAsync(resolvedTabId);
+      else
+        ApplySurfaceMode();
+
+      var heroFade = new DoubleAnimation(1, 0, TimeSpan.FromMilliseconds(75)) { EasingFunction = ease };
+      heroFade.Completed += (_, _) =>
       {
-        if (!_showingOverview)
-        {
-          _overviewLayer.Visibility = Visibility.Collapsed;
-          ApplySurfaceMode();
-        }
+        if (_overviewHeroToken == token) ClearOverviewHeroLayer();
       };
-      SafariTheme.AnimateScale(_overviewScale, 0.96, 150);
-      _overviewLayer.BeginAnimation(OpacityProperty, fadeOut);
+      _overviewHeroCanvas.BeginAnimation(OpacityProperty, heroFade);
+    }
+    else
+    {
+      _overviewLayer.Visibility = Visibility.Collapsed;
+      if (resolvedTabId is not null && resolvedTabId != _state.ActiveTabId)
+        await SelectTabAsync(resolvedTabId);
+      else
+        ApplySurfaceMode();
     }
   }
 
@@ -2201,12 +2379,12 @@ internal sealed partial class SafariBrowserWindow : Window
     }
   }
 
-  private static void RestoreOverviewCardVisual(OverviewCardEntry entry)
+  private void RestoreOverviewCardVisual(OverviewCardEntry entry)
   {
     SafariTheme.AnimateScale(entry.Scale, 1.0, 175);
     SafariTheme.AnimateColor(entry.Background, SafariTheme.CardFillColor, 150);
-    entry.Card.BorderBrush = entry.IsActive ? SafariTheme.Accent : SafariTheme.SpecularBorder;
-    entry.Card.BorderThickness = new Thickness(entry.IsActive ? 2 : 1);
+    entry.Card.BorderBrush = entry.IsActive ? ActiveProfileBorderBrush() : SafariTheme.SpecularBorder;
+    entry.Card.BorderThickness = new Thickness(entry.IsActive ? 2.2 : 1);
     entry.Card.Effect = SafariTheme.GlassShadow(18, 0.4, 6);
   }
 
@@ -2440,11 +2618,11 @@ internal sealed partial class SafariBrowserWindow : Window
       Grid.SetRow(topBar, 0);
       cardGrid.Children.Add(topBar);
 
-      // Preview Surface
+      // Preview Surface (top-aligned just like Safari!)
       UIElement previewContent;
       if (_thumbnails.TryGetValue(currentTab.Id, out var thumb))
       {
-        previewContent = new Image { Source = thumb, Stretch = Stretch.UniformToFill };
+        previewContent = new Image { Source = thumb, Stretch = Stretch.UniformToFill, VerticalAlignment = VerticalAlignment.Top };
       }
       else
       {
@@ -2483,8 +2661,8 @@ internal sealed partial class SafariBrowserWindow : Window
         Height = OverviewCardHeight,
         CornerRadius = new CornerRadius(15),
         Background = cardBg,
-        BorderBrush = (isSelected || isActive) ? SafariTheme.Accent : SafariTheme.SpecularBorder,
-        BorderThickness = new Thickness((isSelected || isActive) ? 2 : 1),
+        BorderBrush = isSelected ? SafariTheme.Accent : (isActive ? ActiveProfileBorderBrush() : SafariTheme.SpecularBorder),
+        BorderThickness = new Thickness((isSelected || isActive) ? 2.2 : 1),
         Effect = SafariTheme.GlassShadow(18, 0.4, 6),
         Cursor = Cursors.Hand,
         RenderTransformOrigin = new Point(0.5, 0.5),
@@ -2634,10 +2812,7 @@ internal sealed partial class SafariBrowserWindow : Window
           SafariTheme.AnimateScale(scale, 1.0, 110);
           if (!wasCancelled)
           {
-            _showingOverview = false;
-            _overviewLayer.Visibility = Visibility.Collapsed;
-            ApplyChromePreferences();
-            await SelectTabAsync(currentTab.Id);
+            await CloseTabOverviewWithHeroAsync(currentTab.Id, entry);
           }
         }
       };
