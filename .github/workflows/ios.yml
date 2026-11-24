@@ -100,11 +100,13 @@ jobs:
       - name: Refresh raw AltStore source
         if: github.ref == 'refs/heads/main'
         run: |
+          git fetch origin main --depth=20
+          git checkout -B main origin/main
           cp "$RUNNER_TEMP/altstore-source.json" apps/ios/altstore-source.json
           git add apps/ios/altstore-source.json
           if ! git diff --cached --quiet; then
             git -c user.name='github-actions[bot]' \
               -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
               commit -m "Update AltStore source for Omyaru iOS v${{ steps.meta.outputs.version }}"
-            git push origin HEAD:main
+            git push origin main
           fi
