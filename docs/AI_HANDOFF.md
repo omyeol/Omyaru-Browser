@@ -1,3 +1,18 @@
+# 2026-11-24 Antigravity: iOS 탭 목록 길게 누르기 완전 복구 + `.global` 정밀 좌표 + 드래그 중 무변경 시각 슬롯 시프트 (`iOS build 88`)
+
+- 작업 워크스페이스: `E:/DEV/CODEX/BROWSER`
+- 사용자 요청:
+  - `build 87`에서 UIKit 호스트 제스처 교체 후 탭 길게 누르기 자체가 작동하지 않게 된 문제 수정
+- 원인 및 해결 (`apps/ios/Omyaru/BrowserViews.swift`, `Info.plist`, `OmyaruApp.swift`):
+  1. `build 87`의 UIKit `TabGridLongPressBridge`는 `TabView(.page)`와 `UIScrollView`의 지연 터치 인식기 경합으로 길게 누르기 자체가 발동하지 않았음 → `build 85/86`에서 100% 정상 인식되던 순수 SwiftUI `LongPressGesture(0.28).sequenced(before: DragGesture(minimumDistance: 0, coordinateSpace: .global))`를 복원.
+  2. `build 86`의 2가지 문제(좌표 튐 + 무한 핑퐁)를 **무변경 시각 슬롯 시프트(Zero-Mutation Visual Shift)**로 원천 해결:
+     - 카드 프레임(`geo.frame(in: .global)`), 제스처(`coordinateSpace: .global`), 전체 화면 오버레이(`overlayGeo.frame(in: .global).origin` 보정)를 **단일 `.global` 화면 좌표계**로 통일해 `TabView(.page)` 경계 오차(00:01 순간이동) 제거.
+     - 드래그 시작 기준점을 `drag.startLocation` 대신 첫 `drag.location`에 고정해 손가락이 정지한 동안 델타=`0.0pt`(12pt 데드존) 보장.
+     - 드래그 도중 `model.tabs`(`ForEach` 순서)를 변경하지 않고 `dragTargetIndex`만 갱신해 이웃 카드들이 스냅샷된 `dragSlotFrames` 사이로 부드럽게 `.offset` 스프링 이동하며, 손을 놓은 뒤 안착 완료 시점에 애니메이션 없는 단일 트랜잭션으로 `model.moveVisibleTab`을 커밋(제스처 소유 뷰가 드래그 중 단 1px도 이동하지 않으므로 떨림/핑퐁 원천 불가능).
+  - iOS 빌드 번호: `87` → **`88`** (`Info.plist`, `OmyaruApp.swift`).
+
+---
+
 # 2026-11-24 Antigravity: iOS 탭 목록 길게 누르기 시 정지 상태에서 카드 자동 이동·핑퐁 완전 해결 — 네이티브 UIKit `UILongPressGestureRecognizer` 페이지 단위 통합 (`iOS build 87`)
 
 - 작업 워크스페이스: `E:/DEV/CODEX/BROWSER`
