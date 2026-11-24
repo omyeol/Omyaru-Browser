@@ -18,11 +18,11 @@
       "versions": [
         {
           "version": "0.15.18",
-          "buildVersion": "101",
+          "buildVersion": "102",
           "date": "2026-11-24",
-          "localizedDescription": "v0.15.18 (build 101): Full PC/Android/iOS bidirectional CRDT tab, tab group & profile sync (OmyaruTabReplica with live debounced push, group creation/move/delete & tombstone sync), smooth iOS 26 Safari Tab Overview long-press lift, spring-animated 2D grid drag reorder & floating Liquid Glass release menu (copy link, pin/unpin, duplicate, select, move, close other tabs, close), plus parallel Google Drive bookshelf sync.",
+          "localizedDescription": "v0.15.18 (build 102): Full PC/Android/iOS bidirectional CRDT tab, tab group & profile sync (OmyaruTabReplica with live debounced push, group creation/move/delete & tombstone sync), smooth iOS 26 Safari Tab Overview long-press lift, spring-animated 2D grid drag reorder & floating Liquid Glass release menu (copy link, pin/unpin, duplicate, select, move, close other tabs, close), plus parallel Google Drive bookshelf sync.",
           "downloadURL": "https://github.com/omyeol/Omyaru-Browser/releases/download/v0.15.18/Omyaru-v0.15.18-ios.ipa",
-          "size": 2417856,
+          "size": 2427610,
           "minOSVersion": "16.0"
         }
       ],
