@@ -45,13 +45,16 @@ struct HeroMorphCommand: Equatable {
 }
 
 /// Locked-120fps native Core Animation Render-Server Safari Hero Zoom host for WKWebView.
-/// Uses hardware single-pass clipsToBounds + cornerRadius + UIView.animate(usingSpringWithDamping:)
-/// with ZERO per-frame SwiftUI updates, ZERO CAShapeLayer offscreen mask passes, and ZERO WKWebView reflow!
+/// CRITICAL DESIGN: WKWebView NEVER moves, NEVER detaches on tab switch, and NEVER toggles contentInsetAdjustmentBehavior!
+/// During Hero Zoom flights, a hardware-cloned 3x Retina portal (`webView.snapshotView(afterScreenUpdates: false)`) or
+/// pixel-aligned 2x Retina fallback animates inside `clipView`, guaranteeing ZERO scroll drift, ZERO 59pt jump, and ZERO blink!
 final class HeroBrowserHostView: UIView {
+    private let webViewContainer = UIView()
     private let clipView = UIView()
     private let scaleView = UIView()
     private let fallbackTopFillView = UIView()
     private let fallbackImageView = UIImageView()
+    private var activePortalView: UIView?
     private weak var currentWebView: WKWebView?
     private var lastAppliedCommandID: UUID?
     private var pendingCommand: HeroMorphCommand?
@@ -59,16 +62,24 @@ final class HeroBrowserHostView: UIView {
     private var lastBoundsSize: CGSize = .zero
     private var lastSafeTop: CGFloat = 0
     private var fallbackImageSize: CGSize = .zero
-    var onDidResetToFullScreen: (() -> Void)?
+    private var currentAnimToken = UUID()
+    private var currentIsCommitted = false
+    private var currentFallbackSnapshot: UIImage?
 
     override init(frame: CGRect) {
         super.init(frame: frame)
         backgroundColor = .clear
         clipsToBounds = false
 
+        webViewContainer.backgroundColor = .clear
+        webViewContainer.clipsToBounds = true
+        addSubview(webViewContainer)
+
         clipView.backgroundColor = .clear
         clipView.clipsToBounds = true
         clipView.layer.cornerCurve = .continuous
+        clipView.isHidden = true
+        clipView.isUserInteractionEnabled = false
         addSubview(clipView)
 
         scaleView.backgroundColor = .clear
@@ -92,10 +103,17 @@ final class HeroBrowserHostView: UIView {
         let sizeChanged = abs(bounds.width - lastBoundsSize.width) > 0.5 || abs(bounds.height - lastBoundsSize.height) > 0.5
         lastBoundsSize = bounds.size
 
+        webViewContainer.frame = bounds
+        for sub in webViewContainer.subviews {
+            if sub.frame != webViewContainer.bounds {
+                sub.frame = webViewContainer.bounds
+            }
+        }
+
         if let pending = pendingCommand {
             pendingCommand = nil
             layoutBaseFullScreen()
-            execute(command: pending)
+            execute(command: pending, allowLivePortal: false)
             return
         }
 
@@ -108,20 +126,24 @@ final class HeroBrowserHostView: UIView {
         UIView.performWithoutAnimation {
             clipView.layer.removeAllAnimations()
             scaleView.layer.removeAllAnimations()
+            activePortalView?.removeFromSuperview()
+            activePortalView = nil
+            clipView.isHidden = true
+            clipView.alpha = 1.0
             clipView.frame = bounds
             clipView.layer.cornerRadius = 0
             clipView.layer.borderWidth = 0
             scaleView.transform = .identity
             scaleView.bounds = CGRect(origin: .zero, size: bounds.size)
             scaleView.center = CGPoint(x: bounds.width * 0.5, y: bounds.height * 0.5)
-            currentWebView?.frame = scaleView.bounds
+            webViewContainer.alpha = 1.0
             layoutFallbackViews()
         }
     }
 
     private func layoutFallbackViews() {
-        let w = scaleView.bounds.width
-        let h = scaleView.bounds.height
+        let w = bounds.width
+        let h = bounds.height
         guard w > 1, h > 1 else { return }
         let safeTop = max(lastSafeTop, currentWebView?.safeAreaInsets.top ?? lastSafeTop)
         fallbackTopFillView.frame = CGRect(x: 0, y: 0, width: w, height: safeTop)
@@ -144,17 +166,24 @@ final class HeroBrowserHostView: UIView {
         command: HeroMorphCommand
     ) {
         lastSafeTop = safeTop
+        currentIsCommitted = isWebViewCommitted
+        currentFallbackSnapshot = fallbackSnapshot
 
-        if currentWebView !== webView {
-            currentWebView?.removeFromSuperview()
-            currentWebView = webView
+        let wasSameVisibleWebView = (currentWebView === webView && !webView.isHidden && webView.superview === webViewContainer && webViewContainer.alpha > 0.9)
+
+        // Keep visited WKWebViews attached & hidden in-place (NEVER removeFromSuperview on tab switch!)
+        // so safeAreaInsets, scroll offset, and GPU tiles remain 100% preserved across tab switches!
+        if webView.superview !== webViewContainer {
             webView.autoresizingMask = []
-            webView.frame = scaleView.bounds.width > 1 ? scaleView.bounds : bounds
-            scaleView.addSubview(webView)
-        } else if webView.superview !== scaleView {
-            webView.frame = scaleView.bounds.width > 1 ? scaleView.bounds : bounds
-            scaleView.addSubview(webView)
+            webView.frame = webViewContainer.bounds.width > 1 ? webViewContainer.bounds : bounds
+            webViewContainer.addSubview(webView)
         }
+        if currentWebView !== webView {
+            currentWebView?.isHidden = true
+            currentWebView = webView
+        }
+        webView.isHidden = false
+        webViewContainer.bringSubviewToFront(webView)
 
         fallbackTopFillView.backgroundColor = topColor
         if fallbackImageView.image !== fallbackSnapshot {
@@ -163,23 +192,12 @@ final class HeroBrowserHostView: UIView {
             layoutFallbackViews()
         }
 
-        if isWebViewCommitted || fallbackSnapshot == nil {
-            scaleView.bringSubviewToFront(webView)
-            fallbackTopFillView.isHidden = (fallbackSnapshot == nil)
-            fallbackImageView.isHidden = (fallbackSnapshot == nil)
-        } else {
-            fallbackTopFillView.isHidden = false
-            fallbackImageView.isHidden = false
-            scaleView.bringSubviewToFront(fallbackTopFillView)
-            scaleView.bringSubviewToFront(fallbackImageView)
-        }
-
         if lastAppliedCommandID != command.id {
             lastAppliedCommandID = command.id
             if bounds.width <= 1 || bounds.height <= 1 {
                 pendingCommand = command
             } else {
-                execute(command: command)
+                execute(command: command, allowLivePortal: wasSameVisibleWebView && isWebViewCommitted)
             }
         }
     }
@@ -208,18 +226,37 @@ final class HeroBrowserHostView: UIView {
         clipView.layer.add(anim, forKey: "heroBorderWidth")
     }
 
-    private func execute(command: HeroMorphCommand) {
+    private func installPortalOrFallback(allowLivePortal: Bool) {
+        activePortalView?.removeFromSuperview()
+        activePortalView = nil
+        layoutFallbackViews()
+
+        if allowLivePortal, let wv = currentWebView, wv.window != nil,
+           let portal = wv.snapshotView(afterScreenUpdates: false) {
+            portal.frame = CGRect(origin: .zero, size: bounds.size)
+            portal.isUserInteractionEnabled = false
+            scaleView.addSubview(portal)
+            activePortalView = portal
+            fallbackTopFillView.isHidden = true
+            fallbackImageView.isHidden = true
+        } else {
+            fallbackTopFillView.isHidden = false
+            fallbackImageView.isHidden = (currentFallbackSnapshot == nil)
+        }
+    }
+
+    private func execute(command: HeroMorphCommand, allowLivePortal: Bool) {
         let w = bounds.width
         let h = bounds.height
         guard w > 1, h > 1 else { return }
+        let animToken = UUID()
+        currentAnimToken = animToken
 
         switch command.kind {
         case .idle:
             isInMorphPose = false
             isUserInteractionEnabled = true
             layoutBaseFullScreen()
-            layoutIfNeeded()
-            onDidResetToFullScreen?()
 
         case .shrinkToCard(let rect, let corner, let borderColor, let safeTop):
             isInMorphPose = true
@@ -231,6 +268,9 @@ final class HeroBrowserHostView: UIView {
             UIView.performWithoutAnimation {
                 clipView.layer.removeAllAnimations()
                 scaleView.layer.removeAllAnimations()
+                installPortalOrFallback(allowLivePortal: allowLivePortal)
+                clipView.isHidden = false
+                clipView.alpha = 1.0
                 clipView.frame = bounds
                 clipView.layer.cornerRadius = 46
                 clipView.layer.borderColor = borderColor.cgColor
@@ -238,12 +278,11 @@ final class HeroBrowserHostView: UIView {
                 scaleView.transform = .identity
                 scaleView.bounds = CGRect(origin: .zero, size: bounds.size)
                 scaleView.center = CGPoint(x: w * 0.5, y: h * 0.5)
-                currentWebView?.frame = scaleView.bounds
-                layoutFallbackViews()
+                webViewContainer.alpha = 0.0
             }
 
             UIView.animate(
-                withDuration: 0.36,
+                withDuration: 0.34,
                 delay: 0,
                 usingSpringWithDamping: 0.88,
                 initialSpringVelocity: 0.15,
@@ -257,7 +296,7 @@ final class HeroBrowserHostView: UIView {
                     y: (h * 0.5 - effectiveSafeTop) * scale
                 )
             }
-            animateBorderWidth(from: 0, to: 2.6, duration: 0.36)
+            animateBorderWidth(from: 0, to: 2.6, duration: 0.34)
 
         case .expandFromCard(let rect, let corner, let borderColor, let safeTop):
             isInMorphPose = true
@@ -269,6 +308,10 @@ final class HeroBrowserHostView: UIView {
             UIView.performWithoutAnimation {
                 clipView.layer.removeAllAnimations()
                 scaleView.layer.removeAllAnimations()
+                installPortalOrFallback(allowLivePortal: allowLivePortal)
+                webViewContainer.alpha = 0.0
+                clipView.isHidden = false
+                clipView.alpha = 1.0
                 clipView.frame = start
                 clipView.layer.cornerRadius = corner
                 clipView.layer.borderColor = borderColor.cgColor
@@ -279,12 +322,10 @@ final class HeroBrowserHostView: UIView {
                     x: start.width * 0.5,
                     y: (h * 0.5 - effectiveSafeTop) * scale
                 )
-                currentWebView?.frame = scaleView.bounds
-                layoutFallbackViews()
             }
 
             UIView.animate(
-                withDuration: 0.35,
+                withDuration: 0.34,
                 delay: 0,
                 usingSpringWithDamping: 0.88,
                 initialSpringVelocity: 0.15,
@@ -294,8 +335,16 @@ final class HeroBrowserHostView: UIView {
                 self.clipView.layer.cornerRadius = 46
                 self.scaleView.transform = .identity
                 self.scaleView.center = CGPoint(x: w * 0.5, y: h * 0.5)
+            } completion: { _ in
+                guard self.currentAnimToken == animToken else { return }
+                self.webViewContainer.alpha = 1.0
+                self.clipView.isHidden = true
+                self.activePortalView?.removeFromSuperview()
+                self.activePortalView = nil
+                self.isInMorphPose = false
+                self.isUserInteractionEnabled = true
             }
-            animateBorderWidth(from: 2.6, to: 0, duration: 0.30)
+            animateBorderWidth(from: 2.6, to: 0, duration: 0.28)
         }
     }
 }
@@ -307,14 +356,12 @@ private struct HeroBrowserHostRepresentable: UIViewRepresentable {
     let isWebViewCommitted: Bool
     let safeTop: CGFloat
     let command: HeroMorphCommand
-    let onDidResetToFullScreen: () -> Void
 
     func makeUIView(context: Context) -> HeroBrowserHostView {
         HeroBrowserHostView()
     }
 
     func updateUIView(_ view: HeroBrowserHostView, context: Context) {
-        view.onDidResetToFullScreen = onDidResetToFullScreen
         view.updateContent(
             webView: webView,
             fallbackSnapshot: fallbackSnapshot,
@@ -489,10 +536,7 @@ struct BrowserScreen: View {
                                 topColor: model.tabTopColors[tab.id] ?? UIColor(red: 0.08, green: 0.09, blue: 0.11, alpha: 1.0),
                                 isWebViewCommitted: model.committedTabIDs.contains(tab.id),
                                 safeTop: safeTop,
-                                command: heroMorphCommand,
-                                onDidResetToFullScreen: {
-                                    model.unfreezeAllHeroMorphScrollInsets()
-                                }
+                                command: heroMorphCommand
                             )
                             .ignoresSafeArea()
 
@@ -509,7 +553,6 @@ struct BrowserScreen: View {
                     }
                 }
             }
-            .opacity((showTabs && !isHeroMorphing) ? 0.0 : 1.0)
             .allowsHitTesting(!showTabs && !isHeroMorphing && !showPageTools && !showBrowserMenu)
             .zIndex(10)
 
@@ -1569,9 +1612,6 @@ struct BrowserScreen: View {
 
     private func openTabOverviewWithHero() {
         let activeID = model.activeID
-        let safeTop = screenSafeAreaInsets.top
-        // Lock WKWebView insets & capture crisp async snapshot BEFORE starting morph (eliminates 59pt jump & 60ms drawHierarchy stall!)
-        model.freezeScrollInsetsForHeroMorph(for: activeID, fallbackSafeTop: safeTop)
         model.captureSnapshot(for: activeID)
         addressFocused = false
         showPageTools = false
@@ -1647,22 +1687,28 @@ struct BrowserScreen: View {
             overviewMorphProgress = 1.0
         }
         if model.isStartPage {
-            withAnimation(.spring(response: 0.36, dampingFraction: 0.88)) {
+            withAnimation(.spring(response: 0.34, dampingFraction: 0.88)) {
                 heroMorphProgress = 1.0
             }
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.39) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.36) {
             guard heroMorphToken == token else { return }
-            var endTx = Transaction()
-            endTx.disablesAnimations = true
-            withTransaction(endTx) {
+            // Step 1: Promote TabOverview to front (zIndex 15) and reveal resting card FIRST
+            var promoteTx = Transaction()
+            promoteTx.disablesAnimations = true
+            withTransaction(promoteTx) {
                 isHeroMorphing = false
                 heroMorphHiddenTabID = nil
-                heroMorphProgress = 0.0
-                heroMorphCommand = HeroMorphCommand(kind: .idle)
             }
-            if model.isStartPage {
-                model.unfreezeAllHeroMorphScrollInsets()
+            // Step 2: One frame later (now guaranteed safely behind opaque TabOverview!), reset HeroBrowserHostView to idle
+            DispatchQueue.main.async {
+                guard heroMorphToken == token else { return }
+                var resetTx = Transaction()
+                resetTx.disablesAnimations = true
+                withTransaction(resetTx) {
+                    heroMorphProgress = 0.0
+                    heroMorphCommand = HeroMorphCommand(kind: .idle)
+                }
             }
         }
     }
@@ -1676,7 +1722,6 @@ struct BrowserScreen: View {
         if selectedTabID != model.activeID {
             model.select(selectedTabID)
         }
-        model.freezeScrollInsetsForHeroMorph(for: selectedTabID, fallbackSafeTop: safeTop)
 
         let screen = UIScreen.main.bounds
         let startRect: CGRect
@@ -1712,24 +1757,24 @@ struct BrowserScreen: View {
         if model.isStartPage {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.016) {
                 guard heroMorphToken == token else { return }
-                withAnimation(.spring(response: 0.35, dampingFraction: 0.88)) {
+                withAnimation(.spring(response: 0.34, dampingFraction: 0.88)) {
                     heroMorphProgress = 0.0
                     overviewMorphProgress = 0.0
                 }
             }
         } else {
-            withAnimation(.spring(response: 0.35, dampingFraction: 0.88)) {
+            withAnimation(.easeOut(duration: 0.24)) {
                 overviewMorphProgress = 0.0
             }
         }
 
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.14) {
             guard heroMorphToken == token else { return }
-            withAnimation(.spring(response: 0.30, dampingFraction: 0.84)) {
+            withAnimation(.spring(response: 0.28, dampingFraction: 0.84)) {
                 toolbarVisible = true
             }
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.40) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.38) {
             guard heroMorphToken == token else { return }
             var endTx = Transaction()
             endTx.disablesAnimations = true
@@ -1740,9 +1785,6 @@ struct BrowserScreen: View {
                 heroMorphHiddenTabID = nil
                 toolbarVisible = true
                 heroMorphCommand = HeroMorphCommand(kind: .idle)
-            }
-            if model.isStartPage {
-                model.unfreezeAllHeroMorphScrollInsets()
             }
         }
     }
@@ -2442,20 +2484,34 @@ struct TabOverview: View {
                             }
                             .padding(.top, 16)
                         } else {
+                            // Deterministic non-lazy row grid so 100% of rows lay out synchronously on Frame 0
+                            // (eliminates the LazyVGrid + Spacer 95pt vertical drop-and-snap during Hero Zoom open!)
+                            let rowCount = (groupTabs.count + colCount - 1) / colCount
                             VStack {
                                 if model.preferences.tabsStartFromBottom {
                                     Spacer(minLength: 0)
                                 }
-                                LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 12), count: colCount), spacing: 14) {
-                                    ForEach(Array(groupTabs.enumerated()), id: \.element.id) { idx, tab in
-                                        safariTabCard(tab: tab, index: idx, cardHeight: gridThumbHeight, isHeroSingle: false, outerGeo: outerGeo, scrollProxy: proxy, groupTabs: groupTabs)
-                                            .id(tab.id)
-                                            .offset(visualShiftOffset(for: idx, groupID: groupID))
-                                            .animation(.spring(response: 0.28, dampingFraction: 0.80), value: dragTargetIndex)
-                                            .transition(.asymmetric(
-                                                insertion: .scale(scale: 0.90).combined(with: .opacity),
-                                                removal: .scale(scale: 0.72).combined(with: .opacity)
-                                            ))
+                                VStack(spacing: 14) {
+                                    ForEach(0..<rowCount, id: \.self) { row in
+                                        HStack(alignment: .top, spacing: 12) {
+                                            ForEach(0..<colCount, id: \.self) { col in
+                                                let idx = row * colCount + col
+                                                if idx < groupTabs.count {
+                                                    let tab = groupTabs[idx]
+                                                    safariTabCard(tab: tab, index: idx, cardHeight: gridThumbHeight, isHeroSingle: false, outerGeo: outerGeo, scrollProxy: proxy, groupTabs: groupTabs)
+                                                        .id(tab.id)
+                                                        .frame(maxWidth: .infinity)
+                                                        .offset(visualShiftOffset(for: idx, groupID: groupID))
+                                                        .animation(.spring(response: 0.28, dampingFraction: 0.80), value: dragTargetIndex)
+                                                        .transition(.asymmetric(
+                                                            insertion: .scale(scale: 0.90).combined(with: .opacity),
+                                                            removal: .scale(scale: 0.72).combined(with: .opacity)
+                                                        ))
+                                                } else {
+                                                    Color.clear.frame(maxWidth: .infinity, height: 1)
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                                 .padding(.horizontal, 14)
@@ -2468,10 +2524,14 @@ struct TabOverview: View {
                 }
                 .scrollDisabled(draggingTabID != nil || contextMenuTab != nil)
                 .onAppear {
-                    if groupTabs.contains(where: { $0.id == model.activeID }) {
-                        proxy.scrollTo(model.activeID, anchor: .center)
-                    } else if model.preferences.tabsStartFromBottom, let lastID = groupTabs.last?.id {
-                        proxy.scrollTo(lastID, anchor: .bottom)
+                    let rowCount = max(1, (groupTabs.count + colCount - 1) / colCount)
+                    let estimatedGridH = CGFloat(rowCount) * (gridThumbHeight + 26) + CGFloat(max(0, rowCount - 1)) * 14 + 36
+                    if estimatedGridH > outerGeo.size.height {
+                        if groupTabs.contains(where: { $0.id == model.activeID }) {
+                            proxy.scrollTo(model.activeID, anchor: .center)
+                        } else if model.preferences.tabsStartFromBottom, let lastID = groupTabs.last?.id {
+                            proxy.scrollTo(lastID, anchor: .bottom)
+                        }
                     }
                 }
                 .onPreferenceChange(TabCardFramePreferenceKey.self) { frames in
