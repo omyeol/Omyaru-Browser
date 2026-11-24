@@ -66,6 +66,7 @@ struct OmyaruApp: App {
                 switch phase {
                 case .background:
                     appLock.lockIfNeeded()
+                    BookshelfLockManager.shared.onAppBackgrounded()
                     browser.persist()
                     OmyaruSyncLiveActivityController.shared.onAppMovedToBackground(isSyncing: driveSync.busy)
                     if browser.preferences.clearDataOnExit {
@@ -81,6 +82,7 @@ struct OmyaruApp: App {
                     }
                 case .active:
                     OmyaruBackgroundSyncScheduler.shared.browserRef = browser
+                    BookshelfLockManager.shared.onAppForegrounded()
                     OmyaruSyncLiveActivityController.shared.onAppMovedToForeground()
                     if driveSync.isConnected && sharedFolder.needsInitialFolderSetup && !promptedFolderThisLaunch {
                         promptedFolderThisLaunch = true
@@ -455,7 +457,7 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
     static let defaultProfileID = UUID(uuidString: "00000000-0000-0000-0000-000000000010")!
     static let defaultGroupID = UUID(uuidString: "00000000-0000-0000-0000-000000000002")!
     static let appVersionName = "0.15.18"
-    static let appBuildNumber = 89
+    static let appBuildNumber = 90
 
     var isApplyingRemoteSync: Bool = false
 

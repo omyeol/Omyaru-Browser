@@ -293,6 +293,478 @@ struct AppLockSettingsSheet: View {
     }
 }
 
+// MARK: - Dedicated Bookshelf Lock (Timeout + iPhone Device Lock + Face ID / Custom PIN & Password)
+
+enum BookshelfLockTimeout: Int, CaseIterable, Identifiable {
+    case immediately = 0
+    case thirtySeconds = 30
+    case oneMinute = 60
+    case threeMinutes = 180
+    case fiveMinutes = 300
+    case tenMinutes = 600
+    case thirtyMinutes = 1800
+    case oneHour = 3600
+    case never = -1
+
+    var id: Int { rawValue }
+
+    var title: String {
+        switch self {
+        case .immediately: return "즉시 (책장 닫을 때)"
+        case .thirtySeconds: return "30초 후"
+        case .oneMinute: return "1분 후"
+        case .threeMinutes: return "3분 후"
+        case .fiveMinutes: return "5분 후"
+        case .tenMinutes: return "10분 후"
+        case .thirtyMinutes: return "30분 후"
+        case .oneHour: return "1시간 후"
+        case .never: return "시간 잠금 안 함"
+        }
+    }
+}
+
+@MainActor
+final class BookshelfLockManager: ObservableObject {
+    static let shared = BookshelfLockManager()
+
+    @Published var isEnabled: Bool {
+        didSet {
+            UserDefaults.standard.set(isEnabled, forKey: "omyaru.ios.bookshelfLock.enabled")
+            if !isEnabled {
+                isLocked = false
+                lastInactiveAt = nil
+            }
+        }
+    }
+    @Published var lockKind: AppLockKind {
+        didSet { UserDefaults.standard.set(lockKind.rawValue, forKey: "omyaru.ios.bookshelfLock.kind") }
+    }
+    @Published var pinLength: Int {
+        didSet { UserDefaults.standard.set(pinLength, forKey: "omyaru.ios.bookshelfLock.pinLength") }
+    }
+    @Published var useBiometrics: Bool {
+        didSet { UserDefaults.standard.set(useBiometrics, forKey: "omyaru.ios.bookshelfLock.biometrics") }
+    }
+    @Published var lockTimeout: BookshelfLockTimeout {
+        didSet { UserDefaults.standard.set(lockTimeout.rawValue, forKey: "omyaru.ios.bookshelfLock.timeout") }
+    }
+    @Published var lockOnDeviceLock: Bool {
+        didSet { UserDefaults.standard.set(lockOnDeviceLock, forKey: "omyaru.ios.bookshelfLock.onDeviceLock") }
+    }
+    @Published var lockOnBackground: Bool {
+        didSet { UserDefaults.standard.set(lockOnBackground, forKey: "omyaru.ios.bookshelfLock.onBackground") }
+    }
+    @Published var isLocked: Bool = false
+    @Published var errorMessage: String = ""
+
+    private var lastInactiveAt: Date? = nil
+    private var deviceLockObserver: NSObjectProtocol? = nil
+    private let hashKey = "omyaru.ios.bookshelfLock.pinHash"
+    private let saltKey = "omyaru.ios.bookshelfLock.pinSalt"
+
+    init() {
+        let d = UserDefaults.standard
+        let enabled = d.bool(forKey: "omyaru.ios.bookshelfLock.enabled")
+        isEnabled = enabled
+        lockKind = AppLockKind(rawValue: d.string(forKey: "omyaru.ios.bookshelfLock.kind") ?? "PIN") ?? .pin
+        pinLength = min(6, max(4, d.object(forKey: "omyaru.ios.bookshelfLock.pinLength") as? Int ?? 4))
+        useBiometrics = d.object(forKey: "omyaru.ios.bookshelfLock.biometrics") as? Bool ?? true
+        let savedTimeout = d.object(forKey: "omyaru.ios.bookshelfLock.timeout") as? Int ?? BookshelfLockTimeout.immediately.rawValue
+        lockTimeout = BookshelfLockTimeout(rawValue: savedTimeout) ?? .immediately
+        lockOnDeviceLock = d.object(forKey: "omyaru.ios.bookshelfLock.onDeviceLock") as? Bool ?? true
+        lockOnBackground = d.object(forKey: "omyaru.ios.bookshelfLock.onBackground") as? Bool ?? false
+        isLocked = enabled
+
+        deviceLockObserver = NotificationCenter.default.addObserver(
+            forName: UIApplication.protectedDataWillBecomeUnavailableNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                self?.onDeviceLocked()
+            }
+        }
+    }
+
+    var hasSecret: Bool {
+        !(UserDefaults.standard.string(forKey: hashKey) ?? "").isEmpty
+    }
+
+    /// Synchronous read-only check so BookshelfView never flashes photos on frame 0 before `.onAppear`.
+    var isCurrentlyLocked: Bool {
+        guard isEnabled else { return false }
+        if isLocked { return true }
+        guard lockTimeout != .never, let last = lastInactiveAt else { return false }
+        return lockTimeout == .immediately || Date().timeIntervalSince(last) >= Double(lockTimeout.rawValue)
+    }
+
+    var summaryDescription: String {
+        guard isEnabled else { return "꺼짐" }
+        var parts: [String] = []
+        if hasSecret {
+            parts.append(lockKind == .pin ? "\(pinLength)자리 PIN" : "비밀번호")
+        }
+        if useBiometrics || !hasSecret {
+            parts.append("Face ID / 암호")
+        }
+        if lockTimeout != .never {
+            parts.append(lockTimeout.title)
+        }
+        if lockOnDeviceLock {
+            parts.append("아이폰 잠금 연동")
+        }
+        return parts.joined(separator: " · ")
+    }
+
+    func setSecret(_ secret: String, kind: AppLockKind) -> Bool {
+        let trimmed = secret.trimmingCharacters(in: .whitespacesAndNewlines)
+        if kind == .pin {
+            guard (4...6).contains(trimmed.count), trimmed.allSatisfy(\.isNumber) else {
+                errorMessage = "PIN은 4~6자리 숫자여야 합니다."
+                return false
+            }
+            pinLength = trimmed.count
+        } else {
+            guard trimmed.count >= 4, trimmed.count <= 64 else {
+                errorMessage = "비밀번호는 4~64자여야 합니다."
+                return false
+            }
+        }
+        var saltBytes = [UInt8](repeating: 0, count: 16)
+        _ = SecRandomCopyBytes(kSecRandomDefault, 16, &saltBytes)
+        let salt = Data(saltBytes)
+        let hash = Self.hashSecret(trimmed, salt: salt)
+        UserDefaults.standard.set(salt.base64EncodedString(), forKey: saltKey)
+        UserDefaults.standard.set(hash.base64EncodedString(), forKey: hashKey)
+        lockKind = kind
+        isEnabled = true
+        isLocked = false
+        lastInactiveAt = nil
+        errorMessage = ""
+        return true
+    }
+
+    func clearCustomSecret() {
+        UserDefaults.standard.removeObject(forKey: hashKey)
+        UserDefaults.standard.removeObject(forKey: saltKey)
+        errorMessage = ""
+    }
+
+    func verifySecret(_ input: String) -> Bool {
+        guard let saltB64 = UserDefaults.standard.string(forKey: saltKey),
+              let salt = Data(base64Encoded: saltB64),
+              let expectedB64 = UserDefaults.standard.string(forKey: hashKey),
+              let expected = Data(base64Encoded: expectedB64) else {
+            return false
+        }
+        let actual = Self.hashSecret(input.trimmingCharacters(in: .whitespacesAndNewlines), salt: salt)
+        if actual == expected {
+            isLocked = false
+            lastInactiveAt = nil
+            errorMessage = ""
+            return true
+        } else {
+            errorMessage = lockKind == .pin ? "책장 PIN이 일치하지 않습니다." : "책장 비밀번호가 일치하지 않습니다."
+            return false
+        }
+    }
+
+    func disableLock() {
+        isEnabled = false
+        isLocked = false
+        lastInactiveAt = nil
+        clearCustomSecret()
+    }
+
+    func lockNow() {
+        guard isEnabled else { return }
+        isLocked = true
+        lastInactiveAt = Date()
+    }
+
+    func onDeviceLocked() {
+        guard isEnabled, lockOnDeviceLock else { return }
+        isLocked = true
+        lastInactiveAt = Date()
+    }
+
+    func onBookshelfOpened() {
+        guard isEnabled else {
+            isLocked = false
+            return
+        }
+        evaluateTimeoutLockIfNeeded()
+        if !isLocked {
+            lastInactiveAt = nil
+        }
+    }
+
+    func onBookshelfClosed() {
+        guard isEnabled else { return }
+        lastInactiveAt = Date()
+        if lockTimeout == .immediately {
+            isLocked = true
+        }
+    }
+
+    func onAppBackgrounded() {
+        guard isEnabled else { return }
+        lastInactiveAt = Date()
+        if lockOnBackground || lockTimeout == .immediately {
+            isLocked = true
+        }
+    }
+
+    func onAppForegrounded() {
+        guard isEnabled else { return }
+        evaluateTimeoutLockIfNeeded()
+    }
+
+    func evaluateTimeoutLockIfNeeded() {
+        guard isEnabled, !isLocked else { return }
+        guard lockTimeout != .never, let last = lastInactiveAt else { return }
+        if lockTimeout == .immediately || Date().timeIntervalSince(last) >= Double(lockTimeout.rawValue) {
+            isLocked = true
+        }
+    }
+
+    func unlockWithDeviceAuth() async {
+        guard isEnabled else { return }
+        let context = LAContext()
+        var error: NSError?
+        let policy: LAPolicy = hasSecret ? .deviceOwnerAuthenticationWithBiometrics : .deviceOwnerAuthentication
+        if hasSecret && !useBiometrics { return }
+        guard context.canEvaluatePolicy(policy, error: &error) else {
+            if !hasSecret {
+                errorMessage = "기기에 Face ID/Touch ID 또는 암호가 설정되어 있지 않습니다. 책장 전용 암호를 설정해 주세요."
+            }
+            return
+        }
+        do {
+            let success = try await context.evaluatePolicy(
+                policy,
+                localizedReason: "Omyaru 책장 잠금 해제"
+            )
+            if success {
+                isLocked = false
+                lastInactiveAt = nil
+                errorMessage = ""
+            }
+        } catch {
+            errorMessage = hasSecret
+                ? "생체 인증을 완료하지 못했습니다. 책장 암호를 입력해 주세요."
+                : "인증이 취소되었습니다. 다시 시도해 주세요."
+        }
+    }
+
+    private static func hashSecret(_ secret: String, salt: Data) -> Data {
+        var derived = [UInt8](repeating: 0, count: 32)
+        _ = salt.withUnsafeBytes { saltBuf in
+            secret.withCString { ptr in
+                CCKeyDerivationPBKDF(
+                    CCPBKDFAlgorithm(kCCPBKDF2),
+                    ptr,
+                    secret.utf8.count,
+                    saltBuf.bindMemory(to: UInt8.self).baseAddress,
+                    salt.count,
+                    CCPseudoRandomAlgorithm(kCCPRFHmacAlgSHA256),
+                    120_000,
+                    &derived,
+                    32
+                )
+            }
+        }
+        return Data(derived)
+    }
+}
+
+struct BookshelfLockOverlayView: View {
+    @ObservedObject var lock: BookshelfLockManager = .shared
+    var onDismiss: () -> Void
+    @State private var secretInput: String = ""
+
+    var body: some View {
+        ZStack {
+            Color(red: 0.05, green: 0.05, blue: 0.06).ignoresSafeArea()
+            VStack(spacing: 0) {
+                HStack {
+                    Button("닫기", action: onDismiss)
+                        .font(.body.weight(.medium))
+                        .foregroundStyle(.white.opacity(0.85))
+                    Spacer()
+                }
+                .padding(.horizontal, 20)
+                .padding(.top, 14)
+
+                Spacer()
+
+                VStack(spacing: 18) {
+                    Image(systemName: "lock.rectangle.stack.fill")
+                        .font(.system(size: 54))
+                        .foregroundStyle(.blue)
+                    Text("책장 잠금")
+                        .font(.title2.weight(.bold))
+                        .foregroundStyle(.white)
+                    Text(lock.summaryDescription)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+
+                    if lock.hasSecret {
+                        SecureField(lock.lockKind == .pin ? "\(lock.pinLength)자리 PIN 입력" : "책장 비밀번호 입력", text: $secretInput)
+                            .keyboardType(lock.lockKind == .pin ? .numberPad : .default)
+                            .multilineTextAlignment(.center)
+                            .font(.title3.monospacedDigit())
+                            .padding(12)
+                            .frame(width: 240)
+                            .background(Color(red: 0.14, green: 0.14, blue: 0.16), in: RoundedRectangle(cornerRadius: 12))
+                            .onSubmit {
+                                if lock.verifySecret(secretInput) { secretInput = "" }
+                            }
+                    }
+
+                    if !lock.errorMessage.isEmpty {
+                        Text(lock.errorMessage)
+                            .font(.caption)
+                            .foregroundStyle(.red)
+                            .multilineTextAlignment(.center)
+                    }
+
+                    HStack(spacing: 12) {
+                        if lock.hasSecret {
+                            Button {
+                                if lock.verifySecret(secretInput) { secretInput = "" }
+                            } label: {
+                                Label("잠금 해제", systemImage: "key.fill")
+                                    .padding(.horizontal, 16)
+                                    .padding(.vertical, 10)
+                            }
+                            .buttonStyle(.borderedProminent)
+                        }
+
+                        if lock.useBiometrics || !lock.hasSecret {
+                            Button {
+                                Task { await lock.unlockWithDeviceAuth() }
+                            } label: {
+                                Label(lock.hasSecret ? "Face ID / Touch ID" : "Face ID / 암호로 열기", systemImage: "faceid")
+                                    .padding(.horizontal, 16)
+                                    .padding(.vertical, 10)
+                            }
+                            .buttonStyle(.borderedProminent)
+                        }
+                    }
+                }
+                .padding(28)
+
+                Spacer()
+            }
+        }
+        .task {
+            await lock.unlockWithDeviceAuth()
+        }
+    }
+}
+
+struct BookshelfLockSettingsSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    @ObservedObject var lock: BookshelfLockManager = .shared
+    @State private var chosenKind: AppLockKind = .pin
+    @State private var newSecret: String = ""
+    @State private var confirmSecret: String = ""
+    @State private var message: String = ""
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section {
+                    Toggle("책장 잠금 사용", isOn: $lock.isEnabled)
+                    if lock.isEnabled {
+                        LabeledContent("적용 규칙") {
+                            Text(lock.summaryDescription)
+                                .font(.caption)
+                                .foregroundStyle(.green)
+                                .multilineTextAlignment(.trailing)
+                        }
+                        Toggle("Face ID / Touch ID 사용", isOn: $lock.useBiometrics)
+                        Picker("자동 잠금 시간", selection: $lock.lockTimeout) {
+                            ForEach(BookshelfLockTimeout.allCases) { option in
+                                Text(option.title).tag(option)
+                            }
+                        }
+                        Toggle("아이폰이 잠기면 같이 잠금", isOn: $lock.lockOnDeviceLock)
+                        Toggle("앱 백그라운드 전환 시 즉시 잠금", isOn: $lock.lockOnBackground)
+                    }
+                } header: {
+                    Text("책장 잠금 옵션")
+                } footer: {
+                    Text("별도 암호를 설정하지 않아도 Face ID · Touch ID 또는 iPhone 암호로 바로 책장을 잠글 수 있습니다. ‘아이폰이 잠기면 같이 잠금’을 켜면 기기 화면이 잠길 때 책장도 함께 잠깁니다.")
+                }
+
+                Section {
+                    Picker("암호 방식", selection: $chosenKind) {
+                        ForEach(AppLockKind.allCases) { kind in
+                            Text(kind.title).tag(kind)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+
+                    SecureField(chosenKind == .pin ? "책장 PIN (4~6자리 숫자)" : "책장 비밀번호 (4자 이상)", text: $newSecret)
+                        .keyboardType(chosenKind == .pin ? .numberPad : .default)
+                    SecureField("암호 확인", text: $confirmSecret)
+                        .keyboardType(chosenKind == .pin ? .numberPad : .default)
+
+                    Button("책장 전용 암호 저장 및 잠금 켜기") {
+                        guard newSecret == confirmSecret else {
+                            message = "암호 확인이 일치하지 않습니다."
+                            return
+                        }
+                        if lock.setSecret(newSecret, kind: chosenKind) {
+                            newSecret = ""
+                            confirmSecret = ""
+                            message = "책장 전용 암호가 저장되고 잠금이 활성화되었습니다."
+                        } else {
+                            message = lock.errorMessage
+                        }
+                    }
+
+                    if lock.hasSecret {
+                        Button("책장 전용 암호 삭제 (Face ID·기기 암호만 사용)", role: .destructive) {
+                            lock.clearCustomSecret()
+                            message = "전용 암호를 삭제했습니다. 이제 Face ID 또는 기기 암호로 해제됩니다."
+                        }
+                    }
+
+                    if !message.isEmpty {
+                        Text(message).font(.caption).foregroundStyle(.secondary)
+                    }
+                } header: {
+                    Text("책장 전용 암호 (선택)")
+                }
+
+                if lock.isEnabled {
+                    Section {
+                        Button {
+                            lock.lockNow()
+                            dismiss()
+                        } label: {
+                            Label("지금 책장 잠그기", systemImage: "lock.fill")
+                        }
+                    }
+                }
+            }
+            .navigationTitle("책장 잠금 설정")
+            .navigationBarTitleDisplayMode(.inline)
+            .onAppear { chosenKind = lock.lockKind }
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("완료") { dismiss() }
+                }
+            }
+        }
+        .preferredColorScheme(.dark)
+    }
+}
+
 // MARK: - WireGuard .conf Profile Manager & DNS-over-HTTPS (Android VpnActivity + VpnProfiles Parity!)
 
 struct WireGuardProfile: Codable, Identifiable, Hashable {

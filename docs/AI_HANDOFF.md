@@ -1,3 +1,22 @@
+# 2026-11-24 Antigravity: iOS 탭 목록 길게 누르기 미이동 릴리스 메뉴 확정 표시(`@GestureState`) + 전용 책장 잠금(자동 잠금 시간 · 아이폰 잠금 연동 · Face ID/PIN/비밀번호) (`iOS build 90`)
+
+- 작업 워크스페이스: `E:/DEV/CODEX/BROWSER`
+- 사용자 요청:
+  1. iOS 탭 목록에서 탭을 길게 눌렀다가 움직이지 않고 놓으면 `링크 복사하기` 등 컨텍스트 메뉴가 확실히 뜨도록 수정
+  2. 책장 전용 잠금 기능 추가(자동 잠금 시간 설정 + 아이폰 화면이 잠기면 같이 잠기도록 하는 옵션 포함)
+- 해결:
+  1. **탭 목록 미이동 릴리스 컨텍스트 메뉴 확정 발동 (`apps/ios/Omyaru/BrowserViews.swift`)**:
+     - 원인: SwiftUI `LongPressGesture.sequenced(before: DragGesture)`는 길게 누른 뒤 손가락을 움직이지 않고 그대로 떼면 `DragGesture`가 시작되지 않아 `.onEnded`를 호출하지 않고 조용히 취소되는 특성 때문에 컨텍스트 메뉴가 열리지 않았음.
+     - 해결: `@GestureState private var isTabHoldGestureActive = false` + `.updating($isTabHoldGestureActive)` + `.onChange(of: isTabHoldGestureActive)`와 `isSettlingDrop` 가드를 도입하고 홀드 데드존을 `16pt`로 여유 있게 조정해, `.onEnded`가 생략되더라도 손을 떼는 순간 `finalizeActiveTabDrag`가 100% 호출되어 Liquid Glass 컨텍스트 메뉴(`링크 복사하기 · 탭 고정 · 탭 복제 · 탭 선택 · 탭 이동 · 다른 탭 닫기 · 탭 닫기`)가 즉시 열리도록 수정.
+  2. **책장 전용 잠금 (`apps/ios/Omyaru/AppLockAndPrivacy.swift`, `BookshelfView.swift`, `BrowserViews.swift`, `OmyaruApp.swift`)**:
+     - `BookshelfLockManager` / `BookshelfLockTimeout` / `BookshelfLockOverlayView` / `BookshelfLockSettingsSheet` 신설(전체 앱 잠금과 독립 동작).
+     - **자동 잠금 시간(`BookshelfLockTimeout`)**: `즉시 (책장 닫을 때)`, `30초`, `1분`, `3분`, `5분`, `10분`, `30분`, `1시간`, `시간 잠금 안 함` 선택 가능.
+     - **아이폰 잠금 연동(`lockOnDeviceLock`)**: `UIApplication.protectedDataWillBecomeUnavailableNotification` 구독으로 아이폰 화면이 잠기는 즉시 책장도 함께 잠금(+ 선택적 `앱 백그라운드 전환 시 즉시 잠금`, 앱 전환기 미리보기 가림막 포함).
+     - **인증 방식**: 별도 암호 없이 Face ID · Touch ID · iPhone 암호만으로 즉시 사용하거나, 책장 전용 PIN(4~6자리)/비밀번호(PBKDF2-SHA256) 설정 가능. 책장 우측 상단 `⋯` 메뉴(`책장 잠금 설정` / `지금 책장 잠그기`)와 브라우저 설정 → 개인정보 보호 양쪽에서 접근 가능.
+  - iOS 빌드 번호: `89` → **`90`** (`Info.plist`, `OmyaruApp.swift`).
+
+---
+
 # 2026-11-24 Antigravity: iOS 포그라운드 상단 동기화 배너 제거 · 백그라운드 전용 진행 알림 · 동기화 창 상단 진행률 카드 표시 (`iOS build 89`)
 
 - 작업 워크스페이스: `E:/DEV/CODEX/BROWSER`

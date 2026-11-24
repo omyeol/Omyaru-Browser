@@ -725,7 +725,9 @@ final class ShelfModel: ObservableObject {
 
 struct BookshelfView: View {
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.scenePhase) private var scenePhase
     @ObservedObject var model: ShelfModel = .shared
+    @ObservedObject var bookshelfLock: BookshelfLockManager = .shared
     @State private var selectedPhotos: [PhotosPickerItem] = []
     @State private var showFilePicker = false
     @State private var showFolderTree = false
@@ -743,12 +745,14 @@ struct BookshelfView: View {
     @State private var showPDFOptions = false
     @State private var showSyncSheet = false
     @State private var showStorageSheet = false
+    @State private var showLockSettings = false
     @State private var selectionMode = false
     @State private var selectedItemIDs: Set<String> = []
     @State private var showBatchMoveSheet = false
     @State private var noteText = ""
 
     var body: some View {
+        ZStack {
         NavigationStack {
             VStack(spacing: 0) {
                 folderBreadcrumbBar
@@ -835,6 +839,18 @@ struct BookshelfView: View {
                         } label: {
                             Label("책장 저장 공간 관리", systemImage: "externaldrive")
                         }
+                        Button {
+                            showLockSettings = true
+                        } label: {
+                            Label("책장 잠금 설정", systemImage: "lock.shield")
+                        }
+                        if bookshelfLock.isEnabled {
+                            Button {
+                                bookshelfLock.lockNow()
+                            } label: {
+                                Label("지금 책장 잠그기", systemImage: "lock.fill")
+                            }
+                        }
                         Divider()
                         Button(role: .destructive) {
                             deletingFolderPath = model.activeFolder
@@ -918,6 +934,9 @@ struct BookshelfView: View {
             .sheet(isPresented: $showStorageSheet) {
                 BookshelfStorageSheet(model: model)
             }
+            .sheet(isPresented: $showLockSettings) {
+                BookshelfLockSettingsSheet()
+            }
             .sheet(isPresented: $showBatchMoveSheet) {
                 BookshelfBatchMoveSheet(model: model, itemIDs: selectedItemIDs) {
                     selectedItemIDs.removeAll()
@@ -998,6 +1017,30 @@ struct BookshelfView: View {
                     Text("‘\(target)’ 폴더와 하위 폴더, 포함된 이미지 \(count)개를 모두 삭제할까요?")
                 }
             }
+        }
+
+        if bookshelfLock.isCurrentlyLocked {
+            BookshelfLockOverlayView {
+                dismiss()
+            }
+            .transition(.opacity)
+            .zIndex(50)
+        } else if scenePhase != .active && bookshelfLock.isEnabled {
+            Color.black
+                .ignoresSafeArea()
+                .overlay {
+                    Image(systemName: "lock.rectangle.stack.fill")
+                        .font(.system(size: 52))
+                        .foregroundStyle(.blue)
+                }
+                .zIndex(60)
+        }
+        }
+        .onAppear {
+            bookshelfLock.onBookshelfOpened()
+        }
+        .onDisappear {
+            bookshelfLock.onBookshelfClosed()
         }
         .preferredColorScheme(.dark)
     }

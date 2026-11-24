@@ -27,6 +27,7 @@ struct BrowserScreen: View {
     @State private var showExtensions = false
     @State private var showNetworkPrivacy = false
     @State private var showAppLock = false
+    @State private var showBookshelfLock = false
     @State private var showSettings = false
     @State private var showProfiles = false
     @State private var showPageTools = false
@@ -259,6 +260,9 @@ struct BrowserScreen: View {
         .sheet(isPresented: $showAppLock) {
             AppLockSettingsSheet()
         }
+        .sheet(isPresented: $showBookshelfLock) {
+            BookshelfLockSettingsSheet()
+        }
         .sheet(isPresented: $showSettings) {
             SettingsSheet(
                 model: model,
@@ -266,6 +270,7 @@ struct BrowserScreen: View {
                 onOpenExtensions: { showSettings = false; DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { showExtensions = true } },
                 onOpenNetwork: { showSettings = false; DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { showNetworkPrivacy = true } },
                 onOpenAppLock: { showSettings = false; DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { showAppLock = true } },
+                onOpenBookshelfLock: { showSettings = false; DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { showBookshelfLock = true } },
                 onOpenProfiles: { showSettings = false; DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { showProfiles = true } },
                 onCheckUpdates: { Task { await checkUpdates() } }
             )
@@ -1242,7 +1247,9 @@ struct TabOverview: View {
     @State private var dragOriginIndex: Int? = nil
     @State private var dragTargetIndex: Int? = nil
     @State private var dragSlotFrames: [CGRect] = []
+    @State private var isSettlingDrop = false
     @State private var tabFrames: [UUID: CGRect] = [:]
+    @GestureState private var isTabHoldGestureActive = false
     @FocusState private var searchFieldFocused: Bool
 
     private func displayedTabs(for groupID: UUID) -> [BrowserTab] {
@@ -1448,6 +1455,13 @@ struct TabOverview: View {
         }
         .onAppear {
             pagedGroupID = model.activeGroupID
+        }
+        .onChange(of: isTabHoldGestureActive) { active in
+            // SwiftUI cancels LongPress.sequenced(before: Drag) silently without firing .onEnded
+            // when the user lifts their finger straight up without dragging -> @GestureState ALWAYS resets to false!
+            if !active && draggingTabID != nil && !isSettlingDrop {
+                finalizeActiveTabDrag(in: displayedTabs(for: pagedGroupID))
+            }
         }
         .onChange(of: pagedGroupID) { nextGroup in
             if nextGroup != model.activeGroupID {
@@ -1837,8 +1851,11 @@ struct TabOverview: View {
         .gesture(
             LongPressGesture(minimumDuration: 0.28)
                 .sequenced(before: DragGesture(minimumDistance: 0, coordinateSpace: .global))
+                .updating($isTabHoldGestureActive) { _, state, _ in
+                    state = true
+                }
                 .onChanged { value in
-                    guard !selectionMode && contextMenuTab == nil else { return }
+                    guard !selectionMode && contextMenuTab == nil && !isSettlingDrop else { return }
                     guard draggingTabID == nil || draggingTabID == tab.id else { return }
                     switch value {
                     case .first(true):
@@ -1872,7 +1889,6 @@ struct TabOverview: View {
                             }
                         }
                         if let drag {
-                            // Anchor delta strictly to the FIRST drag.location (never drag.startLocation!) so resting finger = 0.0pt delta!
                             if dragFirstLocation == nil {
                                 dragFirstLocation = drag.location
                             }
@@ -1880,7 +1896,7 @@ struct TabOverview: View {
                             let dx = drag.location.x - firstLoc.x
                             let dy = drag.location.y - firstLoc.y
                             if !dragMovedBeyondThreshold {
-                                guard hypot(dx, dy) > 12 else { return }
+                                guard hypot(dx, dy) > 16 else { return }
                                 dragMovedBeyondThreshold = true
                             }
                             let nextCenter = CGPoint(
@@ -1889,7 +1905,6 @@ struct TabOverview: View {
                             )
                             dragCardGlobalCenter = nextCenter
 
-                            // Hit-test against STATIC snapshotted slot frames (ForEach NEVER mutates mid-drag -> zero ping-pong!)
                             if !isHeroSingle && !searchMode {
                                 for candidateIdx in dragSlotFrames.indices {
                                     guard candidateIdx < groupTabs.count,
@@ -1910,65 +1925,63 @@ struct TabOverview: View {
                         break
                     }
                 }
-                .onEnded { value in
-                    let wasLifted = draggingTabID == tab.id
-                    let wasDragged = dragMovedBeyondThreshold
-                    let originIdx = dragOriginIndex
-                    let targetIdx = dragTargetIndex
-                    let slots = dragSlotFrames
-                    let finishedFirstOnly: Bool
-                    if case .first(true) = value {
-                        finishedFirstOnly = true
-                    } else {
-                        finishedFirstOnly = false
-                    }
-
-                    dragFirstLocation = nil
-                    dragMovedBeyondThreshold = false
-
-                    if wasLifted && wasDragged {
-                        let token = dragSessionID
-                        let destIdx = targetIdx ?? originIdx
-                        let destRect = destIdx.flatMap { $0 < slots.count ? slots[$0] : nil }
-                        withAnimation(.spring(response: 0.20, dampingFraction: 0.86)) {
-                            if let destRect, destRect.width > 10 {
-                                dragCardGlobalCenter = CGPoint(x: destRect.midX, y: destRect.midY)
-                            }
-                            dragCardScale = 1.0
-                        }
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.19) {
-                            guard dragSessionID == token && draggingTabID == tab.id else { return }
-                            var tx = Transaction()
-                            tx.disablesAnimations = true
-                            withTransaction(tx) {
-                                if let o = originIdx, let t = targetIdx, o != t, t >= 0, t < groupTabs.count {
-                                    model.moveVisibleTab(fromID: tab.id, toID: groupTabs[t].id)
-                                }
-                                draggingTabID = nil
-                                dragOriginIndex = nil
-                                dragTargetIndex = nil
-                                dragSlotFrames = []
-                            }
-                        }
-                    } else if wasLifted || finishedFirstOnly {
-                        draggingTabID = nil
-                        dragCardScale = 1.0
-                        dragOriginIndex = nil
-                        dragTargetIndex = nil
-                        dragSlotFrames = []
-                        UIImpactFeedbackGenerator(style: .soft).impactOccurred()
-                        withAnimation(.spring(response: 0.32, dampingFraction: 0.82)) {
-                            contextMenuTab = tab
-                        }
-                    } else {
-                        draggingTabID = nil
-                        dragCardScale = 1.0
-                        dragOriginIndex = nil
-                        dragTargetIndex = nil
-                        dragSlotFrames = []
-                    }
+                .onEnded { _ in
+                    finalizeActiveTabDrag(in: groupTabs)
                 }
         )
+    }
+
+    private func finalizeActiveTabDrag(in groupTabs: [BrowserTab]) {
+        guard let dragID = draggingTabID, !isSettlingDrop else { return }
+        let liftedTab = groupTabs.first(where: { $0.id == dragID }) ?? model.tabs.first(where: { $0.id == dragID })
+        let wasDragged = dragMovedBeyondThreshold
+        let originIdx = dragOriginIndex
+        let targetIdx = dragTargetIndex
+        let slots = dragSlotFrames
+
+        dragFirstLocation = nil
+        dragMovedBeyondThreshold = false
+
+        if !wasDragged, let liftedTab {
+            // Held and released WITHOUT moving -> open floating Liquid Glass context menu (링크 복사하기, 탭 고정 등)!
+            draggingTabID = nil
+            dragCardScale = 1.0
+            dragOriginIndex = nil
+            dragTargetIndex = nil
+            dragSlotFrames = []
+            UIImpactFeedbackGenerator(style: .soft).impactOccurred()
+            withAnimation(.spring(response: 0.32, dampingFraction: 0.82)) {
+                contextMenuTab = liftedTab
+            }
+            return
+        }
+
+        // Dragged -> smoothly glide floating card into destination slot and commit order seamlessly!
+        isSettlingDrop = true
+        let token = dragSessionID
+        let destIdx = targetIdx ?? originIdx
+        let destRect = destIdx.flatMap { $0 < slots.count ? slots[$0] : nil }
+        withAnimation(.spring(response: 0.20, dampingFraction: 0.86)) {
+            if let destRect, destRect.width > 10 {
+                dragCardGlobalCenter = CGPoint(x: destRect.midX, y: destRect.midY)
+            }
+            dragCardScale = 1.0
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.19) {
+            guard dragSessionID == token && draggingTabID == dragID else { return }
+            var tx = Transaction()
+            tx.disablesAnimations = true
+            withTransaction(tx) {
+                if let o = originIdx, let t = targetIdx, o != t, t >= 0, t < groupTabs.count {
+                    model.moveVisibleTab(fromID: dragID, toID: groupTabs[t].id)
+                }
+                draggingTabID = nil
+                dragOriginIndex = nil
+                dragTargetIndex = nil
+                dragSlotFrames = []
+                isSettlingDrop = false
+            }
+        }
     }
 
     private func liquidGlassListRow(tab: BrowserTab) -> some View {
@@ -2766,6 +2779,7 @@ struct SettingsSheet: View {
     var onOpenExtensions: () -> Void
     var onOpenNetwork: () -> Void
     var onOpenAppLock: () -> Void
+    var onOpenBookshelfLock: () -> Void
     var onOpenProfiles: () -> Void
     var onCheckUpdates: () -> Void
     @State private var showToolbarEditor = false
@@ -2895,6 +2909,7 @@ struct SettingsSheet: View {
                             }
                             Section("앱 잠금 및 화면 보호") {
                                 Button("앱 잠금 설정 (PIN · 비밀번호 · Face ID · 검은 화면 보호)", action: onOpenAppLock)
+                                Button("책장 잠금 설정 (잠금 시간 · 아이폰 잠금 연동 · Face ID)", action: onOpenBookshelfLock)
                             }
                             Section("데이터 및 예외 관리") {
                                 Button("사이트별 콘텐츠 차단 예외 초기화 (\(model.preferences.contentBlockingExceptions.count)곳)", role: .destructive) {
