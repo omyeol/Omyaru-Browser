@@ -647,7 +647,7 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
     static let defaultProfileID = UUID(uuidString: "00000000-0000-0000-0000-000000000010")!
     static let defaultGroupID = UUID(uuidString: "00000000-0000-0000-0000-000000000002")!
     static let appVersionName = "0.15.18"
-    static let appBuildNumber = 97
+    static let appBuildNumber = 98
 
     var isApplyingRemoteSync: Bool = false
 
@@ -669,6 +669,7 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
     @Published var tabSnapshots: [UUID: UIImage] = [:]
     @Published var tabTopColors: [UUID: UIColor] = [:]
     @Published var tabBottomColors: [UUID: UIColor] = [:]
+    @Published var committedTabIDs: Set<UUID> = []
     @Published var isAtTopOfPage: Bool = true
     @Published var isDarkChromeOverlayActive: Bool = false
     @Published var blockedTrackerCount: Int = 0
@@ -700,6 +701,7 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
     private var webViews: [UUID: WKWebView] = [:]
     private var loadedTabIDs: Set<UUID> = []
     private var lastActiveTabByGroup: [UUID: UUID] = [:]
+    private var pullRefreshStartedAt: [UUID: Date] = [:]
     var tabCardThumbRects: [UUID: CGRect] = [:]
     var tabCardIsHeroMap: [UUID: Bool] = [:]
     private var compiledContentRuleList: WKContentRuleList? = nil
@@ -712,6 +714,8 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
     private static let stateKey = "omyaru.ios.browser.v3"
     private static let prefsKey = "omyaru.ios.preferences.v3"
     private static let visitsKey = "omyaru.ios.url_suggestions.v1"
+    private static let snapshotsVersionKey = "omyaru.ios.snapshots.version"
+    private static let currentSnapshotsVersion = 2
 
     private struct PersistedState: Codable {
         var profiles: [BrowserProfile]
@@ -940,18 +944,88 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
         return tabBottomColors[activeID] ?? tabTopColors[activeID]
     }
 
+    static func isLightUIColor(_ color: UIColor) -> Bool {
+        var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
+        if color.getRed(&r, green: &g, blue: &b, alpha: &a) {
+            return (0.299 * r + 0.587 * g + 0.114 * b) > 0.62
+        }
+        var white: CGFloat = 0
+        if color.getWhite(&white, alpha: &a) {
+            return white > 0.62
+        }
+        return false
+    }
+
     var activePageTopIsLight: Bool {
         guard let c = activePageTopUIColor else { return false }
-        var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
-        c.getRed(&r, green: &g, blue: &b, alpha: &a)
-        return (0.299 * r + 0.587 * g + 0.114 * b) > 0.62
+        return Self.isLightUIColor(c)
     }
 
     var activePageBottomIsLight: Bool {
         guard let c = activePageBottomUIColor else { return false }
-        var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
-        c.getRed(&r, green: &g, blue: &b, alpha: &a)
-        return (0.299 * r + 0.587 * g + 0.114 * b) > 0.62
+        return Self.isLightUIColor(c)
+    }
+
+    func updateScrollEdgeBackgroundColor(for webView: WKWebView, tabID: UUID) {
+        let topColor = tabTopColors[tabID]
+        let bottomColor = tabBottomColors[tabID] ?? topColor
+        let sv = webView.scrollView
+        let viewportH = max(1, sv.bounds.height)
+        let scrollable = max(0, sv.contentSize.height - viewportH)
+        let adjustedY = sv.contentOffset.y + sv.adjustedContentInset.top
+        let useBottom = scrollable > 160 && adjustedY > scrollable * 0.55
+        let edgeColor = (useBottom ? (bottomColor ?? topColor) : (topColor ?? bottomColor))
+            ?? UIColor(red: 0.09, green: 0.075, blue: 0.067, alpha: 1.0)
+        if webView.underPageBackgroundColor != edgeColor {
+            webView.underPageBackgroundColor = edgeColor
+        }
+        if webView.backgroundColor != edgeColor {
+            webView.backgroundColor = edgeColor
+        }
+        if sv.backgroundColor != edgeColor {
+            sv.backgroundColor = edgeColor
+        }
+        if let rc = sv.refreshControl, let topC = topColor {
+            rc.tintColor = Self.isLightUIColor(topC)
+                ? UIColor(white: 0.32, alpha: 0.88)
+                : UIColor(white: 0.88, alpha: 0.90)
+        }
+    }
+
+    @objc private func handlePullToRefresh(_ sender: UIRefreshControl) {
+        guard let entry = webViews.first(where: { $0.value.scrollView.refreshControl === sender }) else {
+            sender.endRefreshing()
+            return
+        }
+        let tabID = entry.key
+        let wv = entry.value
+        UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+        pullRefreshStartedAt[tabID] = Date()
+        if wv.url != nil {
+            wv.reload()
+        } else if let tab = tabs.first(where: { $0.id == tabID }), tab.url != "about:blank", let url = URL(string: tab.url) {
+            wv.load(URLRequest(url: url))
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.90) { [weak self, weak sender] in
+            guard let self, let sender, sender.isRefreshing else { return }
+            self.pullRefreshStartedAt.removeValue(forKey: tabID)
+            sender.endRefreshing()
+        }
+    }
+
+    private func endPullRefreshIfNeeded(for webView: WKWebView, tabID: UUID) {
+        guard let rc = webView.scrollView.refreshControl, rc.isRefreshing else { return }
+        let started = pullRefreshStartedAt[tabID] ?? Date.distantPast
+        let elapsed = Date().timeIntervalSince(started)
+        let remaining = max(0.0, 0.36 - elapsed)
+        pullRefreshStartedAt.removeValue(forKey: tabID)
+        if remaining <= 0.01 {
+            rc.endRefreshing()
+        } else {
+            DispatchQueue.main.asyncAfter(deadline: .now() + remaining) { [weak rc] in
+                rc?.endRefreshing()
+            }
+        }
     }
 
     func samplePageEdgeColors(for tabID: UUID, webView: WKWebView) {
@@ -964,6 +1038,9 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
             const a = m[4] !== undefined ? parseFloat(m[4]) : 1;
             if (a < 0.15) return null;
             return [Math.round(parseFloat(m[1])), Math.round(parseFloat(m[2])), Math.round(parseFloat(m[3]))];
+          }
+          function sameColor(a, b) {
+            return a && b && Math.abs(a[0] - b[0]) <= 3 && Math.abs(a[1] - b[1]) <= 3 && Math.abs(a[2] - b[2]) <= 3;
           }
           function colorAt(x, y) {
             let el = document.elementFromPoint(x, y);
@@ -985,9 +1062,12 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
             topColor = parseRGB(getComputedStyle(probe).color);
             probe.remove();
           }
-          const w = Math.max(10, window.innerWidth || 320);
-          const h = Math.max(10, window.innerHeight || 600);
-          const sampledTop = topColor || colorAt(Math.floor(w * 0.5), 2);
+          const w = Math.max(24, window.innerWidth || 320);
+          const h = Math.max(24, window.innerHeight || 600);
+          const leftTop = colorAt(8, 4);
+          const midTop = colorAt(Math.floor(w * 0.5), 4);
+          const rightTop = colorAt(Math.max(8, w - 8), 4);
+          const sampledTop = topColor || (sameColor(leftTop, rightTop) ? leftTop : midTop);
           const sampledBottom = colorAt(Math.floor(w * 0.5), Math.max(2, h - 2));
           return { top: sampledTop, bottom: sampledBottom };
         })();
@@ -1019,9 +1099,7 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
                 let resolvedBottom = bottomUI ?? resolvedTop
                 self.tabTopColors[tabID] = resolvedTop
                 self.tabBottomColors[tabID] = resolvedBottom
-                webView.underPageBackgroundColor = resolvedBottom
-                webView.backgroundColor = resolvedBottom
-                webView.scrollView.backgroundColor = resolvedBottom
+                self.updateScrollEdgeBackgroundColor(for: webView, tabID: tabID)
             }
         }
     }
@@ -1071,6 +1149,8 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
             wv.stopLoading()
             webViews.removeValue(forKey: tid)
             loadedTabIDs.remove(tid)
+            committedTabIDs.remove(tid)
+            pullRefreshStartedAt.removeValue(forKey: tid)
             tabSnapshots.removeValue(forKey: tid)
         }
         for tab in tabs {
@@ -1123,8 +1203,15 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
     }
 
     private func loadPersistedSnapshotsAsync() {
-        let ids = tabs.map(\.id)
         let dir = snapshotsDirectory
+        if UserDefaults.standard.integer(forKey: Self.snapshotsVersionKey) < Self.currentSnapshotsVersion {
+            UserDefaults.standard.set(Self.currentSnapshotsVersion, forKey: Self.snapshotsVersionKey)
+            if let files = try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil) {
+                for f in files { try? FileManager.default.removeItem(at: f) }
+            }
+            return
+        }
+        let ids = tabs.map(\.id)
         Task.detached(priority: .utility) {
             var loaded: [UUID: UIImage] = [:]
             for id in ids {
@@ -1145,7 +1232,7 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
         guard preferences.showTabThumbnails, let view = webViews[id],
               let tab = tabs.first(where: { $0.id == id }), tab.url != "about:blank" else { return }
         let config = WKSnapshotConfiguration()
-        config.snapshotWidth = 380
+        config.snapshotWidth = NSNumber(value: Double(min(UIScreen.main.bounds.width * 2.0, 780)))
         let topSafe = view.safeAreaInsets.top
         if topSafe > 4 && view.bounds.height > topSafe + 120 {
             config.rect = CGRect(x: 0, y: topSafe, width: view.bounds.width, height: view.bounds.height - topSafe)
@@ -1153,7 +1240,7 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
         view.takeSnapshot(with: config) { [weak self] image, _ in
             guard let self, let image else { return }
             self.tabSnapshots[id] = image
-            if !tab.isPrivate, let jpg = image.jpegData(compressionQuality: 0.72) {
+            if !tab.isPrivate, let jpg = image.jpegData(compressionQuality: 0.78) {
                 let target = self.snapshotsDirectory.appendingPathComponent("\(id.uuidString).jpg")
                 Task.detached(priority: .background) {
                     try? jpg.write(to: target, options: .atomic)
@@ -1249,11 +1336,19 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
         view.scrollView.delegate = self
         view.scrollView.showsVerticalScrollIndicator = false
         view.scrollView.contentInsetAdjustmentBehavior = .scrollableAxes
+        view.scrollView.bounces = true
+        view.scrollView.alwaysBounceVertical = true
         view.isOpaque = true
-        let initialBg = tabBottomColors[id] ?? tabTopColors[id] ?? UIColor(red: 0.09, green: 0.075, blue: 0.067, alpha: 1.0)
+        let initialBg = tabTopColors[id] ?? tabBottomColors[id] ?? UIColor(red: 0.09, green: 0.075, blue: 0.067, alpha: 1.0)
         view.backgroundColor = initialBg
         view.scrollView.backgroundColor = initialBg
         view.underPageBackgroundColor = initialBg
+        let refreshControl = UIRefreshControl()
+        refreshControl.tintColor = Self.isLightUIColor(initialBg)
+            ? UIColor(white: 0.32, alpha: 0.88)
+            : UIColor(white: 0.88, alpha: 0.90)
+        refreshControl.addTarget(self, action: #selector(handlePullToRefresh(_:)), for: .valueChanged)
+        view.scrollView.refreshControl = refreshControl
         applyContentInsets(to: view)
         if tab?.isDesktopMode == true || preferences.desktopModeDefault {
             view.customUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15"
@@ -1329,12 +1424,15 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
         let viewportH = max(1, scrollView.bounds.height)
         let contentH = scrollView.contentSize.height
         let scrollable = contentH - viewportH
-        if scrollable > 40 {
-            let adjustedY = max(0, scrollView.contentOffset.y + scrollView.adjustedContentInset.top)
+        let adjustedY = max(0, scrollView.contentOffset.y + scrollView.adjustedContentInset.top)
         let nowAtTop = adjustedY <= 3
         if isAtTopOfPage != nowAtTop {
             isAtTopOfPage = nowAtTop
         }
+        if let activeWV = webViews[activeID], activeWV.scrollView === scrollView {
+            updateScrollEdgeBackgroundColor(for: activeWV, tabID: activeID)
+        }
+        if scrollable > 40 {
             isScrollable = true
             scrollViewportRatio = min(1.0, max(0.12, Double(viewportH / max(contentH, 1))))
             scrollFraction = min(1.0, max(0.0, Double(adjustedY / max(scrollable, 1))))
@@ -1813,6 +1911,7 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
         let wv = webView(for: id, loadIfNeeded: true)
         let adjustedY = max(0, wv.scrollView.contentOffset.y + wv.scrollView.adjustedContentInset.top)
         isAtTopOfPage = adjustedY <= 3
+        updateScrollEdgeBackgroundColor(for: wv, tabID: id)
         if tabTopColors[id] == nil && tab.url != "about:blank" {
             samplePageEdgeColors(for: id, webView: wv)
         }
@@ -1826,6 +1925,8 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
         }
         webViews.removeValue(forKey: id)?.stopLoading()
         loadedTabIDs.remove(id)
+        committedTabIDs.remove(id)
+        pullRefreshStartedAt.removeValue(forKey: id)
         tabs.removeAll { $0.id == id }
         if visibleTabs.isEmpty {
             _ = newTab()
@@ -2394,6 +2495,7 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
 
     func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
         guard let id = id(for: webView) else { return }
+        committedTabIDs.insert(id)
         if id == activeID {
             estimatedProgress = max(0.45, webView.estimatedProgress)
             failedLoadURL = nil
@@ -2408,6 +2510,8 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         guard let id = id(for: webView) else { return }
+        committedTabIDs.insert(id)
+        endPullRefreshIfNeeded(for: webView, tabID: id)
         if id == activeID {
             isLoading = false
             estimatedProgress = 1.0
@@ -2435,8 +2539,18 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
         objectWillChange.send()
     }
 
+    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+        if let id = id(for: webView) {
+            endPullRefreshIfNeeded(for: webView, tabID: id)
+            if id == activeID { isLoading = false }
+        }
+    }
+
     func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
-        if id(for: webView) == activeID { isLoading = false }
+        if let id = id(for: webView) {
+            endPullRefreshIfNeeded(for: webView, tabID: id)
+            if id == activeID { isLoading = false }
+        }
         let nsErr = error as NSError
         if nsErr.code == NSURLErrorCancelled { return }
         if id(for: webView) == activeID {

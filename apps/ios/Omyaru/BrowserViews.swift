@@ -8,6 +8,359 @@ struct BrowserWebView: UIViewRepresentable {
     func updateUIView(_ view: WKWebView, context: Context) {}
 }
 
+/// Guaranteed top-edge (y = 0) aspect-fill image — completely immune to SwiftUI `.scaledToFill()` vertical centering.
+struct TopAlignedFillImage: View {
+    let image: UIImage
+
+    var body: some View {
+        GeometryReader { geo in
+            let iw = max(1, image.size.width)
+            let ih = max(1, image.size.height)
+            let scale = max(geo.size.width / iw, geo.size.height / ih)
+            let drawW = iw * scale
+            let drawH = ih * scale
+            Image(uiImage: image)
+                .resizable()
+                .interpolation(.high)
+                .frame(width: drawW, height: drawH)
+                .position(x: geo.size.width * 0.5, y: drawH * 0.5)
+        }
+        .clipped()
+    }
+}
+
+/// Live UIKit GPU-composited Safari Hero Zoom host for WKWebView.
+/// Keeps WKWebView's layout frame & safeAreaInsets 100% constant at full screen while morphing
+/// via CATransform3D + CAShapeLayer mask so expanding/shrinking displays the REAL live webpage with zero jump!
+final class HeroBrowserHostView: UIView {
+    struct MorphParams {
+        var isMorphing: Bool = false
+        var progress: CGFloat = 0
+        var safeTop: CGFloat = 0
+        var cardRect: CGRect = .zero
+        var cardCornerRadius: CGFloat = 18
+        var borderColor: UIColor = .systemBlue
+    }
+
+    private let transformView = UIView()
+    private let shadowLayer = CALayer()
+    private let maskedView = UIView()
+    private let fallbackTopFillView = UIView()
+    private let fallbackImageView = UIImageView()
+    private let maskLayer = CAShapeLayer()
+    private let borderLayer = CAShapeLayer()
+    private weak var currentWebView: WKWebView?
+    private var storedMorph = MorphParams()
+    private var fallbackImageSize: CGSize = .zero
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        backgroundColor = .clear
+        clipsToBounds = false
+
+        transformView.backgroundColor = .clear
+        transformView.clipsToBounds = false
+        addSubview(transformView)
+
+        shadowLayer.shadowColor = UIColor.black.cgColor
+        shadowLayer.shadowOpacity = 0
+        shadowLayer.shadowRadius = 20
+        shadowLayer.shadowOffset = CGSize(width: 0, height: 10)
+        shadowLayer.isHidden = true
+        transformView.layer.addSublayer(shadowLayer)
+
+        maskedView.backgroundColor = .clear
+        maskedView.clipsToBounds = false
+        transformView.addSubview(maskedView)
+
+        fallbackTopFillView.isUserInteractionEnabled = false
+        maskedView.addSubview(fallbackTopFillView)
+
+        fallbackImageView.isUserInteractionEnabled = false
+        fallbackImageView.contentMode = .scaleToFill
+        fallbackImageView.clipsToBounds = true
+        maskedView.addSubview(fallbackImageView)
+
+        borderLayer.fillColor = nil
+        borderLayer.isHidden = true
+        transformView.layer.addSublayer(borderLayer)
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        guard bounds.width > 1, bounds.height > 1 else { return }
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        transformView.layer.transform = CATransform3DIdentity
+        transformView.frame = bounds
+        maskedView.frame = bounds
+        shadowLayer.frame = bounds
+        borderLayer.frame = bounds
+        if let wv = currentWebView {
+            wv.frame = bounds
+        }
+        layoutFallbackViews()
+        CATransaction.commit()
+        applyStoredMorph()
+    }
+
+    private func layoutFallbackViews() {
+        let w = bounds.width
+        let h = bounds.height
+        guard w > 1, h > 1 else { return }
+        let safeTop = max(storedMorph.safeTop, currentWebView?.safeAreaInsets.top ?? storedMorph.safeTop)
+        fallbackTopFillView.frame = CGRect(x: 0, y: 0, width: w, height: safeTop)
+        let availH = max(1, h - safeTop)
+        if fallbackImageSize.width > 1 && fallbackImageSize.height > 1 {
+            let aspect = fallbackImageSize.height / fallbackImageSize.width
+            let drawH = max(availH, w * aspect)
+            fallbackImageView.frame = CGRect(x: 0, y: safeTop, width: w, height: drawH)
+        } else {
+            fallbackImageView.frame = CGRect(x: 0, y: safeTop, width: w, height: availH)
+        }
+    }
+
+    func updateContent(
+        webView: WKWebView,
+        fallbackSnapshot: UIImage?,
+        topColor: UIColor,
+        isWebViewCommitted: Bool,
+        morph: MorphParams
+    ) {
+        if currentWebView !== webView {
+            currentWebView?.removeFromSuperview()
+            currentWebView = webView
+            webView.autoresizingMask = []
+            webView.frame = maskedView.bounds
+            maskedView.addSubview(webView)
+        } else if webView.superview !== maskedView {
+            webView.frame = maskedView.bounds
+            maskedView.addSubview(webView)
+        }
+
+        fallbackTopFillView.backgroundColor = topColor
+        if fallbackImageView.image !== fallbackSnapshot {
+            fallbackImageView.image = fallbackSnapshot
+            fallbackImageSize = fallbackSnapshot?.size ?? .zero
+        }
+        storedMorph = morph
+        layoutFallbackViews()
+
+        if isWebViewCommitted || fallbackSnapshot == nil {
+            maskedView.bringSubviewToFront(webView)
+            fallbackTopFillView.isHidden = (fallbackSnapshot == nil)
+            fallbackImageView.isHidden = (fallbackSnapshot == nil)
+        } else {
+            fallbackTopFillView.isHidden = false
+            fallbackImageView.isHidden = false
+            maskedView.bringSubviewToFront(fallbackTopFillView)
+            maskedView.bringSubviewToFront(fallbackImageView)
+        }
+
+        applyStoredMorph()
+    }
+
+    private func applyStoredMorph() {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        defer { CATransaction.commit() }
+
+        let w = bounds.width
+        let h = bounds.height
+        guard w > 1, h > 1 else { return }
+
+        if !storedMorph.isMorphing && storedMorph.progress <= 0.001 {
+            transformView.layer.transform = CATransform3DIdentity
+            maskedView.layer.mask = nil
+            shadowLayer.isHidden = true
+            borderLayer.isHidden = true
+            isUserInteractionEnabled = true
+            return
+        }
+
+        isUserInteractionEnabled = false
+        let t = max(0, min(1, storedMorph.progress))
+        let effectiveSafeTop = max(storedMorph.safeTop, currentWebView?.safeAreaInsets.top ?? storedMorph.safeTop)
+        let localCard: CGRect = {
+            let raw = storedMorph.cardRect
+            guard raw.width > 20 && raw.height > 20 else {
+                return CGRect(x: w * 0.5 - 88, y: h * 0.5 - 115, width: 176, height: 230)
+            }
+            if let win = self.window {
+                return self.convert(raw, from: win)
+            }
+            return raw
+        }()
+
+        let curX = localCard.minX * t
+        let curY = localCard.minY * t
+        let curW = w + (localCard.width - w) * t
+        let curH = h + (localCard.height - h) * t
+        let scale = max(0.05, curW / w)
+
+        let srcY = effectiveSafeTop * t
+        let srcH = max(1, min(h - srcY, curH / scale))
+        let curScreenCorner = 46 * (1 - t) + storedMorph.cardCornerRadius * t
+        let srcCorner = curScreenCorner / scale
+
+        let maskRect = CGRect(x: 0, y: srcY, width: w, height: srcH)
+        let bezier = UIBezierPath(roundedRect: maskRect, cornerRadius: srcCorner)
+
+        maskLayer.frame = maskedView.bounds
+        maskLayer.path = bezier.cgPath
+        if maskedView.layer.mask !== maskLayer {
+            maskedView.layer.mask = maskLayer
+        }
+
+        let borderAlpha = CGFloat(min(1.0, max(0.0, (t - 0.10) / 0.72)))
+        if borderAlpha > 0.01 {
+            borderLayer.isHidden = false
+            borderLayer.path = bezier.cgPath
+            borderLayer.strokeColor = storedMorph.borderColor.withAlphaComponent(borderAlpha).cgColor
+            borderLayer.lineWidth = 2.6 / scale
+        } else {
+            borderLayer.isHidden = true
+        }
+
+        let shadowAlpha = Float(min(0.46, Double(t) * 0.62))
+        shadowLayer.isHidden = shadowAlpha <= 0.01
+        shadowLayer.shadowPath = bezier.cgPath
+        shadowLayer.shadowOpacity = shadowAlpha
+        shadowLayer.shadowRadius = 18 / scale
+        shadowLayer.shadowOffset = CGSize(width: 0, height: 9 / scale)
+
+        let tx = curX - (w * 0.5) * (1 - scale)
+        let ty = curY - (h * 0.5) + (h * 0.5 - srcY) * scale
+        var tr = CATransform3DIdentity
+        tr = CATransform3DTranslate(tr, tx, ty, 0)
+        tr = CATransform3DScale(tr, scale, scale, 1)
+        transformView.layer.transform = tr
+    }
+}
+
+private struct HeroBrowserHostRepresentable: UIViewRepresentable {
+    let webView: WKWebView
+    let fallbackSnapshot: UIImage?
+    let topColor: UIColor
+    let isWebViewCommitted: Bool
+    let isMorphing: Bool
+    let progress: CGFloat
+    let safeTop: CGFloat
+    let cardRect: CGRect
+    let cardCornerRadius: CGFloat
+    let borderColor: UIColor
+
+    func makeUIView(context: Context) -> HeroBrowserHostView {
+        HeroBrowserHostView()
+    }
+
+    func updateUIView(_ view: HeroBrowserHostView, context: Context) {
+        view.updateContent(
+            webView: webView,
+            fallbackSnapshot: fallbackSnapshot,
+            topColor: topColor,
+            isWebViewCommitted: isWebViewCommitted,
+            morph: HeroBrowserHostView.MorphParams(
+                isMorphing: isMorphing,
+                progress: progress,
+                safeTop: safeTop,
+                cardRect: cardRect,
+                cardCornerRadius: cardCornerRadius,
+                borderColor: borderColor
+            )
+        )
+    }
+}
+
+private struct AnimatedHeroBrowserView: View, Animatable {
+    let webView: WKWebView
+    let fallbackSnapshot: UIImage?
+    let topColor: UIColor
+    let isWebViewCommitted: Bool
+    let isMorphing: Bool
+    var progress: CGFloat
+    let safeTop: CGFloat
+    let cardRect: CGRect
+    let cardCornerRadius: CGFloat
+    let borderColor: UIColor
+
+    var animatableData: CGFloat {
+        get { progress }
+        set { progress = newValue }
+    }
+
+    var body: some View {
+        HeroBrowserHostRepresentable(
+            webView: webView,
+            fallbackSnapshot: fallbackSnapshot,
+            topColor: topColor,
+            isWebViewCommitted: isWebViewCommitted,
+            isMorphing: isMorphing,
+            progress: progress,
+            safeTop: safeTop,
+            cardRect: cardRect,
+            cardCornerRadius: cardCornerRadius,
+            borderColor: borderColor
+        )
+    }
+}
+
+private struct SafariStartPageHeroModifier: ViewModifier, Animatable {
+    var progress: CGFloat
+    let isMorphing: Bool
+    let screenSize: CGSize
+    let cardRect: CGRect
+    let cardCornerRadius: CGFloat
+    let borderColor: Color
+
+    var animatableData: CGFloat {
+        get { progress }
+        set { progress = newValue }
+    }
+
+    func body(content: Content) -> some View {
+        let t = max(0, min(1, progress))
+        let w = max(1, screenSize.width)
+        let h = max(1, screenSize.height)
+        let target = (cardRect.width > 20 && cardRect.height > 20)
+            ? cardRect
+            : CGRect(x: w * 0.5 - 88, y: h * 0.5 - 115, width: 176, height: 230)
+        let curX = target.minX * t
+        let curY = target.minY * t
+        let curW = w + (target.width - w) * t
+        let curH = h + (target.height - h) * t
+        let scale = max(0.05, curW / w)
+        let corner: CGFloat = isMorphing ? (46 * (1 - t) + cardCornerRadius * t) : 0
+        let borderAlpha = Double(min(1.0, max(0.0, (t - 0.10) / 0.72)))
+        let offsetX = (curX + curW * 0.5) - (w * 0.5)
+        let offsetY = (curY + curH * 0.5) - (h * 0.5)
+
+        content
+            .frame(width: w, height: h)
+            .scaleEffect(isMorphing ? scale : 1.0, anchor: .topLeading)
+            .frame(
+                width: isMorphing ? curW : w,
+                height: isMorphing ? curH : h,
+                alignment: .topLeading
+            )
+            .clipShape(RoundedRectangle(cornerRadius: corner, style: .continuous))
+            .overlay {
+                if isMorphing && borderAlpha > 0.01 {
+                    RoundedRectangle(cornerRadius: corner, style: .continuous)
+                        .strokeBorder(borderColor.opacity(borderAlpha), lineWidth: 2.6)
+                }
+            }
+            .shadow(
+                color: isMorphing ? .black.opacity(0.45 * Double(min(1, t * 1.4))) : .clear,
+                radius: isMorphing ? 18 : 0,
+                y: isMorphing ? 8 : 0
+            )
+            .offset(x: isMorphing ? offsetX : 0, y: isMorphing ? offsetY : 0)
+    }
+}
+
 // MARK: - Main Browser Screen
 
 struct BrowserScreen: View {
@@ -38,16 +391,16 @@ struct BrowserScreen: View {
     @State private var newFavTitle = ""
     @State private var newFavURL = ""
     @State private var updateMessage: String? = nil
-    @State private var heroMorphVisible = false
-    @State private var heroMorphImage: UIImage? = nil
-    @State private var heroMorphFallbackColor: Color = Color(red: 0.08, green: 0.09, blue: 0.11)
-    @State private var heroMorphRect: CGRect = .zero
-    @State private var heroMorphCornerRadius: CGFloat = 0
-    @State private var heroMorphBorderColor: Color = .clear
+    @State private var isHeroMorphing = false
+    @State private var heroMorphProgress: CGFloat = 0.0
+    @State private var heroTargetRect: CGRect = .zero
+    @State private var heroTargetCornerRadius: CGFloat = 18
+    @State private var heroTargetBorderColor: UIColor = .systemBlue
     @State private var heroMorphHiddenTabID: UUID? = nil
     @State private var heroMorphToken = UUID()
     @State private var pendingOpenHeroTabID: UUID? = nil
     @State private var overviewMorphProgress: CGFloat = 1.0
+    @State private var toolbarVisible = true
     @FocusState private var addressFocused: Bool
 
     private var anyDarkOverlayPresented: Bool {
@@ -59,41 +412,105 @@ struct BrowserScreen: View {
 
     var body: some View {
         let isBottomBar = model.preferences.addressBarPosition == .bottom
+        let safeTop = screenSafeAreaInsets.top
+        let screenSize = UIScreen.main.bounds.size
         let pageBackdropColor: Color = {
             if model.isStartPage {
                 return Color(red: 0.08, green: 0.08, blue: 0.09)
             }
-            if let pageUI = model.activePageBottomUIColor ?? model.activePageTopUIColor {
+            let pageUI = model.isAtTopOfPage
+                ? (model.activePageTopUIColor ?? model.activePageBottomUIColor)
+                : (model.activePageBottomUIColor ?? model.activePageTopUIColor)
+            if let pageUI {
                 return Color(uiColor: pageUI)
             }
             return Color(red: 0.08, green: 0.08, blue: 0.09)
         }()
         ZStack {
-            pageBackdropColor.ignoresSafeArea()
+            pageBackdropColor.ignoresSafeArea().zIndex(0)
 
-            // Main Browser Surface + Floating Toolbar (Full Edge-to-Edge incl. Notch/Dynamic Island & Bottom Home Bar + Subtle Edge Blur!)
+            // Exact Safari Shared-Element Hero Zoom Tab Overview:
+            // Behind the live morphing webpage (zIndex 5) during transitions, and in front (zIndex 25) while browsing tabs!
+            if showTabs {
+                TabOverview(
+                    morphProgress: overviewMorphProgress,
+                    hiddenHeroTabID: heroMorphHiddenTabID,
+                    onCardRectsUpdated: {
+                        tryLaunchPendingOpenHeroFlight()
+                    },
+                    onSelectTabWithHero: { tabID, sourceRect, isHero in
+                        closeTabOverviewWithHero(selectedTabID: tabID, sourceRect: sourceRect, isHero: isHero)
+                    },
+                    onDismiss: {
+                        let activeID = model.activeID
+                        closeTabOverviewWithHero(
+                            selectedTabID: activeID,
+                            sourceRect: model.tabCardThumbRects[activeID],
+                            isHero: model.tabCardIsHeroMap[activeID] ?? false
+                        )
+                    }
+                )
+                .environmentObject(model)
+                .environment(\.colorScheme, .dark)
+                .allowsHitTesting(!isHeroMorphing)
+                .zIndex(isHeroMorphing ? 5 : 25)
+            }
+
+            // Live Browser Surface (Actual WKWebView morphs seamlessly via GPU CATransform3D — zero photo swap or 59pt jump!)
             ZStack {
                 if let tab = model.activeTab {
                     if model.isStartPage {
-                        startPageView
+                        ZStack {
+                            Color(red: 0.08, green: 0.08, blue: 0.09).ignoresSafeArea()
+                            startPageView
+                                .padding(.top, isHeroMorphing ? safeTop : 0)
+                        }
+                        .ignoresSafeArea(edges: isHeroMorphing ? .all : [])
+                        .modifier(
+                            SafariStartPageHeroModifier(
+                                progress: heroMorphProgress,
+                                isMorphing: isHeroMorphing,
+                                screenSize: screenSize,
+                                cardRect: heroTargetRect,
+                                cardCornerRadius: heroTargetCornerRadius,
+                                borderColor: Color(uiColor: heroTargetBorderColor)
+                            )
+                        )
                     } else {
                         ZStack {
-                            BrowserWebView(webView: model.webView(for: tab.id, loadIfNeeded: true))
-                                .id(tab.id)
-                                .ignoresSafeArea()
+                            AnimatedHeroBrowserView(
+                                webView: model.webView(for: tab.id, loadIfNeeded: true),
+                                fallbackSnapshot: model.tabSnapshots[tab.id],
+                                topColor: model.tabTopColors[tab.id] ?? UIColor(red: 0.08, green: 0.09, blue: 0.11, alpha: 1.0),
+                                isWebViewCommitted: model.committedTabIDs.contains(tab.id),
+                                isMorphing: isHeroMorphing,
+                                progress: heroMorphProgress,
+                                safeTop: safeTop,
+                                cardRect: heroTargetRect,
+                                cardCornerRadius: heroTargetCornerRadius,
+                                borderColor: heroTargetBorderColor
+                            )
+                            .ignoresSafeArea()
 
-                            FastScrollBarOverlay(model: model)
-                                .padding(.top, isBottomBar ? 8 : (model.isChromeCollapsed ? 58 : 124))
-                                .padding(.bottom, isBottomBar ? (model.isChromeCollapsed ? 48 : 126) : 8)
+                            if !showTabs && !isHeroMorphing {
+                                FastScrollBarOverlay(model: model)
+                                    .padding(.top, isBottomBar ? 8 : (model.isChromeCollapsed ? 58 : 124))
+                                    .padding(.bottom, isBottomBar ? (model.isChromeCollapsed ? 48 : 126) : 8)
 
-                            if let failedURL = model.failedLoadURL {
-                                pageErrorOverlay(failedURL: failedURL)
+                                if let failedURL = model.failedLoadURL {
+                                    pageErrorOverlay(failedURL: failedURL)
+                                }
                             }
                         }
                     }
                 }
+            }
+            .opacity((showTabs && !isHeroMorphing) ? 0.0 : 1.0)
+            .allowsHitTesting(!showTabs && !isHeroMorphing && !showPageTools && !showBrowserMenu)
+            .zIndex(isHeroMorphing ? 20 : 10)
 
-                // Safari-style seamless top color fill (y == 0) + subtle top & bottom progressive edge blur
+            // Safari-style seamless top color fill (y == 0) + subtle progressive edge blur + Floating URL Island
+            ZStack {
                 VStack(spacing: 0) {
                     topEdgeBlurOverlay
                     Spacer(minLength: 0)
@@ -101,8 +518,10 @@ struct BrowserScreen: View {
                 }
                 .ignoresSafeArea()
                 .allowsHitTesting(false)
+                .opacity((showTabs || isHeroMorphing) ? 0.0 : 1.0)
+                .animation(.easeOut(duration: 0.14), value: showTabs || isHeroMorphing)
 
-                if showFindBar && !model.isStartPage {
+                if showFindBar && !model.isStartPage && !showTabs && !isHeroMorphing {
                     VStack {
                         if !isBottomBar {
                             Spacer().frame(height: model.isChromeCollapsed ? 56 : 122)
@@ -112,7 +531,7 @@ struct BrowserScreen: View {
                     }
                 }
 
-                // Floating Status Toast + Floating Liquid Glass URL Island (Tucked low near home bar just like Safari!)
+                // Floating Status Toast + Floating Liquid Glass URL Island (glides in smoothly at tail of hero zoom like Safari!)
                 VStack(spacing: 6) {
                     if isBottomBar {
                         Spacer(minLength: 0)
@@ -134,14 +553,13 @@ struct BrowserScreen: View {
                 }
                 .environment(\.colorScheme, .dark)
                 .ignoresSafeArea(.container, edges: isBottomBar ? .bottom : [])
-                .opacity((showTabs || heroMorphVisible) ? 0.0 : 1.0)
-                .animation(.easeOut(duration: 0.16), value: showTabs || heroMorphVisible)
+                .opacity(toolbarVisible ? 1.0 : 0.0)
+                .offset(y: toolbarVisible ? 0 : (isBottomBar ? 20 : -20))
+                .allowsHitTesting(toolbarVisible && !showTabs && !isHeroMorphing && !showPageTools && !showBrowserMenu)
                 .animation(.spring(response: 0.30, dampingFraction: 0.84), value: model.isChromeCollapsed)
                 .animation(.easeInOut(duration: 0.2), value: model.status)
             }
-            .blur(radius: showTabs ? Double(overviewMorphProgress) * 14 : 0)
-            .opacity(showTabs ? max(0.35, 1.0 - Double(overviewMorphProgress) * 0.45) : 1.0)
-            .allowsHitTesting(!showTabs && !heroMorphVisible && !showPageTools && !showBrowserMenu)
+            .zIndex(22)
 
             // Exact Video 00:06->00:08 Morphing Liquid Glass Page Tools Popover
             LiquidGlassMorphContainer(
@@ -169,6 +587,7 @@ struct BrowserScreen: View {
                 )
             }
             .environment(\.colorScheme, .dark)
+            .zIndex(30)
 
             // Morphing Liquid Glass Browser Menu Popover (Bottom-Right / Top-Right)
             LiquidGlassMorphContainer(
@@ -193,69 +612,7 @@ struct BrowserScreen: View {
                 )
             }
             .environment(\.colorScheme, .dark)
-
-            // Exact Safari Shared-Element Hero Zoom Tab Overview (matches KakaoTalk_20261124_195552958.mp4!)
-            if showTabs {
-                TabOverview(
-                    morphProgress: overviewMorphProgress,
-                    hiddenHeroTabID: heroMorphHiddenTabID,
-                    onCardRectsUpdated: {
-                        tryLaunchPendingOpenHeroFlight()
-                    },
-                    onSelectTabWithHero: { tabID, sourceRect, isHero in
-                        closeTabOverviewWithHero(selectedTabID: tabID, sourceRect: sourceRect, isHero: isHero)
-                    },
-                    onDismiss: {
-                        let activeID = model.activeID
-                        closeTabOverviewWithHero(
-                            selectedTabID: activeID,
-                            sourceRect: model.tabCardThumbRects[activeID],
-                            isHero: model.tabCardIsHeroMap[activeID] ?? false
-                        )
-                    }
-                )
-                .environmentObject(model)
-                .environment(\.colorScheme, .dark)
-                .zIndex(20)
-            }
-
-            // Flying Shared-Element Hero Card (Web <-> Tab Overview exact Safari morph!)
-            if heroMorphVisible {
-                GeometryReader { overlayGeo in
-                    let origin = overlayGeo.frame(in: .global).origin
-                    let localRect = CGRect(
-                        x: heroMorphRect.minX - origin.x,
-                        y: heroMorphRect.minY - origin.y,
-                        width: max(1, heroMorphRect.width),
-                        height: max(1, heroMorphRect.height)
-                    )
-                    ZStack {
-                        heroMorphFallbackColor
-                        if let img = heroMorphImage {
-                            Image(uiImage: img)
-                                .resizable()
-                                .scaledToFill()
-                                .frame(width: localRect.width, height: localRect.height, alignment: .top)
-                                .clipped()
-                        }
-                    }
-                    .frame(width: localRect.width, height: localRect.height)
-                    .clipShape(RoundedRectangle(cornerRadius: heroMorphCornerRadius, style: .continuous))
-                    .overlay(
-                        RoundedRectangle(cornerRadius: heroMorphCornerRadius, style: .continuous)
-                            .strokeBorder(heroMorphBorderColor, lineWidth: heroMorphBorderColor == .clear ? 0 : 2.6)
-                    )
-                    .shadow(
-                        color: .black.opacity(heroMorphCornerRadius > 2 ? 0.48 : 0.0),
-                        radius: heroMorphCornerRadius > 2 ? 22 : 0,
-                        y: heroMorphCornerRadius > 2 ? 10 : 0
-                    )
-                    .position(x: localRect.midX, y: localRect.midY)
-                }
-                .ignoresSafeArea()
-                .allowsHitTesting(false)
-                .zIndex(40)
-            }
+            .zIndex(30)
         }
         .sheet(isPresented: $showBookmarks) {
             BookmarksSheet()
@@ -1165,7 +1522,7 @@ struct BrowserScreen: View {
 
     private func openTabOverviewWithHero() {
         let activeID = model.activeID
-        let liveImg = model.captureLiveHeroSnapshot(for: activeID) ?? model.tabSnapshots[activeID]
+        _ = model.captureLiveHeroSnapshot(for: activeID)
         model.captureSnapshot(for: activeID)
         addressFocused = false
         showPageTools = false
@@ -1176,28 +1533,35 @@ struct BrowserScreen: View {
         let token = UUID()
         heroMorphToken = token
         pendingOpenHeroTabID = activeID
-        heroMorphImage = liveImg
-        heroMorphFallbackColor = model.isStartPage
-            ? Color(red: 0.08, green: 0.08, blue: 0.09)
-            : Color(uiColor: model.activePageTopUIColor ?? UIColor(red: 0.08, green: 0.09, blue: 0.11, alpha: 1.0))
-        heroMorphRect = screen
-        heroMorphCornerRadius = 38
-        heroMorphBorderColor = .clear
-        heroMorphHiddenTabID = activeID
-        overviewMorphProgress = 0.0
-        heroMorphVisible = true
-        showTabs = true
+        let initialRect = model.tabCardThumbRects[activeID] ?? CGRect(
+            x: screen.midX - 88,
+            y: screen.midY - 115,
+            width: 176,
+            height: 230
+        )
+        let initialIsHero = model.tabCardIsHeroMap[activeID] ?? (model.visibleTabs.count == 1)
 
-        // Fallback trigger if TabOverview preference callback already had rects or takes >40ms (e.g. list mode)
+        var tx = Transaction()
+        tx.disablesAnimations = true
+        withTransaction(tx) {
+            heroTargetRect = initialRect
+            heroTargetCornerRadius = initialIsHero ? 22 : 18
+            heroTargetBorderColor = UIColor(profileBorderColor(for: activeID))
+            heroMorphHiddenTabID = activeID
+            heroMorphProgress = 0.0
+            overviewMorphProgress = 0.0
+            isHeroMorphing = true
+            showTabs = true
+        }
+        withAnimation(.easeOut(duration: 0.13)) {
+            toolbarVisible = false
+        }
+
+        // Fallback trigger if TabOverview preference callback takes >45ms (e.g. list mode or already-cached layout)
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.045) {
             guard heroMorphToken == token, pendingOpenHeroTabID == activeID else { return }
-            let fallbackRect = model.tabCardThumbRects[activeID] ?? CGRect(
-                x: screen.midX - 88,
-                y: screen.midY - 120,
-                width: 176,
-                height: 220
-            )
-            let isHero = model.tabCardIsHeroMap[activeID] ?? (model.visibleTabs.count == 1)
+            let fallbackRect = model.tabCardThumbRects[activeID] ?? initialRect
+            let isHero = model.tabCardIsHeroMap[activeID] ?? initialIsHero
             launchOpenHeroFlight(tabID: activeID, targetRect: fallbackRect, isHero: isHero, token: token)
         }
     }
@@ -1213,17 +1577,26 @@ struct BrowserScreen: View {
     private func launchOpenHeroFlight(tabID: UUID, targetRect: CGRect, isHero: Bool, token: UUID) {
         guard heroMorphToken == token, pendingOpenHeroTabID == tabID else { return }
         pendingOpenHeroTabID = nil
-        let accent = profileBorderColor(for: tabID)
-        withAnimation(.spring(response: 0.36, dampingFraction: 0.85)) {
-            heroMorphRect = targetRect
-            heroMorphCornerRadius = isHero ? 22 : 18
-            heroMorphBorderColor = accent
+        var tx = Transaction()
+        tx.disablesAnimations = true
+        withTransaction(tx) {
+            heroTargetRect = targetRect
+            heroTargetCornerRadius = isHero ? 22 : 18
+            heroTargetBorderColor = UIColor(profileBorderColor(for: tabID))
+        }
+        withAnimation(.spring(response: 0.37, dampingFraction: 0.86)) {
+            heroMorphProgress = 1.0
             overviewMorphProgress = 1.0
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.38) {
             guard heroMorphToken == token else { return }
-            heroMorphVisible = false
-            heroMorphHiddenTabID = nil
+            var endTx = Transaction()
+            endTx.disablesAnimations = true
+            withTransaction(endTx) {
+                isHeroMorphing = false
+                heroMorphHiddenTabID = nil
+                heroMorphProgress = 0.0
+            }
         }
     }
 
@@ -1232,7 +1605,6 @@ struct BrowserScreen: View {
         heroMorphToken = token
         pendingOpenHeroTabID = nil
 
-        let targetTab = model.tabs.first(where: { $0.id == selectedTabID })
         if selectedTabID != model.activeID {
             model.select(selectedTabID)
         }
@@ -1243,34 +1615,43 @@ struct BrowserScreen: View {
         } else if let cached = model.tabCardThumbRects[selectedTabID], cached.width > 20, cached.height > 20 {
             startRect = cached
         } else {
-            startRect = CGRect(x: screen.midX - 88, y: screen.midY - 120, width: 176, height: 220)
+            startRect = CGRect(x: screen.midX - 88, y: screen.midY - 115, width: 176, height: 230)
         }
 
-        heroMorphImage = model.tabSnapshots[selectedTabID]
-        heroMorphFallbackColor = (targetTab?.url == "about:blank" || targetTab == nil)
-            ? Color(red: 0.08, green: 0.08, blue: 0.09)
-            : Color(uiColor: model.tabTopColors[selectedTabID] ?? UIColor(red: 0.08, green: 0.09, blue: 0.11, alpha: 1.0))
-        heroMorphRect = startRect
-        heroMorphCornerRadius = isHero ? 22 : 18
-        heroMorphBorderColor = profileBorderColor(for: selectedTabID)
-        heroMorphHiddenTabID = selectedTabID
-        overviewMorphProgress = 1.0
-        heroMorphVisible = true
+        var tx = Transaction()
+        tx.disablesAnimations = true
+        withTransaction(tx) {
+            heroTargetRect = startRect
+            heroTargetCornerRadius = isHero ? 22 : 18
+            heroTargetBorderColor = UIColor(profileBorderColor(for: selectedTabID))
+            heroMorphHiddenTabID = selectedTabID
+            heroMorphProgress = 1.0
+            overviewMorphProgress = 1.0
+            toolbarVisible = false
+            isHeroMorphing = true
+        }
 
-        DispatchQueue.main.async {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.02) {
             guard heroMorphToken == token else { return }
-            withAnimation(.spring(response: 0.34, dampingFraction: 0.86)) {
-                heroMorphRect = screen
-                heroMorphCornerRadius = 0
-                heroMorphBorderColor = .clear
+            withAnimation(.spring(response: 0.36, dampingFraction: 0.87)) {
+                heroMorphProgress = 0.0
                 overviewMorphProgress = 0.0
             }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.31) {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.14) {
                 guard heroMorphToken == token else { return }
-                showTabs = false
-                heroMorphHiddenTabID = nil
-                withAnimation(.easeOut(duration: 0.08)) {
-                    heroMorphVisible = false
+                withAnimation(.spring(response: 0.28, dampingFraction: 0.86)) {
+                    toolbarVisible = true
+                }
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.38) {
+                guard heroMorphToken == token else { return }
+                var endTx = Transaction()
+                endTx.disablesAnimations = true
+                withTransaction(endTx) {
+                    showTabs = false
+                    isHeroMorphing = false
+                    heroMorphHiddenTabID = nil
+                    toolbarVisible = true
                 }
             }
         }
@@ -2232,12 +2613,9 @@ struct TabOverview: View {
         return ZStack(alignment: .topTrailing) {
             Group {
                 if let snap = model.tabSnapshots[tab.id] {
-                    Image(uiImage: snap)
-                        .resizable()
-                        .scaledToFill()
+                    TopAlignedFillImage(image: snap)
                         .frame(maxWidth: .infinity)
-                        .frame(height: cardHeight, alignment: .top)
-                        .clipped()
+                        .frame(height: cardHeight)
                 } else {
                     ZStack {
                         Color(red: 0.08, green: 0.09, blue: 0.11)
