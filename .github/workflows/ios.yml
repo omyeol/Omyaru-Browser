@@ -19,6 +19,7 @@ concurrency:
 jobs:
   ios:
     runs-on: macos-15
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - name: Read iOS version metadata
