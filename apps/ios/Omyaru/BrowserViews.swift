@@ -1582,7 +1582,7 @@ struct BrowserScreen: View {
             isHeroMorphing = true
             showTabs = true
         }
-        withAnimation(.easeOut(duration: 0.08)) {
+        withAnimation(.easeOut(duration: 0.06)) {
             toolbarVisible = false
         }
 
@@ -1622,11 +1622,13 @@ struct BrowserScreen: View {
                 )
             }
         }
-        withAnimation(.spring(response: 0.36, dampingFraction: 0.88)) {
-            if model.isStartPage {
+        withAnimation(.easeOut(duration: 0.24)) {
+            overviewMorphProgress = 1.0
+        }
+        if model.isStartPage {
+            withAnimation(.spring(response: 0.36, dampingFraction: 0.88)) {
                 heroMorphProgress = 1.0
             }
-            overviewMorphProgress = 1.0
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.38) {
             guard heroMorphToken == token else { return }
@@ -2147,7 +2149,6 @@ struct TabOverview: View {
 
                 liquidGlassBottomCarouselBar
             }
-            .scaleEffect(0.94 + 0.06 * morphProgress)
             .opacity(Double(morphProgress))
 
             // Full-screen floating lifted tab card in exact .global screen coordinates (zero TabView offset mismatch!)

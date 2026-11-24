@@ -647,7 +647,7 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
     static let defaultProfileID = UUID(uuidString: "00000000-0000-0000-0000-000000000010")!
     static let defaultGroupID = UUID(uuidString: "00000000-0000-0000-0000-000000000002")!
     static let appVersionName = "0.15.18"
-    static let appBuildNumber = 100
+    static let appBuildNumber = 101
 
     var isApplyingRemoteSync: Bool = false
 
@@ -1454,7 +1454,9 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
             isScrollable = true
             scrollViewportRatio = min(1.0, max(0.12, Double(viewportH / max(contentH, 1))))
             scrollFraction = min(1.0, max(0.0, Double(adjustedY / max(scrollable, 1))))
-            lastScrollActivity = Date()
+            if scrollView.isDragging || scrollView.isDecelerating {
+                lastScrollActivity = Date()
+            }
         } else {
             isScrollable = false
         }
