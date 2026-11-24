@@ -329,21 +329,23 @@ final class HeroBrowserHostView: UIView {
                 delay: 0,
                 usingSpringWithDamping: 0.88,
                 initialSpringVelocity: 0.15,
-                options: [.beginFromCurrentState, .allowUserInteraction]
-            ) {
-                self.clipView.frame = self.bounds
-                self.clipView.layer.cornerRadius = 46
-                self.scaleView.transform = .identity
-                self.scaleView.center = CGPoint(x: w * 0.5, y: h * 0.5)
-            } completion: { _ in
-                guard self.currentAnimToken == animToken else { return }
-                self.webViewContainer.alpha = 1.0
-                self.clipView.isHidden = true
-                self.activePortalView?.removeFromSuperview()
-                self.activePortalView = nil
-                self.isInMorphPose = false
-                self.isUserInteractionEnabled = true
-            }
+                options: [.beginFromCurrentState, .allowUserInteraction],
+                animations: {
+                    self.clipView.frame = self.bounds
+                    self.clipView.layer.cornerRadius = 46
+                    self.scaleView.transform = .identity
+                    self.scaleView.center = CGPoint(x: w * 0.5, y: h * 0.5)
+                },
+                completion: { _ in
+                    guard self.currentAnimToken == animToken else { return }
+                    self.webViewContainer.alpha = 1.0
+                    self.clipView.isHidden = true
+                    self.activePortalView?.removeFromSuperview()
+                    self.activePortalView = nil
+                    self.isInMorphPose = false
+                    self.isUserInteractionEnabled = true
+                }
+            )
             animateBorderWidth(from: 2.6, to: 0, duration: 0.28)
         }
     }
@@ -2484,40 +2486,15 @@ struct TabOverview: View {
                             }
                             .padding(.top, 16)
                         } else {
-                            // Deterministic non-lazy row grid so 100% of rows lay out synchronously on Frame 0
-                            // (eliminates the LazyVGrid + Spacer 95pt vertical drop-and-snap during Hero Zoom open!)
-                            let rowCount = (groupTabs.count + colCount - 1) / colCount
-                            VStack {
-                                if model.preferences.tabsStartFromBottom {
-                                    Spacer(minLength: 0)
-                                }
-                                VStack(spacing: 14) {
-                                    ForEach(0..<rowCount, id: \.self) { row in
-                                        HStack(alignment: .top, spacing: 12) {
-                                            ForEach(0..<colCount, id: \.self) { col in
-                                                let idx = row * colCount + col
-                                                if idx < groupTabs.count {
-                                                    let tab = groupTabs[idx]
-                                                    safariTabCard(tab: tab, index: idx, cardHeight: gridThumbHeight, isHeroSingle: false, outerGeo: outerGeo, scrollProxy: proxy, groupTabs: groupTabs)
-                                                        .id(tab.id)
-                                                        .frame(maxWidth: .infinity)
-                                                        .offset(visualShiftOffset(for: idx, groupID: groupID))
-                                                        .animation(.spring(response: 0.28, dampingFraction: 0.80), value: dragTargetIndex)
-                                                        .transition(.asymmetric(
-                                                            insertion: .scale(scale: 0.90).combined(with: .opacity),
-                                                            removal: .scale(scale: 0.72).combined(with: .opacity)
-                                                        ))
-                                                } else {
-                                                    Color.clear.frame(maxWidth: .infinity, height: 1)
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                .padding(.horizontal, 14)
-                                .padding(.bottom, 16)
-                            }
-                            .frame(minHeight: max(0, outerGeo.size.height - (headerTitle == nil ? 12 : 54)))
+                            deterministicTabGrid(
+                                groupTabs: groupTabs,
+                                groupID: groupID,
+                                colCount: colCount,
+                                gridThumbHeight: gridThumbHeight,
+                                headerTitle: headerTitle,
+                                outerGeo: outerGeo,
+                                scrollProxy: proxy
+                            )
                         }
                     }
                     .padding(.bottom, 12)
@@ -2547,6 +2524,95 @@ struct TabOverview: View {
                     }
                 }
             }
+        }
+    }
+
+    private func deterministicTabGrid(
+        groupTabs: [BrowserTab],
+        groupID: UUID,
+        colCount: Int,
+        gridThumbHeight: CGFloat,
+        headerTitle: String?,
+        outerGeo: GeometryProxy,
+        scrollProxy: ScrollViewProxy
+    ) -> some View {
+        let rowCount = max(1, (groupTabs.count + colCount - 1) / colCount)
+        let minContainerH = max(0, outerGeo.size.height - (headerTitle == nil ? 12 : 54))
+        return VStack {
+            if model.preferences.tabsStartFromBottom {
+                Spacer(minLength: 0)
+            }
+            VStack(spacing: 14) {
+                ForEach(0..<rowCount, id: \.self) { row in
+                    deterministicTabGridRow(
+                        row: row,
+                        colCount: colCount,
+                        groupTabs: groupTabs,
+                        groupID: groupID,
+                        gridThumbHeight: gridThumbHeight,
+                        outerGeo: outerGeo,
+                        scrollProxy: scrollProxy
+                    )
+                }
+            }
+            .padding(.horizontal, 14)
+            .padding(.bottom, 16)
+        }
+        .frame(minHeight: minContainerH)
+    }
+
+    private func deterministicTabGridRow(
+        row: Int,
+        colCount: Int,
+        groupTabs: [BrowserTab],
+        groupID: UUID,
+        gridThumbHeight: CGFloat,
+        outerGeo: GeometryProxy,
+        scrollProxy: ScrollViewProxy
+    ) -> some View {
+        HStack(alignment: .top, spacing: 12) {
+            ForEach(0..<colCount, id: \.self) { col in
+                deterministicTabGridCell(
+                    idx: row * colCount + col,
+                    groupTabs: groupTabs,
+                    groupID: groupID,
+                    gridThumbHeight: gridThumbHeight,
+                    outerGeo: outerGeo,
+                    scrollProxy: scrollProxy
+                )
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func deterministicTabGridCell(
+        idx: Int,
+        groupTabs: [BrowserTab],
+        groupID: UUID,
+        gridThumbHeight: CGFloat,
+        outerGeo: GeometryProxy,
+        scrollProxy: ScrollViewProxy
+    ) -> some View {
+        if idx < groupTabs.count {
+            safariTabCard(
+                tab: groupTabs[idx],
+                index: idx,
+                cardHeight: gridThumbHeight,
+                isHeroSingle: false,
+                outerGeo: outerGeo,
+                scrollProxy: scrollProxy,
+                groupTabs: groupTabs
+            )
+            .id(groupTabs[idx].id)
+            .frame(maxWidth: .infinity)
+            .offset(visualShiftOffset(for: idx, groupID: groupID))
+            .animation(.spring(response: 0.28, dampingFraction: 0.80), value: dragTargetIndex)
+            .transition(.asymmetric(
+                insertion: .scale(scale: 0.90).combined(with: .opacity),
+                removal: .scale(scale: 0.72).combined(with: .opacity)
+            ))
+        } else {
+            Color.clear.frame(maxWidth: .infinity, height: 1)
         }
     }
 
