@@ -42,10 +42,27 @@ struct BrowserScreen: View {
     @State private var updateMessage: String? = nil
     @FocusState private var addressFocused: Bool
 
+    private var anyDarkOverlayPresented: Bool {
+        showTabs || showBookmarks || showBookmarkEdit || showHistory || showDownloads
+            || showBookshelf || showCaptureMenu || showLiveCapture || showWatermarkRemover
+            || showDriveSync || showExtensions || showNetworkPrivacy || showSettings
+            || showProfiles || showToolbarEditor || showPageToolsEditor
+            || showCloseAllConfirm || sharePayload != nil
+    }
+
     var body: some View {
         let isBottomBar = model.preferences.addressBarPosition == .bottom
+        let pageBackdropColor: Color = {
+            if model.isStartPage {
+                return Color(red: 0.08, green: 0.08, blue: 0.09)
+            }
+            if let pageUI = model.activePageBottomUIColor ?? model.activePageTopUIColor {
+                return Color(uiColor: pageUI)
+            }
+            return Color(red: 0.08, green: 0.08, blue: 0.09)
+        }()
         ZStack {
-            Color(red: 0.08, green: 0.08, blue: 0.09).ignoresSafeArea()
+            pageBackdropColor.ignoresSafeArea()
 
             // Main Browser Surface + Floating Toolbar (Full Edge-to-Edge incl. Notch/Dynamic Island & Bottom Home Bar + Subtle Edge Blur!)
             ZStack {
@@ -60,7 +77,7 @@ struct BrowserScreen: View {
 
                             FastScrollBarOverlay(model: model)
                                 .padding(.top, isBottomBar ? 8 : (model.isChromeCollapsed ? 58 : 124))
-                                .padding(.bottom, isBottomBar ? (model.isChromeCollapsed ? 58 : 124) : 8)
+                                .padding(.bottom, isBottomBar ? (model.isChromeCollapsed ? 42 : 104) : 8)
 
                             if let failedURL = model.failedLoadURL {
                                 pageErrorOverlay(failedURL: failedURL)
@@ -69,7 +86,7 @@ struct BrowserScreen: View {
                     }
                 }
 
-                // Subtle Top & Bottom Edge Blur (feathers status bar / Dynamic Island sides & bottom bar seamlessly!)
+                // Safari-style seamless top color fill (y == 0) + subtle top & bottom progressive edge blur
                 VStack(spacing: 0) {
                     topEdgeBlurOverlay
                     Spacer(minLength: 0)
@@ -88,7 +105,7 @@ struct BrowserScreen: View {
                     }
                 }
 
-                // Floating Status Toast + Floating Liquid Glass URL Island (Top or Bottom!)
+                // Floating Status Toast + Floating Liquid Glass URL Island (Tucked low near home bar just like Safari!)
                 VStack(spacing: 6) {
                     if isBottomBar {
                         Spacer(minLength: 0)
@@ -108,14 +125,15 @@ struct BrowserScreen: View {
                         Spacer(minLength: 0)
                     }
                 }
+                .environment(\.colorScheme, .dark)
+                .ignoresSafeArea(.container, edges: isBottomBar ? .bottom : [])
                 .animation(.spring(response: 0.30, dampingFraction: 0.84), value: model.isChromeCollapsed)
                 .animation(.easeInOut(duration: 0.2), value: model.status)
             }
-            .scaleEffect(showTabs ? 0.88 : 1.0)
-            .blur(radius: showTabs ? 18 : 0)
-            .opacity(showTabs ? 0.52 : 1.0)
+            .blur(radius: showTabs ? 14 : 0)
+            .opacity(showTabs ? 0.72 : 1.0)
             .allowsHitTesting(!showTabs && !showPageTools && !showBrowserMenu)
-            .animation(.spring(response: 0.36, dampingFraction: 0.86), value: showTabs)
+            .animation(.spring(response: 0.28, dampingFraction: 0.88), value: showTabs)
 
             // Exact Video 00:06->00:08 Morphing Liquid Glass Page Tools Popover
             LiquidGlassMorphContainer(
@@ -123,7 +141,7 @@ struct BrowserScreen: View {
                 alignment: isBottomBar ? .bottomLeading : .topLeading,
                 anchor: isBottomBar ? .bottomLeading : .topLeading,
                 edgeInsets: isBottomBar
-                    ? EdgeInsets(top: 0, leading: 14, bottom: model.isChromeCollapsed ? 62 : 126, trailing: 14)
+                    ? EdgeInsets(top: 0, leading: 14, bottom: model.isChromeCollapsed ? 42 : 104, trailing: 14)
                     : EdgeInsets(top: model.isChromeCollapsed ? 62 : 126, leading: 14, bottom: 0, trailing: 14),
                 onDismiss: { showPageTools = false }
             ) {
@@ -143,6 +161,7 @@ struct BrowserScreen: View {
                     onOpenPageToolsEditor: { showPageToolsEditor = true }
                 )
             }
+            .environment(\.colorScheme, .dark)
 
             // Morphing Liquid Glass Browser Menu Popover (Bottom-Right / Top-Right)
             LiquidGlassMorphContainer(
@@ -150,7 +169,7 @@ struct BrowserScreen: View {
                 alignment: isBottomBar ? .bottomTrailing : .topTrailing,
                 anchor: isBottomBar ? .bottomTrailing : .topTrailing,
                 edgeInsets: isBottomBar
-                    ? EdgeInsets(top: 0, leading: 14, bottom: model.isChromeCollapsed ? 62 : 126, trailing: 14)
+                    ? EdgeInsets(top: 0, leading: 14, bottom: model.isChromeCollapsed ? 42 : 104, trailing: 14)
                     : EdgeInsets(top: model.isChromeCollapsed ? 62 : 126, leading: 14, bottom: 0, trailing: 14),
                 onDismiss: { showBrowserMenu = false }
             ) {
@@ -167,23 +186,25 @@ struct BrowserScreen: View {
                     onCheckUpdates: { Task { await checkUpdates() } }
                 )
             }
+            .environment(\.colorScheme, .dark)
 
-            // Exact Video 00:00->00:01->00:04 Fullscreen Hero-Zoom Liquid Glass Tab Overview!
+            // Exact Video 00:00->00:01->00:04 Fullscreen Liquid Glass Tab Overview (zero black bottom flash on dismiss!)
             if showTabs {
                 TabOverview(onDismiss: {
-                    withAnimation(.spring(response: 0.36, dampingFraction: 0.86)) {
+                    withAnimation(.spring(response: 0.28, dampingFraction: 0.88)) {
                         showTabs = false
                     }
                 })
                 .environmentObject(model)
+                .environment(\.colorScheme, .dark)
                 .transition(.asymmetric(
-                    insertion: .opacity.combined(with: .scale(scale: 1.08)),
-                    removal: .opacity.combined(with: .scale(scale: 1.06))
+                    insertion: .opacity.combined(with: .scale(scale: 1.04)),
+                    removal: .opacity.combined(with: .scale(scale: 1.03))
                 ))
                 .zIndex(20)
             }
         }
-        .animation(.spring(response: 0.36, dampingFraction: 0.86), value: showTabs)
+        .animation(.spring(response: 0.28, dampingFraction: 0.88), value: showTabs)
         .sheet(isPresented: $showBookmarks) {
             BookmarksSheet().environmentObject(model)
         }
@@ -334,8 +355,12 @@ struct BrowserScreen: View {
                 syncAddressField()
             }
         }
+        .onChange(of: anyDarkOverlayPresented) { active in
+            model.isDarkChromeOverlayActive = active
+        }
         .onAppear {
             syncAddressField()
+            model.isDarkChromeOverlayActive = anyDarkOverlayPresented
         }
     }
 
@@ -347,37 +372,53 @@ struct BrowserScreen: View {
     }
 
     private var topEdgeBlurOverlay: some View {
-        let h = max(56, screenSafeAreaInsets.top + 16)
-        return Rectangle()
-            .fill(.ultraThinMaterial)
-            .opacity(0.88)
-            .frame(height: h)
-            .mask(
-                LinearGradient(
-                    stops: [
-                        .init(color: .black, location: 0.0),
-                        .init(color: .black.opacity(0.72), location: 0.56),
-                        .init(color: .black.opacity(0.22), location: 0.82),
-                        .init(color: .clear, location: 1.0)
-                    ],
-                    startPoint: .top,
-                    endPoint: .bottom
+        let safeTop = max(44, screenSafeAreaInsets.top)
+        let h = safeTop + 16
+        let topFillColor = model.activePageTopUIColor.map { Color(uiColor: $0) }
+        return ZStack(alignment: .top) {
+            // Seamless top color fill at scroll y == 0 (matches Safari Screenshot 3 — fills notch/Dynamic Island sides!)
+            if !model.isStartPage, let topFillColor {
+                topFillColor
+                    .frame(height: safeTop)
+                    .opacity(model.isAtTopOfPage ? 1.0 : 0.0)
+                    .animation(.easeOut(duration: 0.16), value: model.isAtTopOfPage)
+            }
+
+            // Subtle progressive frosted edge blur when scrolling page content passes behind Dynamic Island sides
+            Rectangle()
+                .fill(.ultraThinMaterial)
+                .environment(\.colorScheme, model.activePageTopIsLight ? .light : .dark)
+                .opacity((model.isAtTopOfPage && !model.isStartPage) ? 0.0 : 0.86)
+                .frame(height: h)
+                .mask(
+                    LinearGradient(
+                        stops: [
+                            .init(color: .black, location: 0.0),
+                            .init(color: .black.opacity(0.72), location: 0.56),
+                            .init(color: .black.opacity(0.22), location: 0.82),
+                            .init(color: .clear, location: 1.0)
+                        ],
+                        startPoint: .top,
+                        endPoint: .bottom
+                    )
                 )
-            )
+                .animation(.easeOut(duration: 0.16), value: model.isAtTopOfPage)
+        }
     }
 
     private var bottomEdgeBlurOverlay: some View {
-        let h = max(46, screenSafeAreaInsets.bottom + 24)
+        let h = max(36, screenSafeAreaInsets.bottom + 14)
         return Rectangle()
             .fill(.ultraThinMaterial)
-            .opacity(0.88)
+            .environment(\.colorScheme, model.activePageBottomIsLight ? .light : .dark)
+            .opacity(0.78)
             .frame(height: h)
             .mask(
                 LinearGradient(
                     stops: [
                         .init(color: .clear, location: 0.0),
-                        .init(color: .black.opacity(0.22), location: 0.24),
-                        .init(color: .black.opacity(0.72), location: 0.58),
+                        .init(color: .black.opacity(0.20), location: 0.25),
+                        .init(color: .black.opacity(0.66), location: 0.60),
                         .init(color: .black, location: 1.0)
                     ],
                     startPoint: .top,
@@ -720,7 +761,7 @@ struct BrowserScreen: View {
         }
         .padding(.horizontal, 8)
         .padding(.top, isBottom ? 0 : 6)
-        .padding(.bottom, isBottom ? 6 : 0)
+        .padding(.bottom, isBottom ? (addressFocused ? 8 : (screenSafeAreaInsets.bottom > 0 ? (model.isChromeCollapsed && !model.isStartPage ? 12 : 10) : 8)) : 0)
     }
 
     private var androidProgressStrip: some View {

@@ -15,6 +15,15 @@ struct OmyaruApp: App {
     @State private var showInitialSyncFolderPrompt = false
     @State private var promptedFolderThisLaunch = false
 
+    private var effectiveRootColorScheme: ColorScheme? {
+        if appLock.isLocked { return .dark }
+        if browser.preferences.pageColorScheme == .light { return .light }
+        if !browser.isStartPage && !browser.isDarkChromeOverlayActive && browser.activePageTopIsLight {
+            return .light
+        }
+        return browser.preferences.pageColorScheme.swiftUIColorScheme
+    }
+
     var body: some Scene {
         WindowGroup {
             ZStack {
@@ -38,7 +47,7 @@ struct OmyaruApp: App {
                         }
                 }
             }
-            .preferredColorScheme(browser.preferences.pageColorScheme.swiftUIColorScheme)
+            .preferredColorScheme(effectiveRootColorScheme)
             .sheet(isPresented: $showInitialSyncFolderPrompt) {
                 SharedSyncFolderSetupSheet(
                     shelf: .shared,
@@ -629,7 +638,7 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
     static let defaultProfileID = UUID(uuidString: "00000000-0000-0000-0000-000000000010")!
     static let defaultGroupID = UUID(uuidString: "00000000-0000-0000-0000-000000000002")!
     static let appVersionName = "0.15.18"
-    static let appBuildNumber = 94
+    static let appBuildNumber = 95
 
     var isApplyingRemoteSync: Bool = false
 
@@ -649,6 +658,10 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
     @Published var downloads: [URL] = []
     @Published var pendingDownload: PendingDownloadPrompt? = nil
     @Published var tabSnapshots: [UUID: UIImage] = [:]
+    @Published var tabTopColors: [UUID: UIColor] = [:]
+    @Published var tabBottomColors: [UUID: UIColor] = [:]
+    @Published var isAtTopOfPage: Bool = true
+    @Published var isDarkChromeOverlayActive: Bool = false
     @Published var blockedTrackerCount: Int = 0
     @Published var estimatedProgress: Double = 0.0
     @Published var isLoading: Bool = false
@@ -906,6 +919,102 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
         status = added > 0 ? "'\(folderName)' 폴더에 \(added)개 탭을 북마크했습니다." : "이미 모든 탭이 북마크되어 있습니다."
     }
 
+    var activePageTopUIColor: UIColor? {
+        guard !isStartPage else { return nil }
+        return tabTopColors[activeID]
+    }
+
+    var activePageBottomUIColor: UIColor? {
+        guard !isStartPage else { return nil }
+        return tabBottomColors[activeID] ?? tabTopColors[activeID]
+    }
+
+    var activePageTopIsLight: Bool {
+        guard let c = activePageTopUIColor else { return false }
+        var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
+        c.getRed(&r, green: &g, blue: &b, alpha: &a)
+        return (0.299 * r + 0.587 * g + 0.114 * b) > 0.62
+    }
+
+    var activePageBottomIsLight: Bool {
+        guard let c = activePageBottomUIColor else { return false }
+        var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
+        c.getRed(&r, green: &g, blue: &b, alpha: &a)
+        return (0.299 * r + 0.587 * g + 0.114 * b) > 0.62
+    }
+
+    func samplePageEdgeColors(for tabID: UUID, webView: WKWebView) {
+        let js = """
+        (() => {
+          function parseRGB(str) {
+            if (!str || str === 'transparent') return null;
+            const m = str.match(/rgba?\\(\\s*([\\d.]+)\\s*,\\s*([\\d.]+)\\s*,\\s*([\\d.]+)(?:\\s*,\\s*([\\d.]+))?\\s*\\)/i);
+            if (!m) return null;
+            const a = m[4] !== undefined ? parseFloat(m[4]) : 1;
+            if (a < 0.15) return null;
+            return [Math.round(parseFloat(m[1])), Math.round(parseFloat(m[2])), Math.round(parseFloat(m[3]))];
+          }
+          function colorAt(x, y) {
+            let el = document.elementFromPoint(x, y);
+            while (el && el !== document.documentElement) {
+              const c = parseRGB(getComputedStyle(el).backgroundColor);
+              if (c) return c;
+              el = el.parentElement;
+            }
+            return parseRGB(getComputedStyle(document.body || document.documentElement).backgroundColor)
+              || parseRGB(getComputedStyle(document.documentElement).backgroundColor)
+              || [255, 255, 255];
+          }
+          const meta = document.querySelector('meta[name="theme-color"]');
+          let topColor = null;
+          if (meta && meta.content) {
+            const probe = document.createElement('div');
+            probe.style.color = meta.content;
+            document.documentElement.appendChild(probe);
+            topColor = parseRGB(getComputedStyle(probe).color);
+            probe.remove();
+          }
+          const w = Math.max(10, window.innerWidth || 320);
+          const h = Math.max(10, window.innerHeight || 600);
+          const sampledTop = topColor || colorAt(Math.floor(w * 0.5), 2);
+          const sampledBottom = colorAt(Math.floor(w * 0.5), Math.max(2, h - 2));
+          return { top: sampledTop, bottom: sampledBottom };
+        })();
+        """
+        webView.evaluateJavaScript(js) { [weak self, weak webView] result, _ in
+            guard let self, let webView else { return }
+            Task { @MainActor in
+                var topUI: UIColor? = webView.themeColor
+                var bottomUI: UIColor? = nil
+                if let dict = result as? [String: Any] {
+                    if topUI == nil, let arr = dict["top"] as? [NSNumber], arr.count >= 3 {
+                        topUI = UIColor(
+                            red: CGFloat(arr[0].doubleValue) / 255.0,
+                            green: CGFloat(arr[1].doubleValue) / 255.0,
+                            blue: CGFloat(arr[2].doubleValue) / 255.0,
+                            alpha: 1.0
+                        )
+                    }
+                    if let arr = dict["bottom"] as? [NSNumber], arr.count >= 3 {
+                        bottomUI = UIColor(
+                            red: CGFloat(arr[0].doubleValue) / 255.0,
+                            green: CGFloat(arr[1].doubleValue) / 255.0,
+                            blue: CGFloat(arr[2].doubleValue) / 255.0,
+                            alpha: 1.0
+                        )
+                    }
+                }
+                let resolvedTop = topUI ?? bottomUI ?? UIColor.white
+                let resolvedBottom = bottomUI ?? resolvedTop
+                self.tabTopColors[tabID] = resolvedTop
+                self.tabBottomColors[tabID] = resolvedBottom
+                webView.underPageBackgroundColor = resolvedBottom
+                webView.backgroundColor = resolvedBottom
+                webView.scrollView.backgroundColor = resolvedBottom
+            }
+        }
+    }
+
     func activeWebView() -> WKWebView? {
         guard let tab = activeTab else { return nil }
         return webView(for: tab.id)
@@ -1100,9 +1209,11 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
         view.scrollView.delegate = self
         view.scrollView.showsVerticalScrollIndicator = false
         view.scrollView.contentInsetAdjustmentBehavior = .scrollableAxes
-        view.isOpaque = false
-        view.backgroundColor = UIColor(red: 0.09, green: 0.075, blue: 0.067, alpha: 1.0)
-        view.underPageBackgroundColor = nil
+        view.isOpaque = true
+        let initialBg = tabBottomColors[id] ?? tabTopColors[id] ?? UIColor(red: 0.09, green: 0.075, blue: 0.067, alpha: 1.0)
+        view.backgroundColor = initialBg
+        view.scrollView.backgroundColor = initialBg
+        view.underPageBackgroundColor = initialBg
         applyContentInsets(to: view)
         if tab?.isDesktopMode == true || preferences.desktopModeDefault {
             view.customUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15"
@@ -1125,7 +1236,7 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
         let topInset: CGFloat
         if preferences.addressBarPosition == .bottom {
             topInset = 0
-            bottomInset = isChromeCollapsed ? 58 : 126
+            bottomInset = isChromeCollapsed ? 42 : 104
         } else {
             topInset = isChromeCollapsed ? 56 : 124
             bottomInset = 0
@@ -1180,6 +1291,10 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
         let scrollable = contentH - viewportH
         if scrollable > 40 {
             let adjustedY = max(0, scrollView.contentOffset.y + scrollView.adjustedContentInset.top)
+        let nowAtTop = adjustedY <= 3
+        if isAtTopOfPage != nowAtTop {
+            isAtTopOfPage = nowAtTop
+        }
             isScrollable = true
             scrollViewportRatio = min(1.0, max(0.12, Double(viewportH / max(contentH, 1))))
             scrollFraction = min(1.0, max(0.0, Double(adjustedY / max(scrollable, 1))))
@@ -1655,7 +1770,12 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
             activeGroupID = tab.groupID
         }
         rememberActiveTab(id)
-        _ = webView(for: id, loadIfNeeded: true)
+        let wv = webView(for: id, loadIfNeeded: true)
+        let adjustedY = max(0, wv.scrollView.contentOffset.y + wv.scrollView.adjustedContentInset.top)
+        isAtTopOfPage = adjustedY <= 3
+        if tabTopColors[id] == nil && tab.url != "about:blank" {
+            samplePageEdgeColors(for: id, webView: wv)
+        }
         persist()
     }
 
@@ -2233,10 +2353,16 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
     }
 
     func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
-        if id(for: webView) == activeID {
+        guard let id = id(for: webView) else { return }
+        if id == activeID {
             estimatedProgress = max(0.45, webView.estimatedProgress)
             failedLoadURL = nil
             failedLoadMessage = nil
+            isAtTopOfPage = true
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.14) { [weak self, weak webView] in
+            guard let self, let webView else { return }
+            self.samplePageEdgeColors(for: id, webView: webView)
         }
     }
 
@@ -2247,6 +2373,11 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
             estimatedProgress = 1.0
             failedLoadURL = nil
             failedLoadMessage = nil
+        }
+        samplePageEdgeColors(for: id, webView: webView)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self, weak webView] in
+            guard let self, let webView else { return }
+            self.samplePageEdgeColors(for: id, webView: webView)
         }
         let url = webView.url?.absoluteString ?? "about:blank"
         let title = (webView.title?.isEmpty == false) ? webView.title! : url

@@ -1,3 +1,25 @@
+# 2026-11-24 Antigravity: iOS Safari 방식 상단 빈 공간 페이지 색상 자동 채움 + 탭 전환 하단 검은 깜빡임 제거 + 하단 URL 아일랜드/축소 필 하향 배치 + 잠금 사용 토글 시 팝업 암호 설정 (`iOS build 95`)
+
+- 작업 워크스페이스: `E:/DEV/CODEX/BROWSER`
+- 사용자 요청 (스크린샷 1~4 기준):
+  1. 사이트 첫 로드 시 상단 노치·다이나믹 아일랜드 영역이 어둡게 비어 보이는 문제 해결(Safari 3번 사진처럼 페이지 상단 배경색으로 자연스럽게 채우고, 스크롤 시 은은한 블러로 이어지게)
+  2. 탭 목록에서 탭 선택 순간 하단에 검은 영역이 잠깐 깜빡이는 현상 수정(4번 사진)
+  3. 하단 URL 필드 아일랜드 및 스크롤 축소 필을 Safari 3번 사진처럼 화면 아래쪽으로 더 내려 배치
+  4. 앱 잠금·책장 잠금 설정 화면 하단의 상시 PIN/비밀번호 입력 영역 제거 — `잠금 사용` 토글을 켤 때만 전용 PIN/비밀번호 설정 시트가 뜨도록 변경
+- 해결 (`apps/ios/Omyaru/OmyaruApp.swift`, `BrowserViews.swift`, `AppLockAndPrivacy.swift`, `Info.plist`):
+  1. **Safari 방식 상·하단 페이지 색상 샘플링 & 자동 채움 (`OmyaruApp.swift`, `BrowserViews.swift`)**:
+     - `WKWebView.isOpaque = true` 전환 및 `samplePageEdgeColors(for:webView:)` 신설(`webView.themeColor` + 상단/하단 실제 CSS 배경색 샘플링 → `underPageBackgroundColor`, `backgroundColor`, `scrollView.backgroundColor`, `tabTopColors`/`tabBottomColors` 실시간 동기화).
+     - 페이지 최상단(`isAtTopOfPage`)에서는 노치·다이나믹 아일랜드 영역을 해당 페이지 상단 색으로 빈틈없이 채우고, 밝은 페이지에서는 상태바 시계·아이콘도 자동으로 검정(다크 텍스트)으로 전환(`effectiveRootColorScheme`), 스크롤을 내리는 순간 은은한 적응형(`.light`/`.dark`) 상하단 블러로 부드럽게 전환. 하단 끝 어두운 띠도 함께 제거.
+  2. **탭 선택 전환 시 하단 검은 깜빡임 완전 제거 (`BrowserViews.swift`, `OmyaruApp.swift`)**:
+     - `TabOverview` 뒤 브라우저 표면을 `scaleEffect(0.88)`로 축소해 가장자리의 검은 배경을 노출시키던 동작을 제거하고 전체 화면(`1.0`)을 유지하며, 루트 배경색도 현재 탭의 샘플링된 페이지 색(`activePageBottomUIColor`)에 일치시켜 탭 선택 시 검은 깜빡임 원천 차단.
+  3. **하단 URL 아일랜드 및 축소 필 하향 배치 (`BrowserViews.swift`, `OmyaruApp.swift`)**:
+     - 하단 툴바 컨테이너에 `.ignoresSafeArea(.container, edges: .bottom)`(키보드는 정상 회피)을 적용해 Face ID 기기 기준 화면 하단에서 `10pt`(확장 아일랜드) / `12pt`(축소 필) 위치로 약 `24pt` 하향 배치(Safari 3번 사진 정렬), 팝오버 앵커 및 웹뷰 하단 인셋(`42 / 104`)도 함께 정렬.
+  4. **잠금 설정 하단 상시 입력창 제거 및 토글 연동 모달(`LockSecretSetupSheet`) (`AppLockAndPrivacy.swift`)**:
+     - `AppLockSettingsSheet`와 `BookshelfLockSettingsSheet` 하단의 상시 PIN/비밀번호 입력 섹션을 제거하고, **`앱 잠금 사용` / `책장 잠금 사용` 토글을 켤 때**에만 전용 `LockSecretSetupSheet`(PIN 4~6자리 / 비밀번호) 창이 열리도록 개선(취소 시 토글 꺼짐 유지, 저장 시 잠금 활성화 및 `PIN / 비밀번호 변경...` 버튼 표시, 끄면 잠금 비활성화 및 암호 삭제).
+  - iOS 빌드 번호: `94` → **`95`** (`Info.plist`, `OmyaruApp.swift`).
+
+---
+
 # 2026-11-24 Antigravity: iOS 전체 화면 Edge-to-Edge(노치·다이나믹 아일랜드·하단) + 위아래 끝 미세 블러 + 그룹별 마지막 탭 기억 + `다른 탭 닫기` 상단 메뉴 이동 + 추적 방지 기본값 `표준` + 설정 내 앱·책장 잠금 통합/암호 필수/아이폰 잠금 연동 (`iOS build 94`)
 
 - 작업 워크스페이스: `E:/DEV/CODEX/BROWSER`

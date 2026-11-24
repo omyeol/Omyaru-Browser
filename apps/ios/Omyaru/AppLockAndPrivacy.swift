@@ -257,57 +257,20 @@ struct AppLockOverlayView: View {
     }
 }
 
-struct AppLockSettingsSheet: View {
+private struct LockSecretSetupSheet: View {
     @Environment(\.dismiss) private var dismiss
-    @ObservedObject var lock: AppLockManager = .shared
+    let title: String
+    let initialKind: AppLockKind
+    let onSave: (String, AppLockKind) -> String?
+
     @State private var chosenKind: AppLockKind = .pin
     @State private var newSecret: String = ""
     @State private var confirmSecret: String = ""
-    @State private var message: String = ""
-    @State private var isWarning: Bool = false
-
-    private var enabledBinding: Binding<Bool> {
-        Binding(
-            get: { lock.isEnabled && lock.hasSecret },
-            set: { next in
-                if lock.trySetEnabled(next) {
-                    isWarning = false
-                    message = next ? "앱 잠금이 활성화되었습니다." : "앱 잠금이 일시 꺼졌습니다."
-                } else {
-                    isWarning = true
-                    message = lock.errorMessage
-                }
-            }
-        )
-    }
+    @State private var errorMessage: String = ""
 
     var body: some View {
         NavigationStack {
             Form {
-                Section {
-                    Toggle("앱 잠금 사용", isOn: enabledBinding)
-                    LabeledContent("현재 상태") {
-                        if lock.isEnabled && lock.hasSecret {
-                            Text("사용 중 (\(lock.lockKind == .pin ? "\(lock.pinLength)자리 PIN" : "비밀번호"))")
-                                .foregroundStyle(.green)
-                        } else if lock.hasSecret {
-                            Text("암호 저장됨 (꺼짐)")
-                                .foregroundStyle(.secondary)
-                        } else {
-                            Text("꺼짐 (암호 미설정)")
-                                .foregroundStyle(.secondary)
-                        }
-                    }
-                    Toggle("Face ID / Touch ID 사용", isOn: $lock.useBiometrics)
-                    Toggle("아이폰이 잠기면 같이 잠금", isOn: $lock.lockOnDeviceLock)
-                    Toggle("백그라운드 전환 시 즉시 잠금", isOn: $lock.lockOnBackground)
-                    Toggle("앱 전환기 검은 화면 보호 (미리보기 가리기)", isOn: $lock.appSwitchBlackShield)
-                } header: {
-                    Text("앱 잠금 및 화면 보호")
-                } footer: {
-                    Text("앱 잠금을 켜려면 먼저 아래에서 PIN(4~6자리) 또는 비밀번호를 설정해야 합니다. ‘아이폰이 잠기면 같이 잠금’을 켜면 기기 화면이 잠길 때 앱도 함께 잠깁니다.")
-                }
-
                 Section {
                     Picker("잠금 방식", selection: $chosenKind) {
                         ForEach(AppLockKind.allCases) { kind in
@@ -321,44 +284,101 @@ struct AppLockSettingsSheet: View {
                     SecureField("암호 확인", text: $confirmSecret)
                         .keyboardType(chosenKind == .pin ? .numberPad : .default)
 
-                    Button(lock.hasSecret ? "암호 변경 및 앱 잠금 켜기" : "암호 저장 및 앱 잠금 켜기") {
-                        guard newSecret == confirmSecret else {
-                            isWarning = true
-                            message = "암호 확인이 일치하지 않습니다."
-                            return
-                        }
-                        if lock.setSecret(newSecret, kind: chosenKind) {
-                            newSecret = ""
-                            confirmSecret = ""
-                            isWarning = false
-                            message = "앱 잠금이 활성화되었습니다."
-                        } else {
-                            isWarning = true
-                            message = lock.errorMessage
-                        }
-                    }
-                    if lock.hasSecret || lock.isEnabled {
-                        Button("앱 잠금 해제 및 암호 삭제", role: .destructive) {
-                            lock.disableLock()
-                            isWarning = false
-                            message = "앱 잠금이 비활성화되고 암호가 삭제되었습니다."
-                        }
-                    }
-                    if !message.isEmpty {
-                        Text(message)
+                    if !errorMessage.isEmpty {
+                        Text(errorMessage)
                             .font(.caption)
-                            .foregroundStyle(isWarning ? .red : .secondary)
+                            .foregroundStyle(.red)
                     }
                 } header: {
-                    Text("앱 잠금 암호 설정 (필수)")
+                    Text("PIN / 비밀번호 설정")
+                } footer: {
+                    Text(chosenKind == .pin ? "4~6자리 숫자 PIN을 입력해 주세요." : "4자 이상 64자 이하의 비밀번호를 입력해 주세요.")
+                }
+            }
+            .navigationTitle(title)
+            .navigationBarTitleDisplayMode(.inline)
+            .onAppear { chosenKind = initialKind }
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("취소") { dismiss() }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("저장") {
+                        guard newSecret == confirmSecret else {
+                            errorMessage = "암호 확인이 일치하지 않습니다."
+                            return
+                        }
+                        if let err = onSave(newSecret, chosenKind) {
+                            errorMessage = err
+                        } else {
+                            dismiss()
+                        }
+                    }
+                }
+            }
+        }
+        .preferredColorScheme(.dark)
+    }
+}
+
+struct AppLockSettingsSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    @ObservedObject var lock: AppLockManager = .shared
+    @State private var showSecretSetup = false
+
+    private var enabledBinding: Binding<Bool> {
+        Binding(
+            get: { lock.isEnabled && lock.hasSecret },
+            set: { next in
+                if next {
+                    showSecretSetup = true
+                } else {
+                    lock.disableLock()
+                }
+            }
+        )
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section {
+                    Toggle("앱 잠금 사용", isOn: enabledBinding)
+                    if lock.isEnabled && lock.hasSecret {
+                        LabeledContent("잠금 방식") {
+                            Text(lock.lockKind == .pin ? "\(lock.pinLength)자리 PIN" : "비밀번호")
+                                .foregroundStyle(.green)
+                        }
+                        Toggle("Face ID / Touch ID 사용", isOn: $lock.useBiometrics)
+                        Toggle("아이폰이 잠기면 같이 잠금", isOn: $lock.lockOnDeviceLock)
+                        Toggle("백그라운드 전환 시 즉시 잠금", isOn: $lock.lockOnBackground)
+                        Button("PIN / 비밀번호 변경...") {
+                            showSecretSetup = true
+                        }
+                    }
+                } header: {
+                    Text("앱 잠금")
+                } footer: {
+                    Text("앱 잠금 사용을 켜면 PIN(4~6자리) 또는 비밀번호 설정 창이 열립니다. ‘아이폰이 잠기면 같이 잠금’을 켜면 기기 화면이 잠길 때 앱도 함께 잠깁니다.")
+                }
+
+                Section("화면 보호") {
+                    Toggle("앱 전환기 검은 화면 보호 (미리보기 가리기)", isOn: $lock.appSwitchBlackShield)
                 }
             }
             .navigationTitle("앱 잠금 설정")
             .navigationBarTitleDisplayMode(.inline)
-            .onAppear { chosenKind = lock.lockKind }
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
                     Button("완료") { dismiss() }
+                }
+            }
+            .sheet(isPresented: $showSecretSetup) {
+                LockSecretSetupSheet(
+                    title: lock.hasSecret ? "앱 잠금 암호 변경" : "앱 잠금 암호 설정",
+                    initialKind: lock.lockKind
+                ) { secret, kind in
+                    lock.setSecret(secret, kind: kind) ? nil : lock.errorMessage
                 }
             }
         }
@@ -756,22 +776,16 @@ struct BookshelfLockOverlayView: View {
 struct BookshelfLockSettingsSheet: View {
     @Environment(\.dismiss) private var dismiss
     @ObservedObject var lock: BookshelfLockManager = .shared
-    @State private var chosenKind: AppLockKind = .pin
-    @State private var newSecret: String = ""
-    @State private var confirmSecret: String = ""
-    @State private var message: String = ""
-    @State private var isWarning: Bool = false
+    @State private var showSecretSetup = false
 
     private var enabledBinding: Binding<Bool> {
         Binding(
             get: { lock.isEnabled && lock.hasSecret },
             set: { next in
-                if lock.trySetEnabled(next) {
-                    isWarning = false
-                    message = next ? "책장 잠금이 활성화되었습니다." : "책장 잠금이 일시 꺼졌습니다."
+                if next {
+                    showSecretSetup = true
                 } else {
-                    isWarning = true
-                    message = lock.errorMessage
+                    lock.disableLock()
                 }
             }
         )
@@ -782,79 +796,29 @@ struct BookshelfLockSettingsSheet: View {
             Form {
                 Section {
                     Toggle("책장 잠금 사용", isOn: enabledBinding)
-                    LabeledContent("현재 상태") {
-                        if lock.isEnabled && lock.hasSecret {
+                    if lock.isEnabled && lock.hasSecret {
+                        LabeledContent("적용 규칙") {
                             Text(lock.summaryDescription)
                                 .font(.caption)
                                 .foregroundStyle(.green)
                                 .multilineTextAlignment(.trailing)
-                        } else if lock.hasSecret {
-                            Text("암호 저장됨 (꺼짐)")
-                                .foregroundStyle(.secondary)
-                        } else {
-                            Text("꺼짐 (암호 미설정)")
-                                .foregroundStyle(.secondary)
+                        }
+                        Toggle("Face ID / Touch ID 사용", isOn: $lock.useBiometrics)
+                        Picker("자동 잠금 시간", selection: $lock.lockTimeout) {
+                            ForEach(BookshelfLockTimeout.allCases) { option in
+                                Text(option.title).tag(option)
+                            }
+                        }
+                        Toggle("아이폰이 잠기면 같이 잠금", isOn: $lock.lockOnDeviceLock)
+                        Toggle("앱 백그라운드 전환 시 즉시 잠금", isOn: $lock.lockOnBackground)
+                        Button("PIN / 비밀번호 변경...") {
+                            showSecretSetup = true
                         }
                     }
-                    Toggle("Face ID / Touch ID 사용", isOn: $lock.useBiometrics)
-                    Picker("자동 잠금 시간", selection: $lock.lockTimeout) {
-                        ForEach(BookshelfLockTimeout.allCases) { option in
-                            Text(option.title).tag(option)
-                        }
-                    }
-                    Toggle("아이폰이 잠기면 같이 잠금", isOn: $lock.lockOnDeviceLock)
-                    Toggle("앱 백그라운드 전환 시 즉시 잠금", isOn: $lock.lockOnBackground)
                 } header: {
-                    Text("책장 잠금 옵션")
+                    Text("책장 잠금")
                 } footer: {
-                    Text("책장 잠금을 켜려면 먼저 아래에서 PIN(4~6자리) 또는 비밀번호를 설정해야 합니다. 암호를 설정한 뒤에는 Face ID · Touch ID와 함께 사용할 수 있으며, ‘아이폰이 잠기면 같이 잠금’을 켜면 기기 화면이 잠길 때 책장도 함께 잠깁니다.")
-                }
-
-                Section {
-                    Picker("암호 방식", selection: $chosenKind) {
-                        ForEach(AppLockKind.allCases) { kind in
-                            Text(kind.title).tag(kind)
-                        }
-                    }
-                    .pickerStyle(.segmented)
-
-                    SecureField(chosenKind == .pin ? "책장 PIN (4~6자리 숫자)" : "책장 비밀번호 (4자 이상)", text: $newSecret)
-                        .keyboardType(chosenKind == .pin ? .numberPad : .default)
-                    SecureField("암호 확인", text: $confirmSecret)
-                        .keyboardType(chosenKind == .pin ? .numberPad : .default)
-
-                    Button(lock.hasSecret ? "책장 암호 변경 및 잠금 켜기" : "책장 암호 저장 및 잠금 켜기") {
-                        guard newSecret == confirmSecret else {
-                            isWarning = true
-                            message = "암호 확인이 일치하지 않습니다."
-                            return
-                        }
-                        if lock.setSecret(newSecret, kind: chosenKind) {
-                            newSecret = ""
-                            confirmSecret = ""
-                            isWarning = false
-                            message = "책장 암호가 저장되고 잠금이 활성화되었습니다."
-                        } else {
-                            isWarning = true
-                            message = lock.errorMessage
-                        }
-                    }
-
-                    if lock.hasSecret || lock.isEnabled {
-                        Button("책장 잠금 해제 및 암호 삭제", role: .destructive) {
-                            lock.disableLock()
-                            isWarning = false
-                            message = "책장 잠금이 비활성화되고 암호가 삭제되었습니다."
-                        }
-                    }
-
-                    if !message.isEmpty {
-                        Text(message)
-                            .font(.caption)
-                            .foregroundStyle(isWarning ? .red : .secondary)
-                    }
-                } header: {
-                    Text("책장 잠금 암호 설정 (필수)")
+                    Text("책장 잠금 사용을 켜면 PIN(4~6자리) 또는 비밀번호 설정 창이 열립니다. ‘아이폰이 잠기면 같이 잠금’을 켜면 기기 화면이 잠길 때 책장도 함께 잠깁니다.")
                 }
 
                 if lock.isEnabled && lock.hasSecret {
@@ -870,10 +834,17 @@ struct BookshelfLockSettingsSheet: View {
             }
             .navigationTitle("책장 잠금 설정")
             .navigationBarTitleDisplayMode(.inline)
-            .onAppear { chosenKind = lock.lockKind }
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
                     Button("완료") { dismiss() }
+                }
+            }
+            .sheet(isPresented: $showSecretSetup) {
+                LockSecretSetupSheet(
+                    title: lock.hasSecret ? "책장 잠금 암호 변경" : "책장 잠금 암호 설정",
+                    initialKind: lock.lockKind
+                ) { secret, kind in
+                    lock.setSecret(secret, kind: kind) ? nil : lock.errorMessage
                 }
             }
         }
