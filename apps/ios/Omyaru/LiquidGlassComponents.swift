@@ -225,7 +225,6 @@ struct LiquidGlassPageToolsPopover: View {
     var onToolbarAction: (ToolbarShortcutAction) -> Void
     var onOpenDownloads: () -> Void
     var onOpenDriveSync: () -> Void
-    var onOpenPageToolsEditor: () -> Void
 
     private var zoomPercent: Int {
         Int(((model.activeTab?.pageZoom ?? model.preferences.fontScale) * 100).rounded())
@@ -497,18 +496,8 @@ struct LiquidGlassPageToolsPopover: View {
                     ForEach(scrollableItems) { item in
                         rowView(for: item)
                     }
-
-                    Divider().background(Color.white.opacity(0.14)).padding(.vertical, 2)
-
-                    GlassMenuRow(
-                        title: "페이지 도구 편집",
-                        systemImage: "slider.horizontal.3",
-                        iconColor: .white.opacity(0.75)
-                    ) {
-                        onDismiss()
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.14) { onOpenPageToolsEditor() }
-                    }
                 }
+                .padding(.vertical, 4)
             }
             .frame(maxHeight: 440)
         }
@@ -535,7 +524,6 @@ struct LiquidGlassBrowserMenuPopover: View {
     var onOpenCaptureMenu: () -> Void
     var onOpenDownloads: () -> Void
     var onOpenDriveSync: () -> Void
-    var onOpenToolbarEditor: () -> Void
     var onCheckUpdates: () -> Void
 
     private static let candidateOrder: [ToolbarShortcutAction] = [
@@ -583,10 +571,6 @@ struct LiquidGlassBrowserMenuPopover: View {
                 GlassMenuRow(title: "Google Drive 동기화", systemImage: "arrow.triangle.2.circlepath.icloud") {
                     onDismiss()
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.14) { onOpenDriveSync() }
-                }
-                GlassMenuRow(title: "툴바 버튼 편집", systemImage: "slider.horizontal.below.rectangle") {
-                    onDismiss()
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.14) { onOpenToolbarEditor() }
                 }
                 GlassMenuRow(title: "업데이트 확인", subtitle: "v\(BrowserModel.appVersionName) (build \(BrowserModel.appBuildNumber))", systemImage: "arrow.triangle.2.circlepath") {
                     onDismiss()

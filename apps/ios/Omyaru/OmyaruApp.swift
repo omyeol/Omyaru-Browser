@@ -296,6 +296,15 @@ enum PageColorSchemeChoice: String, CaseIterable, Codable, Identifiable {
         case .dark: return .dark
         }
     }
+
+    var resolvedSheetColorScheme: ColorScheme {
+        switch self {
+        case .dark: return .dark
+        case .light: return .light
+        case .system:
+            return UIScreen.main.traitCollection.userInterfaceStyle == .dark ? .dark : .light
+        }
+    }
 }
 
 enum AddressBarPositionChoice: String, CaseIterable, Codable, Identifiable {
@@ -638,7 +647,7 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
     static let defaultProfileID = UUID(uuidString: "00000000-0000-0000-0000-000000000010")!
     static let defaultGroupID = UUID(uuidString: "00000000-0000-0000-0000-000000000002")!
     static let appVersionName = "0.15.18"
-    static let appBuildNumber = 95
+    static let appBuildNumber = 96
 
     var isApplyingRemoteSync: Bool = false
 
@@ -1236,7 +1245,7 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
         let topInset: CGFloat
         if preferences.addressBarPosition == .bottom {
             topInset = 0
-            bottomInset = isChromeCollapsed ? 42 : 104
+            bottomInset = isChromeCollapsed ? 46 : 124
         } else {
             topInset = isChromeCollapsed ? 56 : 124
             bottomInset = 0

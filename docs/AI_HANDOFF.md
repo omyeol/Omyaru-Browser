@@ -1,3 +1,24 @@
+# 2026-11-24 Antigravity: iOS 팝업 편집 버튼 제거(설정 전용) + 모든 하위 설정(VPN·동기화·확장·프로필·잠금) 설정 내부 통합 + 설정 다크 모드 복원 + 하단 URL 아일랜드 높이 2번 사진(Safari) 정밀 일치 (`iOS build 96`)
+
+- 작업 워크스페이스: `E:/DEV/CODEX/BROWSER`
+- 사용자 요청:
+  1. 팝업 메뉴의 `페이지 도구 편집` 및 `툴바 버튼 편집` 버튼 제거 — 설정 창에서만 편집 가능하게 변경
+  2. VPN 설정 등 설정 내 하위 항목이 설정 창을 닫고 나갔다가 열리는 문제 수정 — 설정 안에서 열리고 `완료` 시 설정 창으로 복귀하도록 일괄 정리
+  3. 설정 창 다크 모드가 적용되지 않던 문제 수정
+  4. 하단 URL 필드 아일랜드 높이를 2번 사진(Safari)과 동일한 높이로 살짝 상향 조정
+- 해결 (`apps/ios/Omyaru/LiquidGlassComponents.swift`, `BrowserViews.swift`, `OmyaruApp.swift`, `Info.plist`):
+  1. **편집 버튼 설정 전용화 (`LiquidGlassComponents.swift`, `BrowserViews.swift`)**:
+     - `LiquidGlassPageToolsPopover`의 `페이지 도구 편집` 항목 및 `LiquidGlassBrowserMenuPopover`의 `툴바 버튼 편집` 항목, 주소창/툴바 길게 누르기 편집 진입을 모두 제거해 **`설정 → 화면 및 모양`**에서만 편집하도록 일원화.
+  2. **모든 하위 설정을 `SettingsSheet` 내부로 통합 (`BrowserViews.swift`)**:
+     - `VPN · 보안 DNS`(`NetworkPrivacySheet`), `동기화`(`DriveSyncSheet`), `확장 기능`(`ExtensionSettingsSheet`), `프로필 관리`(`ProfileManagerSheet`), `앱 잠금`, `책장 잠금`, `도구모음 편집`, `페이지 도구 편집`, `업데이트 확인 알림` 모두 `SettingsSheet`를 닫지 않고 설정 창 위에서 직접 열리며 `완료`/`닫기` 시 설정 창으로 바로 복귀.
+  3. **설정 창 및 모든 시트 다크 모드 완전 복원 (`OmyaruApp.swift`, `BrowserViews.swift`)**:
+     - 밝은 웹페이지 탐색 중 루트 상태바 색상 적응(`.light`)이 시트로 전파되던 문제를 차단하기 위해 `PageColorSchemeChoice.resolvedSheetColorScheme`을 도입하고 `SettingsSheet` 및 모든 하위·브라우저 시트에 명시적으로 적용(`다크 모드` 및 `시스템 설정` 다크 iPhone 모두 즉시 다크 모드 적용).
+  4. **하단 URL 필드 아일랜드 높이 2번 사진(Safari) 정밀 일치 (`BrowserViews.swift`, `OmyaruApp.swift`)**:
+     - 1번/2번 스크린샷 픽셀 프로파일 실측 결과를 반영해 하단 간격을 `10pt` → **`14pt`**(확장·축소 공통)로 올리고, `androidExpandedIsland` 내부 패딩(`top: 13`, `bottom: 12`, `horizontal: 10`), 행 간격(`8pt`), 주소창(`48pt`)/툴바(`44pt`), 외곽 곡률(`34pt` / `30pt`)을 조정해 **총 높이 `125pt`, 하단 끝 `14pt`, 상단 끝 `139pt`**로 2번 사진(Safari `14.0pt` / `124.8pt` / `138.9pt`)과 정확히 일치(팝오버 앵커·웹뷰 하단 인셋 `46 / 124` 동기화).
+  - iOS 빌드 번호: `95` → **`96`** (`Info.plist`, `OmyaruApp.swift`).
+
+---
+
 # 2026-11-24 Antigravity: iOS Safari 방식 상단 빈 공간 페이지 색상 자동 채움 + 탭 전환 하단 검은 깜빡임 제거 + 하단 URL 아일랜드/축소 필 하향 배치 + 잠금 사용 토글 시 팝업 암호 설정 (`iOS build 95`)
 
 - 작업 워크스페이스: `E:/DEV/CODEX/BROWSER`

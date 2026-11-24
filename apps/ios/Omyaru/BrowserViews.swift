@@ -30,8 +30,6 @@ struct BrowserScreen: View {
     @State private var showProfiles = false
     @State private var showPageTools = false
     @State private var showBrowserMenu = false
-    @State private var showToolbarEditor = false
-    @State private var showPageToolsEditor = false
     @State private var showCloseAllConfirm = false
     @State private var sharePayload: [Any]? = nil
     @State private var showFindBar = false
@@ -46,8 +44,7 @@ struct BrowserScreen: View {
         showTabs || showBookmarks || showBookmarkEdit || showHistory || showDownloads
             || showBookshelf || showCaptureMenu || showLiveCapture || showWatermarkRemover
             || showDriveSync || showExtensions || showNetworkPrivacy || showSettings
-            || showProfiles || showToolbarEditor || showPageToolsEditor
-            || showCloseAllConfirm || sharePayload != nil
+            || showProfiles || showCloseAllConfirm || sharePayload != nil
     }
 
     var body: some View {
@@ -77,7 +74,7 @@ struct BrowserScreen: View {
 
                             FastScrollBarOverlay(model: model)
                                 .padding(.top, isBottomBar ? 8 : (model.isChromeCollapsed ? 58 : 124))
-                                .padding(.bottom, isBottomBar ? (model.isChromeCollapsed ? 42 : 104) : 8)
+                                .padding(.bottom, isBottomBar ? (model.isChromeCollapsed ? 48 : 126) : 8)
 
                             if let failedURL = model.failedLoadURL {
                                 pageErrorOverlay(failedURL: failedURL)
@@ -141,7 +138,7 @@ struct BrowserScreen: View {
                 alignment: isBottomBar ? .bottomLeading : .topLeading,
                 anchor: isBottomBar ? .bottomLeading : .topLeading,
                 edgeInsets: isBottomBar
-                    ? EdgeInsets(top: 0, leading: 14, bottom: model.isChromeCollapsed ? 42 : 104, trailing: 14)
+                    ? EdgeInsets(top: 0, leading: 14, bottom: model.isChromeCollapsed ? 48 : 130, trailing: 14)
                     : EdgeInsets(top: model.isChromeCollapsed ? 62 : 126, leading: 14, bottom: 0, trailing: 14),
                 onDismiss: { showPageTools = false }
             ) {
@@ -157,8 +154,7 @@ struct BrowserScreen: View {
                     onOpenExtensions: { showExtensions = true },
                     onToolbarAction: { action in triggerToolbarShortcut(action) },
                     onOpenDownloads: { showDownloads = true },
-                    onOpenDriveSync: { showDriveSync = true },
-                    onOpenPageToolsEditor: { showPageToolsEditor = true }
+                    onOpenDriveSync: { showDriveSync = true }
                 )
             }
             .environment(\.colorScheme, .dark)
@@ -169,7 +165,7 @@ struct BrowserScreen: View {
                 alignment: isBottomBar ? .bottomTrailing : .topTrailing,
                 anchor: isBottomBar ? .bottomTrailing : .topTrailing,
                 edgeInsets: isBottomBar
-                    ? EdgeInsets(top: 0, leading: 14, bottom: model.isChromeCollapsed ? 42 : 104, trailing: 14)
+                    ? EdgeInsets(top: 0, leading: 14, bottom: model.isChromeCollapsed ? 48 : 130, trailing: 14)
                     : EdgeInsets(top: model.isChromeCollapsed ? 62 : 126, leading: 14, bottom: 0, trailing: 14),
                 onDismiss: { showBrowserMenu = false }
             ) {
@@ -182,7 +178,6 @@ struct BrowserScreen: View {
                     onOpenCaptureMenu: { showCaptureMenu = true },
                     onOpenDownloads: { showDownloads = true },
                     onOpenDriveSync: { showDriveSync = true },
-                    onOpenToolbarEditor: { showToolbarEditor = true },
                     onCheckUpdates: { Task { await checkUpdates() } }
                 )
             }
@@ -206,7 +201,9 @@ struct BrowserScreen: View {
         }
         .animation(.spring(response: 0.28, dampingFraction: 0.88), value: showTabs)
         .sheet(isPresented: $showBookmarks) {
-            BookmarksSheet().environmentObject(model)
+            BookmarksSheet()
+                .environmentObject(model)
+                .preferredColorScheme(model.preferences.pageColorScheme.resolvedSheetColorScheme)
         }
         .sheet(isPresented: $showBookmarkEdit) {
             BookmarkEditSheet(
@@ -215,15 +212,21 @@ struct BrowserScreen: View {
                 defaultTitle: model.activeTab?.title ?? model.currentHost,
                 defaultURL: model.currentURL
             )
+            .preferredColorScheme(model.preferences.pageColorScheme.resolvedSheetColorScheme)
         }
         .sheet(isPresented: $showHistory) {
-            HistorySheet().environmentObject(model)
+            HistorySheet()
+                .environmentObject(model)
+                .preferredColorScheme(model.preferences.pageColorScheme.resolvedSheetColorScheme)
         }
         .sheet(isPresented: $showDownloads) {
-            DownloadsSheet().environmentObject(model)
+            DownloadsSheet()
+                .environmentObject(model)
+                .preferredColorScheme(model.preferences.pageColorScheme.resolvedSheetColorScheme)
         }
         .sheet(isPresented: $showBookshelf) {
             BookshelfView()
+                .preferredColorScheme(model.preferences.pageColorScheme.resolvedSheetColorScheme)
         }
         .sheet(isPresented: $showCaptureMenu) {
             CaptureActionMenuSheet(
@@ -231,6 +234,7 @@ struct BrowserScreen: View {
                 onOpenWatermark: { showWatermarkRemover = true },
                 onOpenBookshelf: { showBookshelf = true }
             )
+            .preferredColorScheme(model.preferences.pageColorScheme.resolvedSheetColorScheme)
         }
         .sheet(isPresented: $showLiveCapture) {
             LiveCaptureView(
@@ -244,6 +248,7 @@ struct BrowserScreen: View {
                     }
                 }
             )
+            .preferredColorScheme(model.preferences.pageColorScheme.resolvedSheetColorScheme)
         }
         .sheet(isPresented: $showWatermarkRemover, onDismiss: {
             pendingWatermarkImage = nil
@@ -254,9 +259,11 @@ struct BrowserScreen: View {
                 initialCapturedImage: pendingWatermarkImage,
                 configuredWebToolURL: model.preferences.watermarkRemoverUrl
             )
+            .preferredColorScheme(model.preferences.pageColorScheme.resolvedSheetColorScheme)
         }
         .sheet(item: $model.pendingDownload) { prompt in
             DownloadConfirmationSheet(prompt: prompt, model: model)
+                .preferredColorScheme(model.preferences.pageColorScheme.resolvedSheetColorScheme)
         }
         .sheet(item: $model.activeContextElement) { element in
             WebContextElementSheet(model: model, element: element) { urlStr in
@@ -266,44 +273,42 @@ struct BrowserScreen: View {
                     sharePayload = [urlStr]
                 }
             }
+            .preferredColorScheme(model.preferences.pageColorScheme.resolvedSheetColorScheme)
         }
         .sheet(isPresented: Binding(get: { sharePayload != nil }, set: { if !$0 { sharePayload = nil } })) {
             if let items = sharePayload {
                 ActivityShareSheet(items: items)
             }
         }
-        .sheet(isPresented: $showToolbarEditor) {
-            ToolbarEditorSheet(model: model)
-        }
-        .sheet(isPresented: $showPageToolsEditor) {
-            PageToolsEditorSheet(model: model)
-        }
         .sheet(isPresented: $showCloseAllConfirm) {
             CloseAllTabsCountdownSheet(tabCount: model.visibleTabs.count) {
                 model.closeAllVisibleTabs()
             }
+            .preferredColorScheme(model.preferences.pageColorScheme.resolvedSheetColorScheme)
         }
         .sheet(isPresented: $showDriveSync) {
             DriveSyncSheet(browser: model, shelf: .shared)
+                .preferredColorScheme(model.preferences.pageColorScheme.resolvedSheetColorScheme)
         }
         .sheet(isPresented: $showExtensions) {
             ExtensionSettingsSheet(model: model)
+                .preferredColorScheme(model.preferences.pageColorScheme.resolvedSheetColorScheme)
         }
         .sheet(isPresented: $showNetworkPrivacy) {
             NetworkPrivacySheet(model: model)
+                .preferredColorScheme(model.preferences.pageColorScheme.resolvedSheetColorScheme)
         }
         .sheet(isPresented: $showSettings) {
             SettingsSheet(
                 model: model,
-                onOpenSync: { showSettings = false; DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { showDriveSync = true } },
-                onOpenExtensions: { showSettings = false; DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { showExtensions = true } },
-                onOpenNetwork: { showSettings = false; DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { showNetworkPrivacy = true } },
-                onOpenProfiles: { showSettings = false; DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { showProfiles = true } },
-                onCheckUpdates: { Task { await checkUpdates() } }
+                onCheckUpdates: { await fetchUpdateStatusMessage() }
             )
+            .preferredColorScheme(model.preferences.pageColorScheme.resolvedSheetColorScheme)
         }
         .sheet(isPresented: $showProfiles) {
-            ProfileManagerSheet().environmentObject(model)
+            ProfileManagerSheet()
+                .environmentObject(model)
+                .preferredColorScheme(model.preferences.pageColorScheme.resolvedSheetColorScheme)
         }
         .alert("즐겨찾기 추가", isPresented: $showAddFavorite) {
             TextField("이름 (예: 네이버)", text: $newFavTitle)
@@ -761,7 +766,7 @@ struct BrowserScreen: View {
         }
         .padding(.horizontal, 8)
         .padding(.top, isBottom ? 0 : 6)
-        .padding(.bottom, isBottom ? (addressFocused ? 8 : (screenSafeAreaInsets.bottom > 0 ? (model.isChromeCollapsed && !model.isStartPage ? 12 : 10) : 8)) : 0)
+        .padding(.bottom, isBottom ? (addressFocused ? 8 : (screenSafeAreaInsets.bottom > 0 ? 14 : 10)) : 0)
     }
 
     private var androidProgressStrip: some View {
@@ -871,10 +876,10 @@ struct BrowserScreen: View {
         }
     }
 
-    // Exact Android 2-Row + iOS 26 Safari Liquid Glass Floating Island (Video Frames 00:00, 00:04, 00:09, 00:27!)
+    // Exact Android 2-Row + iOS 26 Safari Liquid Glass Floating Island (Matches Screenshot 2 exact 125pt height & 14pt bottom gap!)
     private var androidExpandedIsland: some View {
-        VStack(spacing: 4) {
-            // Row 1: address_row (46pt capsule pill: [PageTools] [Centered Domain / URL TextField] [Bookmark] [Reload/Stop])
+        VStack(spacing: 8) {
+            // Row 1: address_row (48pt capsule pill: [PageTools] [Centered Domain / URL TextField] [Bookmark] [Reload/Stop])
             HStack(spacing: 2) {
                 Button {
                     UIImpactFeedbackGenerator(style: .light).impactOccurred()
@@ -890,12 +895,6 @@ struct BrowserScreen: View {
                         .contentShape(Rectangle())
                 }
                 .buttonStyle(LiquidGlassPressStyle())
-                .simultaneousGesture(
-                    LongPressGesture(minimumDuration: 0.45).onEnded { _ in
-                        UIImpactFeedbackGenerator(style: .medium).impactOccurred()
-                        showPageToolsEditor = true
-                    }
-                )
 
                 TextField("검색 또는 주소 입력", text: $address)
                     .font(.system(size: 15, weight: addressFocused ? .regular : .medium))
@@ -955,7 +954,7 @@ struct BrowserScreen: View {
                 }
             }
             .padding(.horizontal, 6)
-            .frame(height: 46)
+            .frame(height: 48)
             .background(
                 Capsule()
                     .fill(model.preferences.liquidGlassUi ? Color.white.opacity(0.08) : androidFieldColor)
@@ -968,7 +967,7 @@ struct BrowserScreen: View {
                     )
             )
 
-            // Row 2: navigation_scroller -> navigation_row (46pt, horizontally scrollable & centered when fits!)
+            // Row 2: navigation_scroller -> navigation_row (44pt, horizontally scrollable & centered when fits!)
             let activeShortcuts = model.preferences.toolbarShortcuts.isEmpty
                 ? ToolbarShortcutAction.defaultOrder
                 : model.preferences.toolbarShortcuts
@@ -980,27 +979,28 @@ struct BrowserScreen: View {
                                 .frame(maxWidth: activeShortcuts.count <= 6 ? .infinity : nil)
                         }
                     }
-                    .frame(minWidth: navGeo.size.width, minHeight: 46)
+                    .frame(minWidth: navGeo.size.width, minHeight: 44)
                 }
             }
-            .frame(height: 46)
+            .frame(height: 44)
         }
-        .padding(.horizontal, 7)
-        .padding(.vertical, 6)
+        .padding(.horizontal, 10)
+        .padding(.top, 13)
+        .padding(.bottom, 12)
         .background {
             if model.preferences.liquidGlassUi {
                 LiquidGlassShapeBackground(
-                    shape: RoundedRectangle(cornerRadius: 28, style: .continuous),
+                    shape: RoundedRectangle(cornerRadius: 34, style: .continuous),
                     tintOpacity: 0.44,
                     rimOpacity: 0.34,
                     specularOpacity: 0.24,
                     shadowRadius: 16
                 )
             } else {
-                RoundedRectangle(cornerRadius: 24, style: .continuous)
+                RoundedRectangle(cornerRadius: 30, style: .continuous)
                     .fill(Color(red: 0.129, green: 0.114, blue: 0.106, opacity: 0.92))
                     .overlay(
-                        RoundedRectangle(cornerRadius: 24, style: .continuous)
+                        RoundedRectangle(cornerRadius: 30, style: .continuous)
                             .strokeBorder(androidOutlineColor, lineWidth: 1.0)
                     )
                     .shadow(color: .black.opacity(0.30), radius: 10, y: 4)
@@ -1040,12 +1040,6 @@ struct BrowserScreen: View {
         }
         .buttonStyle(LiquidGlassPressStyle())
         .disabled(isDisabled)
-        .simultaneousGesture(
-            LongPressGesture(minimumDuration: 0.5).onEnded { _ in
-                UIImpactFeedbackGenerator(style: .medium).impactOccurred()
-                showToolbarEditor = true
-            }
-        )
     }
 
     private func triggerToolbarShortcut(_ action: ToolbarShortcutAction) {
@@ -1109,8 +1103,10 @@ struct BrowserScreen: View {
         }
     }
 
-    private func checkUpdates() async {
-        guard let url = URL(string: "https://api.github.com/repos/omyeol/Omyaru-Browser/releases/tags/ios-latest") else { return }
+    private func fetchUpdateStatusMessage() async -> String {
+        guard let url = URL(string: "https://api.github.com/repos/omyeol/Omyaru-Browser/releases/tags/ios-latest") else {
+            return "업데이트 주소를 확인할 수 없습니다."
+        }
         do {
             var request = URLRequest(url: url)
             request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
@@ -1118,12 +1114,16 @@ struct BrowserScreen: View {
             let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
             let release = json?["name"] as? String ?? ""
             let installed = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? BrowserModel.appVersionName
-            updateMessage = release.contains(installed)
+            return release.contains(installed)
                 ? "최신 버전(v\(installed))입니다."
                 : "새 버전: \(release). AltStore 소스에서 업데이트할 수 있습니다."
         } catch {
-            updateMessage = "업데이트를 확인하지 못했습니다: \(error.localizedDescription)"
+            return "업데이트를 확인하지 못했습니다: \(error.localizedDescription)"
         }
+    }
+
+    private func checkUpdates() async {
+        updateMessage = await fetchUpdateStatusMessage()
     }
 }
 
@@ -3273,24 +3273,31 @@ struct SettingsSheet: View {
     @ObservedObject var model: BrowserModel
     @ObservedObject private var appLock = AppLockManager.shared
     @ObservedObject private var bookshelfLock = BookshelfLockManager.shared
-    var onOpenSync: () -> Void
-    var onOpenExtensions: () -> Void
-    var onOpenNetwork: () -> Void
-    var onOpenProfiles: () -> Void
-    var onCheckUpdates: () -> Void
+    var onCheckUpdates: () async -> String
     @State private var showToolbarEditor = false
     @State private var showPageToolsEditor = false
     @State private var showAppLockSheet = false
     @State private var showBookshelfLockSheet = false
+    @State private var showNetworkSheet = false
+    @State private var showSyncSheet = false
+    @State private var showExtensionsSheet = false
+    @State private var showProfilesSheet = false
+    @State private var settingsUpdateMessage: String? = nil
     @State private var confirmClearAllData = false
     @State private var confirmResetSettings = false
+
+    private var sheetColorScheme: ColorScheme {
+        model.preferences.pageColorScheme.resolvedSheetColorScheme
+    }
 
     var body: some View {
         NavigationStack {
             List {
                 // 0. VPN & Security DNS
                 Section {
-                    Button(action: onOpenNetwork) {
+                    Button {
+                        showNetworkSheet = true
+                    } label: {
                         Label("VPN · 보안 DNS (DoH / WireGuard)", systemImage: "network.badge.shield.half.filled")
                     }
                 }
@@ -3378,7 +3385,7 @@ struct SettingsSheet: View {
                                 Toggle("새 탭 열 때 키보드 자동 표시", isOn: $model.preferences.showKeyboardOnNewTab)
                                 Toggle("탭 전환 시 키보드 유지", isOn: $model.preferences.keepKeyboardAcrossTabSwitch)
                                 Toggle("앱 시작 시 이전 열린 탭 복원", isOn: $model.preferences.restoreTabs)
-                                Button("프로필 관리 (생성 · 아이콘 · 색상)...", action: onOpenProfiles)
+                                Button("프로필 관리 (생성 · 아이콘 · 색상)...") { showProfilesSheet = true }
                             }
                         }
                         .navigationTitle("탭 설정")
@@ -3446,7 +3453,9 @@ struct SettingsSheet: View {
                     }
 
                     // 5. Sync
-                    Button(action: onOpenSync) {
+                    Button {
+                        showSyncSheet = true
+                    } label: {
                         Label("동기화 (Google Drive · 암호화 파일)", systemImage: "arrow.triangle.2.circlepath.icloud")
                     }
 
@@ -3458,7 +3467,7 @@ struct SettingsSheet: View {
                                 Toggle("백그라운드 오디오 재생 허용", isOn: $model.preferences.backgroundAudio)
                                 Toggle("JavaScript 실행 허용", isOn: $model.preferences.javaScriptEnabled)
                                 Toggle("기본적으로 데스크톱 사이트 요청", isOn: $model.preferences.desktopModeDefault)
-                                Button("확장 기능 · 이미지 선로딩 · 유저스크립트", action: onOpenExtensions)
+                                Button("확장 기능 · 이미지 선로딩 · 유저스크립트") { showExtensionsSheet = true }
                             }
                             Section("워터마크 삭제 웹 도구 URL") {
                                 TextField("예: https://www.watermarkremover.io/ko", text: $model.preferences.watermarkRemoverUrl)
@@ -3487,7 +3496,9 @@ struct SettingsSheet: View {
                                 LabeledContent("앱 이름") { Text("Omyaru Browser") }
                                 LabeledContent("버전") { Text("v\(BrowserModel.appVersionName) (\(BrowserModel.appBuildNumber))") }
                                 LabeledContent("브라우저 엔진") { Text("Apple WebKit (WKWebView)") }
-                                Button("GitHub / AltStore 업데이트 확인", action: onCheckUpdates)
+                                Button("GitHub / AltStore 업데이트 확인") {
+                                    Task { settingsUpdateMessage = await onCheckUpdates() }
+                                }
                                 Button("GitHub 저장소 열기") {
                                     dismiss()
                                     model.open("https://github.com/omyeol/Omyaru-Browser")
@@ -3511,15 +3522,36 @@ struct SettingsSheet: View {
             }
             .sheet(isPresented: $showToolbarEditor) {
                 ToolbarEditorSheet(model: model)
+                    .preferredColorScheme(sheetColorScheme)
             }
             .sheet(isPresented: $showPageToolsEditor) {
                 PageToolsEditorSheet(model: model)
+                    .preferredColorScheme(sheetColorScheme)
             }
             .sheet(isPresented: $showAppLockSheet) {
                 AppLockSettingsSheet()
+                    .preferredColorScheme(sheetColorScheme)
             }
             .sheet(isPresented: $showBookshelfLockSheet) {
                 BookshelfLockSettingsSheet()
+                    .preferredColorScheme(sheetColorScheme)
+            }
+            .sheet(isPresented: $showNetworkSheet) {
+                NetworkPrivacySheet(model: model)
+                    .preferredColorScheme(sheetColorScheme)
+            }
+            .sheet(isPresented: $showSyncSheet) {
+                DriveSyncSheet(browser: model, shelf: .shared)
+                    .preferredColorScheme(sheetColorScheme)
+            }
+            .sheet(isPresented: $showExtensionsSheet) {
+                ExtensionSettingsSheet(model: model)
+                    .preferredColorScheme(sheetColorScheme)
+            }
+            .sheet(isPresented: $showProfilesSheet) {
+                ProfileManagerSheet()
+                    .environmentObject(model)
+                    .preferredColorScheme(sheetColorScheme)
             }
             .confirmationDialog("방문 기록·쿠키·캐시·미리보기를 모두 삭제할까요?", isPresented: $confirmClearAllData, titleVisibility: .visible) {
                 Button("모두 삭제", role: .destructive) { Task { await model.clearBrowsingData() } }
@@ -3529,7 +3561,13 @@ struct SettingsSheet: View {
                 Button("초기화", role: .destructive) { model.resetAllPreferences() }
                 Button("취소", role: .cancel) {}
             }
+            .alert("업데이트 확인", isPresented: Binding(get: { settingsUpdateMessage != nil }, set: { if !$0 { settingsUpdateMessage = nil } })) {
+                Button("확인", role: .cancel) { settingsUpdateMessage = nil }
+            } message: {
+                Text(settingsUpdateMessage ?? "")
+            }
         }
+        .preferredColorScheme(sheetColorScheme)
     }
 }
 
