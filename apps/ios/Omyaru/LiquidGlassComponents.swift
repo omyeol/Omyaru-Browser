@@ -624,6 +624,7 @@ struct LiquidGlassTabOverviewMenuPopover: View {
     var onMoveSelected: () -> Void
     var onCloseSelected: () -> Void
     var onToggleGridList: () -> Void
+    var onCloseOtherTabs: () -> Void
     var onCloseAllTabs: () -> Void
 
     @State private var profilesExpanded = false
@@ -742,8 +743,6 @@ struct LiquidGlassTabOverviewMenuPopover: View {
                     onDismiss()
                 }
 
-                Divider().background(Color.white.opacity(0.14))
-
                 GlassMenuRow(
                     title: useGridLayout ? "리스트 보기" : "그리드 보기",
                     systemImage: useGridLayout ? "list.bullet.rectangle" : "square.grid.2x2"
@@ -759,11 +758,25 @@ struct LiquidGlassTabOverviewMenuPopover: View {
                     }
                 }
 
+                Divider().background(Color.white.opacity(0.14))
+
+                if model.visibleTabs.count > 1 {
+                    GlassMenuRow(
+                        title: "다른 탭 닫기",
+                        systemImage: "xmark.circle",
+                        iconColor: Color(red: 1.0, green: 0.36, blue: 0.36),
+                        textColor: Color(red: 1.0, green: 0.40, blue: 0.40)
+                    ) {
+                        onCloseOtherTabs()
+                        onDismiss()
+                    }
+                }
+
                 GlassMenuRow(
                     title: "모든 탭 닫기",
                     systemImage: "trash",
-                    iconColor: Color(red: 1.0, green: 0.38, blue: 0.38),
-                    textColor: Color(red: 1.0, green: 0.42, blue: 0.42)
+                    iconColor: Color(red: 1.0, green: 0.36, blue: 0.36),
+                    textColor: Color(red: 1.0, green: 0.40, blue: 0.40)
                 ) {
                     onDismiss()
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.14) { onCloseAllTabs() }
@@ -789,14 +802,12 @@ struct LiquidGlassTabOverviewMenuPopover: View {
 
 struct LiquidGlassTabCardContextPopover: View {
     let tab: BrowserTab
-    var canCloseOtherTabs: Bool = true
     var onDismiss: () -> Void
     var onCopyLink: () -> Void
     var onTogglePin: () -> Void
     var onDuplicate: () -> Void
     var onSelectTab: () -> Void
     var onMoveTab: () -> Void
-    var onCloseOtherTabs: () -> Void
     var onCloseTab: () -> Void
 
     private var hasWebURL: Bool {
@@ -830,6 +841,9 @@ struct LiquidGlassTabCardContextPopover: View {
                 onDismiss()
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.16) { onMoveTab() }
             }
+            Divider()
+                .background(Color.white.opacity(0.14))
+                .padding(.vertical, 3)
             GlassMenuRow(
                 title: "탭 닫기",
                 systemImage: "xmark",
@@ -838,20 +852,6 @@ struct LiquidGlassTabCardContextPopover: View {
             ) {
                 onCloseTab()
                 onDismiss()
-            }
-            if canCloseOtherTabs {
-                Divider()
-                    .background(Color.white.opacity(0.14))
-                    .padding(.vertical, 3)
-                GlassMenuRow(
-                    title: "다른 탭 닫기",
-                    systemImage: "xmark",
-                    iconColor: Color(red: 1.0, green: 0.34, blue: 0.34),
-                    textColor: Color(red: 1.0, green: 0.38, blue: 0.38)
-                ) {
-                    onCloseOtherTabs()
-                    onDismiss()
-                }
             }
         }
         .padding(.vertical, 6)

@@ -1,3 +1,31 @@
+# 2026-11-24 Antigravity: iOS 전체 화면 Edge-to-Edge(노치·다이나믹 아일랜드·하단) + 위아래 끝 미세 블러 + 그룹별 마지막 탭 기억 + `다른 탭 닫기` 상단 메뉴 이동 + 추적 방지 기본값 `표준` + 설정 내 앱·책장 잠금 통합/암호 필수/아이폰 잠금 연동 (`iOS build 94`)
+
+- 작업 워크스페이스: `E:/DEV/CODEX/BROWSER`
+- 사용자 요청:
+  1. 화면 위(노치·다이나믹 아일랜드 양 옆 포함)와 아래가 꽉 차지 않는 문제 해결 + 위아래 끝에 은은한 블러 효과 적용
+  2. 탭 그룹 변경 시 맨 아래 탭이 아니라 해당 그룹에서 마지막으로 열었던 탭이 선택되도록 개선
+  3. 탭 카드 컨텍스트 메뉴의 `다른 탭 닫기`를 탭 목록 우측 상단 `⋯` 메뉴의 `모든 탭 닫기` 위로 이동, `리스트 보기`를 위쪽 그룹과 함께 묶기
+  4. 추적 방지 수준 기본값을 `표준`으로 변경
+  5. 앱 잠금에 `아이폰이 잠기면 같이 잠금` 옵션 추가, 앱 잠금·책장 잠금 모두 PIN 또는 비밀번호를 지정해야만 켤 수 있도록 강제, 설정 창을 닫고 나가지 않고 설정 내부에서 바로 열리고 `완료` 시 설정 창으로 복귀하도록 개선
+- 해결 (`apps/ios/Omyaru/BrowserViews.swift`, `OmyaruApp.swift`, `LiquidGlassComponents.swift`, `AppLockAndPrivacy.swift`, `Info.plist`):
+  1. **Edge-to-Edge 전체 화면 + 상하단 끝 미세 블러 (`BrowserViews.swift`, `OmyaruApp.swift`)**:
+     - 기존 메인 `ZStack`의 `.clipShape(RoundedRectangle(...))`이 안전 영역(상단 다이나믹 아일랜드·하단 홈 바)을 잘라내던 문제를 제거하고 `BrowserWebView`에 `.ignoresSafeArea()`(전방향) 및 `WKWebView.scrollView.contentInsetAdjustmentBehavior = .scrollableAxes` + `underPageBackgroundColor = nil`을 적용해 노치·다이나믹 아일랜드 양 옆과 하단 끝까지 100% 꽉 차게 확장.
+     - 상단(`topEdgeBlurOverlay`)·하단(`bottomEdgeBlurOverlay`) 끝에 `.ultraThinMaterial` + 부드러운 알파 그라데이션 마스크(`.allowsHitTesting(false)`)를 배치해 끝부분만 은은하게 블러 처리.
+  2. **탭 그룹별 마지막 활성 탭 기억 (`OmyaruApp.swift`)**:
+     - `lastActiveTabByGroup` 맵 신설 및 `PersistedState` 하위 호환 영속화(`lastActiveTabByGroup: [String: String]?`). `selectGroup(_:)`가 `visibleTabs.first`(맨 아래 탭) 대신 해당 그룹의 마지막으로 열었던 탭을 복원(기록 없을 시 가장 최근 탭 `visibleTabs.last`).
+  3. **탭 목록 메뉴 구조 정리 (`LiquidGlassComponents.swift`, `BrowserViews.swift`)**:
+     - 탭 카드 컨텍스트 메뉴(`LiquidGlassTabCardContextPopover`)에서 `다른 탭 닫기` 제거.
+     - 우측 상단 `⋯` 메뉴(`LiquidGlassTabOverviewMenuPopover`)에서 `리스트 보기` / `그리드 보기`(및 `닫은 탭 복원`)를 위쪽 항목(`탭 그룹 관리 · 탭 선택 · 링크 복사하기 · 탭을 북마크에 추가`)과 함께 묶고, 구분선 아래 파괴적 영역에 `다른 탭 닫기`(빨강, 탭 2개 이상일 때) → `모든 탭 닫기`(빨강) 순으로 배치.
+  4. **추적 방지 기본값 `표준` (`OmyaruApp.swift`)**:
+     - `BrowserPreferences.trackingProtection` 기본값 및 `init(from:)` 폴백을 `.strict` → `.standard`(`표준`)로 변경.
+  5. **앱 잠금·책장 잠금 개선 (`AppLockAndPrivacy.swift`, `BrowserViews.swift`)**:
+     - `AppLockManager`에 `lockOnDeviceLock`(`아이폰이 잠기면 같이 잠금`, `UIApplication.protectedDataWillBecomeUnavailableNotification` 구독) 추가.
+     - `AppLockManager` 및 `BookshelfLockManager` 모두 `hasSecret`(PIN 4~6자리 또는 비밀번호) 없이는 잠금을 켤 수 없도록 `trySetEnabled(_:)`·초기화·UI 토글 가드 강제(전용 암호 없이 켜기/암호만 삭제하는 경로 제거).
+     - `SettingsSheet` 내부에서 `AppLockSettingsSheet` / `BookshelfLockSettingsSheet`를 직접 `.sheet`로 표시하도록 변경(설정 창이 닫히지 않으며, `완료` 시 바로 설정 창으로 복귀 + 현재 `사용 중`/`꺼짐` 상태 표시).
+  - iOS 빌드 번호: `93` → **`94`** (`Info.plist`, `OmyaruApp.swift`).
+
+---
+
 # 2026-11-24 Antigravity: iOS 탭 목록 릴리스 전용 컨텍스트 메뉴(`autoPeekTask` 제거) + 하단 탭 그룹 필 스와이프 전환 (`iOS build 93`)
 
 - 작업 워크스페이스: `E:/DEV/CODEX/BROWSER`

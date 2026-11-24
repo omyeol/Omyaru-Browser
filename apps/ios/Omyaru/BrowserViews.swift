@@ -26,8 +26,6 @@ struct BrowserScreen: View {
     @State private var showDriveSync = false
     @State private var showExtensions = false
     @State private var showNetworkPrivacy = false
-    @State private var showAppLock = false
-    @State private var showBookshelfLock = false
     @State private var showSettings = false
     @State private var showProfiles = false
     @State private var showPageTools = false
@@ -49,7 +47,7 @@ struct BrowserScreen: View {
         ZStack {
             Color(red: 0.08, green: 0.08, blue: 0.09).ignoresSafeArea()
 
-            // Main Browser Surface + Floating Toolbar (Smoothly Hero-Zooms & Blurs behind Fullscreen TabOverview!)
+            // Main Browser Surface + Floating Toolbar (Full Edge-to-Edge incl. Notch/Dynamic Island & Bottom Home Bar + Subtle Edge Blur!)
             ZStack {
                 if let tab = model.activeTab {
                     if model.isStartPage {
@@ -58,7 +56,7 @@ struct BrowserScreen: View {
                         ZStack {
                             BrowserWebView(webView: model.webView(for: tab.id, loadIfNeeded: true))
                                 .id(tab.id)
-                                .ignoresSafeArea(edges: .bottom)
+                                .ignoresSafeArea()
 
                             FastScrollBarOverlay(model: model)
                                 .padding(.top, isBottomBar ? 8 : (model.isChromeCollapsed ? 58 : 124))
@@ -70,6 +68,15 @@ struct BrowserScreen: View {
                         }
                     }
                 }
+
+                // Subtle Top & Bottom Edge Blur (feathers status bar / Dynamic Island sides & bottom bar seamlessly!)
+                VStack(spacing: 0) {
+                    topEdgeBlurOverlay
+                    Spacer(minLength: 0)
+                    bottomEdgeBlurOverlay
+                }
+                .ignoresSafeArea()
+                .allowsHitTesting(false)
 
                 if showFindBar && !model.isStartPage {
                     VStack {
@@ -104,7 +111,6 @@ struct BrowserScreen: View {
                 .animation(.spring(response: 0.30, dampingFraction: 0.84), value: model.isChromeCollapsed)
                 .animation(.easeInOut(duration: 0.2), value: model.status)
             }
-            .clipShape(RoundedRectangle(cornerRadius: showTabs ? 28 : 0, style: .continuous))
             .scaleEffect(showTabs ? 0.88 : 1.0)
             .blur(radius: showTabs ? 18 : 0)
             .opacity(showTabs ? 0.52 : 1.0)
@@ -265,20 +271,12 @@ struct BrowserScreen: View {
         .sheet(isPresented: $showNetworkPrivacy) {
             NetworkPrivacySheet(model: model)
         }
-        .sheet(isPresented: $showAppLock) {
-            AppLockSettingsSheet()
-        }
-        .sheet(isPresented: $showBookshelfLock) {
-            BookshelfLockSettingsSheet()
-        }
         .sheet(isPresented: $showSettings) {
             SettingsSheet(
                 model: model,
                 onOpenSync: { showSettings = false; DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { showDriveSync = true } },
                 onOpenExtensions: { showSettings = false; DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { showExtensions = true } },
                 onOpenNetwork: { showSettings = false; DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { showNetworkPrivacy = true } },
-                onOpenAppLock: { showSettings = false; DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { showAppLock = true } },
-                onOpenBookshelfLock: { showSettings = false; DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { showBookshelfLock = true } },
                 onOpenProfiles: { showSettings = false; DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { showProfiles = true } },
                 onCheckUpdates: { Task { await checkUpdates() } }
             )
@@ -339,6 +337,53 @@ struct BrowserScreen: View {
         .onAppear {
             syncAddressField()
         }
+    }
+
+    private var screenSafeAreaInsets: UIEdgeInsets {
+        let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+        return scenes.first(where: { $0.activationState == .foregroundActive })?.keyWindow?.safeAreaInsets
+            ?? scenes.first?.keyWindow?.safeAreaInsets
+            ?? UIEdgeInsets(top: 54, left: 0, bottom: 34, right: 0)
+    }
+
+    private var topEdgeBlurOverlay: some View {
+        let h = max(56, screenSafeAreaInsets.top + 16)
+        return Rectangle()
+            .fill(.ultraThinMaterial)
+            .opacity(0.88)
+            .frame(height: h)
+            .mask(
+                LinearGradient(
+                    stops: [
+                        .init(color: .black, location: 0.0),
+                        .init(color: .black.opacity(0.72), location: 0.56),
+                        .init(color: .black.opacity(0.22), location: 0.82),
+                        .init(color: .clear, location: 1.0)
+                    ],
+                    startPoint: .top,
+                    endPoint: .bottom
+                )
+            )
+    }
+
+    private var bottomEdgeBlurOverlay: some View {
+        let h = max(46, screenSafeAreaInsets.bottom + 24)
+        return Rectangle()
+            .fill(.ultraThinMaterial)
+            .opacity(0.88)
+            .frame(height: h)
+            .mask(
+                LinearGradient(
+                    stops: [
+                        .init(color: .clear, location: 0.0),
+                        .init(color: .black.opacity(0.22), location: 0.24),
+                        .init(color: .black.opacity(0.72), location: 0.58),
+                        .init(color: .black, location: 1.0)
+                    ],
+                    startPoint: .top,
+                    endPoint: .bottom
+                )
+            )
     }
 
     private func syncAddressField() {
@@ -1506,6 +1551,15 @@ struct TabOverview: View {
                             useGridLayout.toggle()
                         }
                     },
+                    onCloseOtherTabs: {
+                        let groupTabs = displayedTabs(for: pagedGroupID)
+                        let keepID = groupTabs.first(where: { $0.id == model.activeID })?.id ?? groupTabs.first?.id
+                        if let keepID {
+                            withAnimation(.spring(response: 0.28, dampingFraction: 0.82)) {
+                                model.closeOtherTabs(keeping: keepID)
+                            }
+                        }
+                    },
                     onCloseAllTabs: { showingCloseAllConfirm = true }
                 )
             }
@@ -1795,12 +1849,10 @@ struct TabOverview: View {
     }
 
     private func safariTabContextOverlay(for targetTab: BrowserTab) -> some View {
-        let groupCount = model.tabs(forGroup: targetTab.groupID).count
-        let canCloseOthers = groupCount > 1
         let trimmedURL = targetTab.url.trimmingCharacters(in: .whitespacesAndNewlines)
         let hasWebURL = !trimmedURL.isEmpty && trimmedURL != "about:blank"
-        let estimatedRows: CGFloat = 4 + (hasWebURL ? 1 : 0) + ((hasWebURL || targetTab.isPinned) ? 1 : 0) + (canCloseOthers ? 1 : 0)
-        let estimatedMenuH: CGFloat = estimatedRows * 44 + (canCloseOthers ? 10 : 0) + 14
+        let estimatedRows: CGFloat = 4 + (hasWebURL ? 1 : 0) + ((hasWebURL || targetTab.isPinned) ? 1 : 0)
+        let estimatedMenuH: CGFloat = estimatedRows * 44 + 24
         let menuWidth: CGFloat = 244
         let menuGap: CGFloat = 12
         let safe = windowSafeAreaInsets
@@ -1894,7 +1946,6 @@ struct TabOverview: View {
                 // Anchored Liquid Glass Context Menu directly beneath the lifted card!
                 LiquidGlassTabCardContextPopover(
                     tab: targetTab,
-                    canCloseOtherTabs: canCloseOthers,
                     onDismiss: {
                         dismissContextMenu()
                     },
@@ -1921,11 +1972,6 @@ struct TabOverview: View {
                     onMoveTab: {
                         batchMoveIDs = [targetTab.id]
                         showingBatchMove = true
-                    },
-                    onCloseOtherTabs: {
-                        withAnimation(.spring(response: 0.28, dampingFraction: 0.82)) {
-                            model.closeOtherTabs(keeping: targetTab.id)
-                        }
                     },
                     onCloseTab: {
                         withAnimation(.spring(response: 0.28, dampingFraction: 0.82)) {
@@ -3184,15 +3230,17 @@ struct PageToolsEditorSheet: View {
 struct SettingsSheet: View {
     @Environment(\.dismiss) private var dismiss
     @ObservedObject var model: BrowserModel
+    @ObservedObject private var appLock = AppLockManager.shared
+    @ObservedObject private var bookshelfLock = BookshelfLockManager.shared
     var onOpenSync: () -> Void
     var onOpenExtensions: () -> Void
     var onOpenNetwork: () -> Void
-    var onOpenAppLock: () -> Void
-    var onOpenBookshelfLock: () -> Void
     var onOpenProfiles: () -> Void
     var onCheckUpdates: () -> Void
     @State private var showToolbarEditor = false
     @State private var showPageToolsEditor = false
+    @State private var showAppLockSheet = false
+    @State private var showBookshelfLockSheet = false
     @State private var confirmClearAllData = false
     @State private var confirmResetSettings = false
 
@@ -3319,8 +3367,28 @@ struct SettingsSheet: View {
                                 Toggle("앱 종료 시 브라우징 데이터 자동 삭제", isOn: $model.preferences.clearDataOnExit)
                             }
                             Section("앱 잠금 및 화면 보호") {
-                                Button("앱 잠금 설정 (PIN · 비밀번호 · Face ID · 검은 화면 보호)", action: onOpenAppLock)
-                                Button("책장 잠금 설정 (잠금 시간 · 아이폰 잠금 연동 · Face ID)", action: onOpenBookshelfLock)
+                                Button {
+                                    showAppLockSheet = true
+                                } label: {
+                                    HStack {
+                                        Text("앱 잠금 설정 (PIN · 비밀번호 · 아이폰 잠금 연동)")
+                                        Spacer()
+                                        Text(appLock.isEnabled && appLock.hasSecret ? "사용 중" : "꺼짐")
+                                            .font(.caption)
+                                            .foregroundStyle(appLock.isEnabled && appLock.hasSecret ? .green : .secondary)
+                                    }
+                                }
+                                Button {
+                                    showBookshelfLockSheet = true
+                                } label: {
+                                    HStack {
+                                        Text("책장 잠금 설정 (잠금 시간 · 아이폰 잠금 연동)")
+                                        Spacer()
+                                        Text(bookshelfLock.isEnabled && bookshelfLock.hasSecret ? "사용 중" : "꺼짐")
+                                            .font(.caption)
+                                            .foregroundStyle(bookshelfLock.isEnabled && bookshelfLock.hasSecret ? .green : .secondary)
+                                    }
+                                }
                             }
                             Section("데이터 및 예외 관리") {
                                 Button("사이트별 콘텐츠 차단 예외 초기화 (\(model.preferences.contentBlockingExceptions.count)곳)", role: .destructive) {
@@ -3405,6 +3473,12 @@ struct SettingsSheet: View {
             }
             .sheet(isPresented: $showPageToolsEditor) {
                 PageToolsEditorSheet(model: model)
+            }
+            .sheet(isPresented: $showAppLockSheet) {
+                AppLockSettingsSheet()
+            }
+            .sheet(isPresented: $showBookshelfLockSheet) {
+                BookshelfLockSettingsSheet()
             }
             .confirmationDialog("방문 기록·쿠키·캐시·미리보기를 모두 삭제할까요?", isPresented: $confirmClearAllData, titleVisibility: .visible) {
                 Button("모두 삭제", role: .destructive) { Task { await model.clearBrowsingData() } }

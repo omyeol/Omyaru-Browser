@@ -520,7 +520,7 @@ struct BrowserPreferences: Codable, Equatable {
     var showTabThumbnails: Bool = true
 
     // Privacy & Security
-    var trackingProtection: TrackingProtectionLevel = .strict
+    var trackingProtection: TrackingProtectionLevel = .standard
     var cookiePolicy: CookiePolicyLevel = .isolateCrossSite
     var globalPrivacyControl: Bool = true
     var automaticHTTPS: Bool = true
@@ -593,7 +593,7 @@ struct BrowserPreferences: Codable, Equatable {
         openLinksInNewTab = try c.decodeIfPresent(Bool.self, forKey: .openLinksInNewTab) ?? true
         showTabThumbnails = try c.decodeIfPresent(Bool.self, forKey: .showTabThumbnails) ?? true
 
-        trackingProtection = try c.decodeIfPresent(TrackingProtectionLevel.self, forKey: .trackingProtection) ?? .strict
+        trackingProtection = try c.decodeIfPresent(TrackingProtectionLevel.self, forKey: .trackingProtection) ?? .standard
         cookiePolicy = try c.decodeIfPresent(CookiePolicyLevel.self, forKey: .cookiePolicy) ?? .isolateCrossSite
         globalPrivacyControl = try c.decodeIfPresent(Bool.self, forKey: .globalPrivacyControl) ?? true
         automaticHTTPS = try c.decodeIfPresent(Bool.self, forKey: .automaticHTTPS) ?? true
@@ -629,7 +629,7 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
     static let defaultProfileID = UUID(uuidString: "00000000-0000-0000-0000-000000000010")!
     static let defaultGroupID = UUID(uuidString: "00000000-0000-0000-0000-000000000002")!
     static let appVersionName = "0.15.18"
-    static let appBuildNumber = 93
+    static let appBuildNumber = 94
 
     var isApplyingRemoteSync: Bool = false
 
@@ -677,6 +677,7 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
 
     private var webViews: [UUID: WKWebView] = [:]
     private var loadedTabIDs: Set<UUID> = []
+    private var lastActiveTabByGroup: [UUID: UUID] = [:]
     private var compiledContentRuleList: WKContentRuleList? = nil
     private var lastScrollOffsetY: CGFloat = 0
     private var toolbarScrollAccumulator: CGFloat = 0
@@ -701,6 +702,7 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
         var userScripts: [UserScriptExtension]
         var wireGuardProfiles: [WireGuardProfile]
         var blockedTrackerCount: Int
+        var lastActiveTabByGroup: [String: String]? = nil
     }
 
     override init() {
@@ -738,6 +740,15 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
             userScripts = saved.userScripts
             wireGuardProfiles = saved.wireGuardProfiles
             blockedTrackerCount = saved.blockedTrackerCount
+            if let savedLastMap = saved.lastActiveTabByGroup {
+                var parsed: [UUID: UUID] = [:]
+                for (gk, tv) in savedLastMap {
+                    if let g = UUID(uuidString: gk), let t = UUID(uuidString: tv) {
+                        parsed[g] = t
+                    }
+                }
+                lastActiveTabByGroup = parsed
+            }
         } else {
             let initialTab = BrowserTab(profileID: Self.defaultProfileID, groupID: Self.defaultGroupID)
             profiles = [defaultProfile]
@@ -754,6 +765,7 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
             blockedTrackerCount = 0
         }
         super.init()
+        rememberActiveTab(activeID)
         if let vData = UserDefaults.standard.data(forKey: Self.visitsKey),
            let decodedVisits = try? JSONDecoder().decode([String: [UrlSuggestionRecord]].self, from: vData) {
             var map: [UUID: [UrlSuggestionRecord]] = [:]
@@ -902,7 +914,14 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
     // MARK: - Persistence & Cache Management
 
     func persist() {
+        rememberActiveTab(activeID)
         let regularTabs = tabs.filter { !$0.isPrivate }
+        var serializedLastMap: [String: String] = [:]
+        for (gid, tid) in lastActiveTabByGroup where gid != Self.privateGroupID {
+            if regularTabs.contains(where: { $0.id == tid }) {
+                serializedLastMap[gid.uuidString] = tid.uuidString
+            }
+        }
         let state = PersistedState(
             profiles: profiles,
             groups: groups,
@@ -915,7 +934,8 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
             history: Array(history.prefix(600)),
             userScripts: userScripts,
             wireGuardProfiles: wireGuardProfiles,
-            blockedTrackerCount: blockedTrackerCount
+            blockedTrackerCount: blockedTrackerCount,
+            lastActiveTabByGroup: serializedLastMap
         )
         if let data = try? JSONEncoder().encode(state) {
             UserDefaults.standard.set(data, forKey: Self.stateKey)
@@ -1079,8 +1099,10 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
         view.uiDelegate = self
         view.scrollView.delegate = self
         view.scrollView.showsVerticalScrollIndicator = false
+        view.scrollView.contentInsetAdjustmentBehavior = .scrollableAxes
         view.isOpaque = false
         view.backgroundColor = UIColor(red: 0.09, green: 0.075, blue: 0.067, alpha: 1.0)
+        view.underPageBackgroundColor = nil
         applyContentInsets(to: view)
         if tab?.isDesktopMode == true || preferences.desktopModeDefault {
             view.customUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15"
@@ -1611,6 +1633,13 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
         status = "탭을 바로 뒤에 복제했습니다."
     }
 
+    private func rememberActiveTab(_ tabID: UUID) {
+        if let tab = tabs.first(where: { $0.id == tabID }) {
+            let gid = tab.isPrivate ? Self.privateGroupID : tab.groupID
+            lastActiveTabByGroup[gid] = tabID
+        }
+    }
+
     func select(_ id: UUID) {
         guard let tab = tabs.first(where: { $0.id == id }) else { return }
         captureSnapshot(for: activeID)
@@ -1625,6 +1654,7 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
             activeProfileID = tab.profileID
             activeGroupID = tab.groupID
         }
+        rememberActiveTab(id)
         _ = webView(for: id, loadIfNeeded: true)
         persist()
     }
@@ -1743,9 +1773,16 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
     }
 
     func selectGroup(_ id: UUID) {
+        rememberActiveTab(activeID)
         activeGroupID = id
-        if let existing = visibleTabs.first {
+        let groupVisible = visibleTabs
+        if let rememberedID = lastActiveTabByGroup[id],
+           let remembered = groupVisible.first(where: { $0.id == rememberedID }) {
+            activeID = remembered.id
+            _ = webView(for: remembered.id, loadIfNeeded: true)
+        } else if let existing = groupVisible.last {
             activeID = existing.id
+            lastActiveTabByGroup[id] = existing.id
             _ = webView(for: existing.id, loadIfNeeded: true)
         } else {
             _ = newTab()
