@@ -647,7 +647,7 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
     static let defaultProfileID = UUID(uuidString: "00000000-0000-0000-0000-000000000010")!
     static let defaultGroupID = UUID(uuidString: "00000000-0000-0000-0000-000000000002")!
     static let appVersionName = "0.15.18"
-    static let appBuildNumber = 98
+    static let appBuildNumber = 99
 
     var isApplyingRemoteSync: Bool = false
 
@@ -702,6 +702,7 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
     private var loadedTabIDs: Set<UUID> = []
     private var lastActiveTabByGroup: [UUID: UUID] = [:]
     private var pullRefreshStartedAt: [UUID: Date] = [:]
+    private var frozenInsetTabIDs: Set<UUID> = []
     var tabCardThumbRects: [UUID: CGRect] = [:]
     var tabCardIsHeroMap: [UUID: Bool] = [:]
     private var compiledContentRuleList: WKContentRuleList? = nil
@@ -715,7 +716,7 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
     private static let prefsKey = "omyaru.ios.preferences.v3"
     private static let visitsKey = "omyaru.ios.url_suggestions.v1"
     private static let snapshotsVersionKey = "omyaru.ios.snapshots.version"
-    private static let currentSnapshotsVersion = 2
+    private static let currentSnapshotsVersion = 3
 
     private struct PersistedState: Codable {
         var profiles: [BrowserProfile]
@@ -1230,12 +1231,14 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
 
     func captureSnapshot(for id: UUID) {
         guard preferences.showTabThumbnails, let view = webViews[id],
-              let tab = tabs.first(where: { $0.id == id }), tab.url != "about:blank" else { return }
+              let tab = tabs.first(where: { $0.id == id }), tab.url != "about:blank",
+              view.bounds.width > 10, view.bounds.height > 10 else { return }
         let config = WKSnapshotConfiguration()
-        config.snapshotWidth = NSNumber(value: Double(min(UIScreen.main.bounds.width * 2.0, 780)))
-        let topSafe = view.safeAreaInsets.top
-        if topSafe > 4 && view.bounds.height > topSafe + 120 {
-            config.rect = CGRect(x: 0, y: topSafe, width: view.bounds.width, height: view.bounds.height - topSafe)
+        config.snapshotWidth = NSNumber(value: Double(min(UIScreen.main.bounds.width * 1.6, 560)))
+        let svTop = view.scrollView.adjustedContentInset.top
+        let cropTop = svTop > 4 ? svTop : view.safeAreaInsets.top
+        if cropTop > 4 && view.bounds.height > cropTop + 120 {
+            config.rect = CGRect(x: 0, y: cropTop, width: view.bounds.width, height: view.bounds.height - cropTop)
         }
         view.takeSnapshot(with: config) { [weak self] image, _ in
             guard let self, let image else { return }
@@ -1249,29 +1252,31 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
         }
     }
 
-    /// Synchronous ~3ms live capture of the active WebView viewport for zero-latency Safari Hero Zoom morph!
-    func captureLiveHeroSnapshot(for id: UUID) -> UIImage? {
-        guard let tab = tabs.first(where: { $0.id == id }), tab.url != "about:blank" else {
-            return tabSnapshots[id]
+    /// Locks WKWebView's adjustedContentInset during Hero Zoom morph so moving clipView NEVER shifts webpage scroll offset by 59pt!
+    func freezeScrollInsetsForHeroMorph(for id: UUID, fallbackSafeTop: CGFloat) {
+        guard let view = webViews[id], !frozenInsetTabIDs.contains(id) else { return }
+        let sv = view.scrollView
+        let savedOffset = sv.contentOffset
+        let topInset = sv.adjustedContentInset.top > 4 ? sv.adjustedContentInset.top : fallbackSafeTop
+        let bottomInset = sv.adjustedContentInset.bottom
+        frozenInsetTabIDs.insert(id)
+        sv.contentInsetAdjustmentBehavior = .never
+        sv.contentInset = UIEdgeInsets(top: topInset, left: 0, bottom: bottomInset, right: 0)
+        sv.setContentOffset(savedOffset, animated: false)
+    }
+
+    func unfreezeAllHeroMorphScrollInsets() {
+        guard !frozenInsetTabIDs.isEmpty else { return }
+        let ids = frozenInsetTabIDs
+        frozenInsetTabIDs.removeAll()
+        for id in ids {
+            guard let view = webViews[id] else { continue }
+            let sv = view.scrollView
+            let savedOffset = sv.contentOffset
+            sv.contentInsetAdjustmentBehavior = .always
+            applyContentInsets(to: view)
+            sv.setContentOffset(savedOffset, animated: false)
         }
-        guard let view = webViews[id], view.bounds.width > 10, view.bounds.height > 10 else {
-            return tabSnapshots[id]
-        }
-        let topSafe = view.safeAreaInsets.top
-        let cropTop = (topSafe > 4 && view.bounds.height > topSafe + 120) ? topSafe : 0
-        let targetSize = CGSize(width: view.bounds.width, height: max(1, view.bounds.height - cropTop))
-        let format = UIGraphicsImageRendererFormat()
-        format.scale = min(UIScreen.main.scale, 2.0)
-        format.opaque = true
-        let renderer = UIGraphicsImageRenderer(size: targetSize, format: format)
-        let img = renderer.image { ctx in
-            ctx.cgContext.translateBy(x: 0, y: -cropTop)
-            view.drawHierarchy(in: view.bounds, afterScreenUpdates: false)
-        }
-        if preferences.showTabThumbnails {
-            tabSnapshots[id] = img
-        }
-        return img
     }
 
     // MARK: - Per-Site Content Blocking Toggle (Android PageToolsDialog Parity!)
@@ -1335,7 +1340,7 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
         view.uiDelegate = self
         view.scrollView.delegate = self
         view.scrollView.showsVerticalScrollIndicator = false
-        view.scrollView.contentInsetAdjustmentBehavior = .scrollableAxes
+        view.scrollView.contentInsetAdjustmentBehavior = .always
         view.scrollView.bounces = true
         view.scrollView.alwaysBounceVertical = true
         view.isOpaque = true
@@ -1367,6 +1372,9 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
     }
 
     func applyContentInsets(to webView: WKWebView) {
+        if let tid = id(for: webView), frozenInsetTabIDs.contains(tid) {
+            return
+        }
         let bottomInset: CGFloat
         let topInset: CGFloat
         if preferences.addressBarPosition == .bottom {
