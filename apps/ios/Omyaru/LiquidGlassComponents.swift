@@ -106,6 +106,10 @@ struct LiquidGlassMorphContainer<Content: View>: View {
     let alignment: Alignment
     let anchor: UnitPoint
     let edgeInsets: EdgeInsets
+    var animationResponse: Double = 0.30
+    var animationDamping: Double = 0.84
+    var initialScale: CGFloat = 0.42
+    var initialBlur: CGFloat = 10
     let onDismiss: () -> Void
     @ViewBuilder let content: () -> Content
 
@@ -116,7 +120,7 @@ struct LiquidGlassMorphContainer<Content: View>: View {
                     .ignoresSafeArea()
                     .contentShape(Rectangle())
                     .onTapGesture {
-                        withAnimation(.spring(response: 0.30, dampingFraction: 0.84)) {
+                        withAnimation(.spring(response: animationResponse, dampingFraction: animationDamping)) {
                             onDismiss()
                         }
                     }
@@ -127,18 +131,18 @@ struct LiquidGlassMorphContainer<Content: View>: View {
                     .transition(
                         .asymmetric(
                             insertion: .modifier(
-                                active: LiquidGlassBloomModifier(scale: 0.38, blur: 11, opacity: 0, anchor: anchor),
+                                active: LiquidGlassBloomModifier(scale: initialScale, blur: initialBlur, opacity: 0, anchor: anchor),
                                 identity: LiquidGlassBloomModifier(scale: 1.0, blur: 0, opacity: 1, anchor: anchor)
                             ),
                             removal: .modifier(
-                                active: LiquidGlassBloomModifier(scale: 0.42, blur: 10, opacity: 0, anchor: anchor),
+                                active: LiquidGlassBloomModifier(scale: min(0.92, initialScale + 0.04), blur: max(2, initialBlur - 1), opacity: 0, anchor: anchor),
                                 identity: LiquidGlassBloomModifier(scale: 1.0, blur: 0, opacity: 1, anchor: anchor)
                             )
                         )
                     )
             }
         }
-        .animation(.spring(response: 0.34, dampingFraction: 0.80), value: isPresented)
+        .animation(.spring(response: animationResponse, dampingFraction: animationDamping), value: isPresented)
     }
 }
 
@@ -208,7 +212,7 @@ private struct GlassMenuRow: View {
     }
 }
 
-// MARK: - 1. Page Tools Morphing Popover (Exact Frames 00:06 -> 00:07 -> 00:08)
+// MARK: - 1. Page Tools Morphing Popover (Exact Frames 00:06 -> 00:07 -> 00:08, User-Customizable!)
 
 struct LiquidGlassPageToolsPopover: View {
     @ObservedObject var model: BrowserModel
@@ -218,168 +222,295 @@ struct LiquidGlassPageToolsPopover: View {
     var onOpenCapture: () -> Void
     var onOpenWatermark: () -> Void
     var onOpenExtensions: () -> Void
+    var onToolbarAction: (ToolbarShortcutAction) -> Void
+    var onOpenDownloads: () -> Void
+    var onOpenDriveSync: () -> Void
+    var onOpenPageToolsEditor: () -> Void
 
     private var zoomPercent: Int {
         Int(((model.activeTab?.pageZoom ?? model.preferences.fontScale) * 100).rounded())
     }
 
-    var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            // Zoom Row: [-] [100%] [+]
-            HStack(spacing: 8) {
-                Button {
-                    model.setPageZoom((model.activeTab?.pageZoom ?? model.preferences.fontScale) - 0.05)
-                } label: {
-                    Image(systemName: "minus")
-                        .font(.system(size: 14, weight: .bold))
-                        .foregroundStyle(.white)
-                        .frame(width: 34, height: 32)
-                        .background(Color.white.opacity(0.12), in: Capsule())
-                }
-                .buttonStyle(LiquidGlassPressStyle())
+    private var activeItems: [PageToolsMenuItem] {
+        let configured = model.preferences.pageToolsItems
+        return configured.isEmpty ? PageToolsMenuItem.defaultOrder : configured
+    }
 
-                Button {
-                    model.setPageZoom(1.0)
-                } label: {
-                    Text("배율 \(zoomPercent)%")
-                        .font(.system(size: 13.5, weight: .semibold).monospacedDigit())
+    private var pinnedTopZoom: Bool {
+        activeItems.first == .zoomControls
+    }
+
+    private var scrollableItems: [PageToolsMenuItem] {
+        pinnedTopZoom ? Array(activeItems.dropFirst()) : activeItems
+    }
+
+    private var zoomControlsBar: some View {
+        HStack(spacing: 8) {
+            Button {
+                model.setPageZoom((model.activeTab?.pageZoom ?? model.preferences.fontScale) - 0.05)
+            } label: {
+                Image(systemName: "minus")
+                    .font(.system(size: 14, weight: .bold))
+                    .foregroundStyle(.white)
+                    .frame(width: 34, height: 32)
+                    .background(Color.white.opacity(0.12), in: Capsule())
+            }
+            .buttonStyle(LiquidGlassPressStyle())
+
+            Button {
+                model.setPageZoom(1.0)
+            } label: {
+                Text("배율 \(zoomPercent)%")
+                    .font(.system(size: 13.5, weight: .semibold).monospacedDigit())
+                    .foregroundStyle(.white)
+                    .frame(maxWidth: .infinity)
+                    .frame(height: 32)
+                    .background(Color.white.opacity(0.08), in: Capsule())
+            }
+            .buttonStyle(LiquidGlassPressStyle())
+
+            Button {
+                model.setPageZoom((model.activeTab?.pageZoom ?? model.preferences.fontScale) + 0.05)
+            } label: {
+                Image(systemName: "plus")
+                    .font(.system(size: 14, weight: .bold))
+                    .foregroundStyle(.white)
+                    .frame(width: 34, height: 32)
+                    .background(Color.white.opacity(0.12), in: Capsule())
+            }
+            .buttonStyle(LiquidGlassPressStyle())
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+    }
+
+    @ViewBuilder
+    private func rowView(for item: PageToolsMenuItem) -> some View {
+        switch item {
+        case .zoomControls:
+            zoomControlsBar
+
+        case .bookmarkEdit:
+            GlassMenuRow(
+                title: model.isCurrentBookmarked ? "북마크 편집…" : "북마크에 추가",
+                systemImage: model.isCurrentBookmarked ? "bookmark.fill" : "bookmark",
+                iconColor: model.isCurrentBookmarked ? Color(red: 0.45, green: 0.68, blue: 1.0) : .white
+            ) {
+                onDismiss()
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.14) { onBookmarkEdit() }
+            }
+
+        case .findInPage:
+            GlassMenuRow(title: "페이지에서 찾기", systemImage: "doc.text.magnifyingglass") {
+                onDismiss()
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.14) { onFindInPage() }
+            }
+
+        case .contentBlocking:
+            GlassMenuRow(
+                title: model.isContentBlockingDisabledForCurrentHost ? "콘텐츠 차단기 켜기" : "콘텐츠 차단기 끄기",
+                systemImage: "shield.lefthalf.filled",
+                iconColor: model.isContentBlockingDisabledForCurrentHost ? .orange : Color(red: 0.45, green: 0.68, blue: 1.0)
+            ) {
+                model.toggleContentBlockingForCurrentHost()
+                onDismiss()
+            }
+
+        case .desktopSite:
+            GlassMenuRow(
+                title: model.activeTab?.isDesktopMode == true ? "모바일 사이트 요청" : "데스크톱 사이트 요청",
+                systemImage: model.activeTab?.isDesktopMode == true ? "iphone" : "desktopcomputer"
+            ) {
+                model.toggleDesktopMode()
+                onDismiss()
+            }
+
+        case .capture:
+            GlassMenuRow(title: "실시간 영역 캡처", systemImage: "viewfinder") {
+                onDismiss()
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.14) { onOpenCapture() }
+            }
+
+        case .watermark:
+            GlassMenuRow(title: "워터마크 제거", systemImage: "wand.and.stars") {
+                onDismiss()
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.14) { onOpenWatermark() }
+            }
+
+        case .mediaPiP:
+            HStack(spacing: 6) {
+                let secs = model.preferences.pipSeekSeconds
+                Button { model.seekActiveMedia(by: -secs) } label: {
+                    Label("-\(secs)s", systemImage: "gobackward")
+                        .font(.caption2.weight(.semibold))
                         .foregroundStyle(.white)
                         .frame(maxWidth: .infinity)
-                        .frame(height: 32)
-                        .background(Color.white.opacity(0.08), in: Capsule())
+                        .padding(.vertical, 7)
+                        .background(Color.white.opacity(0.10), in: Capsule())
                 }
-                .buttonStyle(LiquidGlassPressStyle())
-
                 Button {
-                    model.setPageZoom((model.activeTab?.pageZoom ?? model.preferences.fontScale) + 0.05)
+                    model.enterActiveVideoPiP()
+                    onDismiss()
                 } label: {
-                    Image(systemName: "plus")
-                        .font(.system(size: 14, weight: .bold))
+                    Label("PiP", systemImage: "pip.enter")
+                        .font(.caption2.weight(.semibold))
                         .foregroundStyle(.white)
-                        .frame(width: 34, height: 32)
-                        .background(Color.white.opacity(0.12), in: Capsule())
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 7)
+                        .background(Color.white.opacity(0.10), in: Capsule())
                 }
-                .buttonStyle(LiquidGlassPressStyle())
+                Button { model.seekActiveMedia(by: secs) } label: {
+                    Label("+\(secs)s", systemImage: "goforward")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(.white)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 7)
+                        .background(Color.white.opacity(0.10), in: Capsule())
+                }
             }
+            .buttonStyle(LiquidGlassPressStyle())
             .padding(.horizontal, 14)
-            .padding(.vertical, 12)
+            .padding(.vertical, 8)
 
-            Divider().background(Color.white.opacity(0.14))
+        case .imagePreloader:
+            GlassMenuRow(
+                title: "이미지 고속 선로딩",
+                systemImage: "bolt.fill",
+                iconColor: model.preferences.enableImagePreloader ? Color(red: 0.35, green: 0.65, blue: 1.0) : .white.opacity(0.45),
+                trailingText: model.preferences.enableImagePreloader ? "켜짐" : "꺼짐"
+            ) {
+                model.preferences.enableImagePreloader.toggle()
+                model.savePreferences()
+                model.applyUserScriptsToAllWebViews()
+            }
+
+        case .userScripts:
+            ForEach(model.userScripts.prefix(3)) { script in
+                GlassMenuRow(
+                    title: script.name,
+                    systemImage: "puzzlepiece.extension.fill",
+                    iconColor: script.isEnabled ? Color(red: 0.35, green: 0.65, blue: 1.0) : .white.opacity(0.4),
+                    trailingText: script.isEnabled ? "ON" : "OFF"
+                ) {
+                    if let idx = model.userScripts.firstIndex(where: { $0.id == script.id }) {
+                        model.userScripts[idx].isEnabled.toggle()
+                        model.persist()
+                        model.applyUserScriptsToAllWebViews()
+                    }
+                }
+            }
+
+        case .extensions:
+            GlassMenuRow(title: "확장 프로그램 설정", systemImage: "puzzlepiece.extension") {
+                onDismiss()
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.14) { onOpenExtensions() }
+            }
+
+        case .bookshelf:
+            GlassMenuRow(title: "책장 열기", systemImage: "books.vertical") {
+                onDismiss()
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.14) { onToolbarAction(.bookshelf) }
+            }
+
+        case .bookmarks:
+            GlassMenuRow(title: "북마크 목록", systemImage: "book") {
+                onDismiss()
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.14) { onToolbarAction(.bookmarks) }
+            }
+
+        case .history:
+            GlassMenuRow(title: "방문 기록", systemImage: "clock") {
+                onDismiss()
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.14) { onToolbarAction(.history) }
+            }
+
+        case .downloads:
+            GlassMenuRow(
+                title: "다운로드",
+                systemImage: "arrow.down.circle",
+                trailingText: model.downloads.isEmpty ? nil : "\(model.downloads.count)"
+            ) {
+                onDismiss()
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.14) { onOpenDownloads() }
+            }
+
+        case .copyAddress:
+            GlassMenuRow(title: "주소 복사", systemImage: "doc.on.doc") {
+                onToolbarAction(.copyAddress)
+                onDismiss()
+            }
+
+        case .share:
+            GlassMenuRow(title: "공유", systemImage: "square.and.arrow.up") {
+                onDismiss()
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.14) { onToolbarAction(.share) }
+            }
+
+        case .duplicateTab:
+            GlassMenuRow(title: "현재 탭 복제", systemImage: "plus.square.on.square") {
+                if let active = model.activeTab { model.duplicateTab(active.id) }
+                onDismiss()
+            }
+
+        case .newTab:
+            GlassMenuRow(title: "새 탭", systemImage: "plus.square") {
+                onDismiss()
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.14) { onToolbarAction(.newTab) }
+            }
+
+        case .reopenClosedTab:
+            GlassMenuRow(title: "닫은 탭 다시 열기", systemImage: "arrow.uturn.backward") {
+                onToolbarAction(.reopenClosedTab)
+                onDismiss()
+            }
+
+        case .vpn:
+            GlassMenuRow(title: "VPN · 보안 DNS", systemImage: "network.badge.shield.half.filled") {
+                onDismiss()
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.14) { onToolbarAction(.vpn) }
+            }
+
+        case .driveSync:
+            GlassMenuRow(title: "Google Drive 동기화", systemImage: "arrow.triangle.2.circlepath.icloud") {
+                onDismiss()
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.14) { onOpenDriveSync() }
+            }
+
+        case .settings:
+            GlassMenuRow(title: "설정", systemImage: "gearshape") {
+                onDismiss()
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.14) { onToolbarAction(.settings) }
+            }
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            if pinnedTopZoom {
+                zoomControlsBar
+                    .padding(.vertical, 2)
+                Divider().background(Color.white.opacity(0.14))
+            }
 
             ScrollView(showsIndicators: false) {
                 VStack(spacing: 0) {
-                    GlassMenuRow(
-                        title: model.isCurrentBookmarked ? "북마크 편집…" : "북마크에 추가",
-                        systemImage: model.isCurrentBookmarked ? "bookmark.fill" : "bookmark",
-                        iconColor: model.isCurrentBookmarked ? Color(red: 0.45, green: 0.68, blue: 1.0) : .white
-                    ) {
-                        onDismiss()
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.14) { onBookmarkEdit() }
+                    ForEach(scrollableItems) { item in
+                        rowView(for: item)
                     }
 
-                    GlassMenuRow(title: "페이지에서 찾기", systemImage: "doc.text.magnifyingglass") {
-                        onDismiss()
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.14) { onFindInPage() }
-                    }
+                    Divider().background(Color.white.opacity(0.14)).padding(.vertical, 2)
 
                     GlassMenuRow(
-                        title: model.isContentBlockingDisabledForCurrentHost ? "콘텐츠 차단기 켜기" : "콘텐츠 차단기 끄기",
-                        systemImage: "shield.lefthalf.filled",
-                        iconColor: model.isContentBlockingDisabledForCurrentHost ? .orange : Color(red: 0.45, green: 0.68, blue: 1.0)
+                        title: "페이지 도구 편집",
+                        systemImage: "slider.horizontal.3",
+                        iconColor: .white.opacity(0.75)
                     ) {
-                        model.toggleContentBlockingForCurrentHost()
                         onDismiss()
-                    }
-
-                    GlassMenuRow(
-                        title: model.activeTab?.isDesktopMode == true ? "모바일 사이트 요청" : "데스크톱 사이트 요청",
-                        systemImage: model.activeTab?.isDesktopMode == true ? "iphone" : "desktopcomputer"
-                    ) {
-                        model.toggleDesktopMode()
-                        onDismiss()
-                    }
-
-                    GlassMenuRow(title: "실시간 영역 캡처", systemImage: "viewfinder") {
-                        onDismiss()
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.14) { onOpenCapture() }
-                    }
-
-                    GlassMenuRow(title: "워터마크 제거", systemImage: "wand.and.stars") {
-                        onDismiss()
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.14) { onOpenWatermark() }
-                    }
-
-                    // Compact Media PiP & Seek strip inside popover
-                    HStack(spacing: 6) {
-                        let secs = model.preferences.pipSeekSeconds
-                        Button { model.seekActiveMedia(by: -secs) } label: {
-                            Label("-\(secs)s", systemImage: "gobackward")
-                                .font(.caption2.weight(.semibold))
-                                .foregroundStyle(.white)
-                                .frame(maxWidth: .infinity)
-                                .padding(.vertical, 7)
-                                .background(Color.white.opacity(0.10), in: Capsule())
-                        }
-                        Button {
-                            model.enterActiveVideoPiP()
-                            onDismiss()
-                        } label: {
-                            Label("PiP", systemImage: "pip.enter")
-                                .font(.caption2.weight(.semibold))
-                                .foregroundStyle(.white)
-                                .frame(maxWidth: .infinity)
-                                .padding(.vertical, 7)
-                                .background(Color.white.opacity(0.10), in: Capsule())
-                        }
-                        Button { model.seekActiveMedia(by: secs) } label: {
-                            Label("+\(secs)s", systemImage: "goforward")
-                                .font(.caption2.weight(.semibold))
-                                .foregroundStyle(.white)
-                                .frame(maxWidth: .infinity)
-                                .padding(.vertical, 7)
-                                .background(Color.white.opacity(0.10), in: Capsule())
-                        }
-                    }
-                    .buttonStyle(LiquidGlassPressStyle())
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 8)
-
-                    Divider().background(Color.white.opacity(0.14))
-
-                    // Extensions section (mirrors Stay / 유니콘 / 확장 프로그램 설정 in video frame 00:07!)
-                    GlassMenuRow(
-                        title: "이미지 고속 선로딩",
-                        systemImage: "bolt.fill",
-                        iconColor: model.preferences.enableImagePreloader ? Color(red: 0.35, green: 0.65, blue: 1.0) : .white.opacity(0.45),
-                        trailingText: model.preferences.enableImagePreloader ? "켜짐" : "꺼짐"
-                    ) {
-                        model.preferences.enableImagePreloader.toggle()
-                        model.savePreferences()
-                        model.applyUserScriptsToAllWebViews()
-                    }
-
-                    ForEach(model.userScripts.prefix(3)) { script in
-                        GlassMenuRow(
-                            title: script.name,
-                            systemImage: "puzzlepiece.extension.fill",
-                            iconColor: script.isEnabled ? Color(red: 0.35, green: 0.65, blue: 1.0) : .white.opacity(0.4),
-                            trailingText: script.isEnabled ? "ON" : "OFF"
-                        ) {
-                            if let idx = model.userScripts.firstIndex(where: { $0.id == script.id }) {
-                                model.userScripts[idx].isEnabled.toggle()
-                                model.persist()
-                                model.applyUserScriptsToAllWebViews()
-                            }
-                        }
-                    }
-
-                    GlassMenuRow(title: "확장 프로그램 설정", systemImage: "puzzlepiece.extension") {
-                        onDismiss()
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.14) { onOpenExtensions() }
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.14) { onOpenPageToolsEditor() }
                     }
                 }
             }
-            .frame(maxHeight: 420)
+            .frame(maxHeight: 440)
         }
         .frame(width: 268)
         .background(

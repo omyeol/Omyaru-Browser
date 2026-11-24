@@ -33,6 +33,7 @@ struct BrowserScreen: View {
     @State private var showPageTools = false
     @State private var showBrowserMenu = false
     @State private var showToolbarEditor = false
+    @State private var showPageToolsEditor = false
     @State private var showCloseAllConfirm = false
     @State private var sharePayload: [Any]? = nil
     @State private var showFindBar = false
@@ -123,13 +124,17 @@ struct BrowserScreen: View {
                 LiquidGlassPageToolsPopover(
                     model: model,
                     onDismiss: {
-                        withAnimation(.spring(response: 0.30, dampingFraction: 0.84)) { showPageTools = false }
+                        withAnimation(.spring(response: 0.26, dampingFraction: 0.86)) { showPageTools = false }
                     },
                     onBookmarkEdit: { showBookmarkEdit = true },
                     onFindInPage: { showFindBar = true },
                     onOpenCapture: { showLiveCapture = true },
                     onOpenWatermark: { showWatermarkRemover = true },
-                    onOpenExtensions: { showExtensions = true }
+                    onOpenExtensions: { showExtensions = true },
+                    onToolbarAction: { action in triggerToolbarShortcut(action) },
+                    onOpenDownloads: { showDownloads = true },
+                    onOpenDriveSync: { showDriveSync = true },
+                    onOpenPageToolsEditor: { showPageToolsEditor = true }
                 )
             }
 
@@ -242,6 +247,9 @@ struct BrowserScreen: View {
         }
         .sheet(isPresented: $showToolbarEditor) {
             ToolbarEditorSheet(model: model)
+        }
+        .sheet(isPresented: $showPageToolsEditor) {
+            PageToolsEditorSheet(model: model)
         }
         .sheet(isPresented: $showCloseAllConfirm) {
             CloseAllTabsCountdownSheet(tabCount: model.visibleTabs.count) {
@@ -797,9 +805,9 @@ struct BrowserScreen: View {
                 }
                 .buttonStyle(LiquidGlassPressStyle())
                 .simultaneousGesture(
-                    LongPressGesture(minimumDuration: 0.5).onEnded { _ in
+                    LongPressGesture(minimumDuration: 0.45).onEnded { _ in
                         UIImpactFeedbackGenerator(style: .medium).impactOccurred()
-                        showToolbarEditor = true
+                        showPageToolsEditor = true
                     }
                 )
 
@@ -1215,6 +1223,132 @@ private struct TabCardFramePreferenceKey: PreferenceKey {
     }
 }
 
+private final class TabCardTouchView: UIView {
+    var excludeTopRightSize: CGFloat = 0
+
+    override func point(inside point: CGPoint, with event: UIEvent?) -> Bool {
+        if excludeTopRightSize > 0,
+           point.x >= bounds.width - excludeTopRightSize,
+           point.y <= excludeTopRightSize {
+            return false
+        }
+        return super.point(inside: point, with: event)
+    }
+}
+
+/// Native UIKit Tap + Continuous LongPress surface for TabOverview cards:
+/// - Eliminates SwiftUI SequenceGesture's ~0.7-1.0s inter-gesture timeout when lifting straight up without dragging!
+/// - Fires `.began` at 0.18s (snappy hold), tracks 60/120Hz `.changed` drag in window coordinates, and fires `.ended` with 0ms latency on finger-up!
+/// - Lets ScrollView vertical scrolling and TabView horizontal paging win natively whenever the finger moves before 0.18s.
+private struct TabCardGestureOverlay: UIViewRepresentable {
+    var isLongPressEnabled: Bool
+    var excludeTopRightCloseSize: CGFloat
+    var onTap: () -> Void
+    var onLongPressBegan: (CGPoint) -> Void
+    var onLongPressChanged: (CGPoint) -> Void
+    var onLongPressEnded: () -> Void
+    var onLongPressCancelled: () -> Void
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(
+            onTap: onTap,
+            onLongPressBegan: onLongPressBegan,
+            onLongPressChanged: onLongPressChanged,
+            onLongPressEnded: onLongPressEnded,
+            onLongPressCancelled: onLongPressCancelled
+        )
+    }
+
+    func makeUIView(context: Context) -> TabCardTouchView {
+        let view = TabCardTouchView(frame: .zero)
+        view.backgroundColor = .clear
+        view.isOpaque = false
+        view.isUserInteractionEnabled = true
+        view.excludeTopRightSize = excludeTopRightCloseSize
+
+        let tap = UITapGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.handleTap(_:)))
+        tap.cancelsTouchesInView = false
+        tap.delegate = context.coordinator
+
+        let lp = UILongPressGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.handleLongPress(_:)))
+        lp.minimumPressDuration = 0.18
+        lp.allowableMovement = 14
+        lp.cancelsTouchesInView = true
+        lp.isEnabled = isLongPressEnabled
+        lp.delegate = context.coordinator
+
+        tap.require(toFail: lp)
+
+        view.addGestureRecognizer(tap)
+        view.addGestureRecognizer(lp)
+        context.coordinator.tapRecognizer = tap
+        context.coordinator.longPressRecognizer = lp
+        return view
+    }
+
+    func updateUIView(_ uiView: TabCardTouchView, context: Context) {
+        uiView.excludeTopRightSize = excludeTopRightCloseSize
+        context.coordinator.onTap = onTap
+        context.coordinator.onLongPressBegan = onLongPressBegan
+        context.coordinator.onLongPressChanged = onLongPressChanged
+        context.coordinator.onLongPressEnded = onLongPressEnded
+        context.coordinator.onLongPressCancelled = onLongPressCancelled
+        if let lp = context.coordinator.longPressRecognizer,
+           lp.state != .began && lp.state != .changed {
+            lp.isEnabled = isLongPressEnabled
+        }
+    }
+
+    final class Coordinator: NSObject, UIGestureRecognizerDelegate {
+        var onTap: () -> Void
+        var onLongPressBegan: (CGPoint) -> Void
+        var onLongPressChanged: (CGPoint) -> Void
+        var onLongPressEnded: () -> Void
+        var onLongPressCancelled: () -> Void
+        weak var tapRecognizer: UITapGestureRecognizer?
+        weak var longPressRecognizer: UILongPressGestureRecognizer?
+
+        init(
+            onTap: @escaping () -> Void,
+            onLongPressBegan: @escaping (CGPoint) -> Void,
+            onLongPressChanged: @escaping (CGPoint) -> Void,
+            onLongPressEnded: @escaping () -> Void,
+            onLongPressCancelled: @escaping () -> Void
+        ) {
+            self.onTap = onTap
+            self.onLongPressBegan = onLongPressBegan
+            self.onLongPressChanged = onLongPressChanged
+            self.onLongPressEnded = onLongPressEnded
+            self.onLongPressCancelled = onLongPressCancelled
+        }
+
+        @objc func handleTap(_ gr: UITapGestureRecognizer) {
+            guard gr.state == .ended else { return }
+            onTap()
+        }
+
+        @objc func handleLongPress(_ gr: UILongPressGestureRecognizer) {
+            let screenPt = gr.location(in: gr.view?.window)
+            switch gr.state {
+            case .began:
+                onLongPressBegan(screenPt)
+            case .changed:
+                onLongPressChanged(screenPt)
+            case .ended:
+                onLongPressEnded()
+            case .cancelled, .failed:
+                onLongPressCancelled()
+            default:
+                break
+            }
+        }
+
+        func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer) -> Bool {
+            return false
+        }
+    }
+}
+
 struct TabOverview: View {
     @EnvironmentObject private var model: BrowserModel
     var onDismiss: () -> Void
@@ -1249,7 +1383,6 @@ struct TabOverview: View {
     @State private var dragSlotFrames: [CGRect] = []
     @State private var isSettlingDrop = false
     @State private var tabFrames: [UUID: CGRect] = [:]
-    @GestureState private var isTabHoldGestureActive = false
     @FocusState private var searchFieldFocused: Bool
 
     private func displayedTabs(for groupID: UUID) -> [BrowserTab] {
@@ -1374,6 +1507,10 @@ struct TabOverview: View {
                 alignment: .center,
                 anchor: .center,
                 edgeInsets: EdgeInsets(top: 120, leading: 24, bottom: 80, trailing: 24),
+                animationResponse: 0.20,
+                animationDamping: 0.88,
+                initialScale: 0.86,
+                initialBlur: 3,
                 onDismiss: { contextMenuTab = nil }
             ) {
                 if let targetTab = contextMenuTab {
@@ -1455,13 +1592,6 @@ struct TabOverview: View {
         }
         .onAppear {
             pagedGroupID = model.activeGroupID
-        }
-        .onChange(of: isTabHoldGestureActive) { active in
-            // SwiftUI cancels LongPress.sequenced(before: Drag) silently without firing .onEnded
-            // when the user lifts their finger straight up without dragging -> @GestureState ALWAYS resets to false!
-            if !active && draggingTabID != nil && !isSettlingDrop {
-                finalizeActiveTabDrag(in: displayedTabs(for: pagedGroupID))
-            }
         }
         .onChange(of: pagedGroupID) { nextGroup in
             if nextGroup != model.activeGroupID {
@@ -1761,28 +1891,12 @@ struct TabOverview: View {
                     }
                 }
 
-                // Selection Checkmark or Floating Close (×) Circle at Top-Right
+                // Selection Checkmark at Top-Right (Close × button is layered ABOVE TabCardGestureOverlay in safariTabCard!)
                 if selectionMode {
                     Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
                         .font(.system(size: 22))
                         .foregroundStyle(isSelected ? Color(red: 0.20, green: 0.56, blue: 1.0) : .white.opacity(0.75))
                         .padding(8)
-                } else if !isHeroSingle && !isLiftedOverlay {
-                    Button {
-                        UIImpactFeedbackGenerator(style: .light).impactOccurred()
-                        withAnimation(.spring(response: 0.28, dampingFraction: 0.82)) {
-                            model.close(tab.id)
-                        }
-                    } label: {
-                        Image(systemName: "xmark")
-                            .font(.system(size: 10, weight: .bold))
-                            .foregroundStyle(.white.opacity(0.92))
-                            .frame(width: 24, height: 24)
-                            .background(Color.black.opacity(0.58), in: Circle())
-                            .overlay(Circle().strokeBorder(Color.white.opacity(0.20), lineWidth: 0.6))
-                    }
-                    .buttonStyle(LiquidGlassPressStyle())
-                    .padding(7)
                 }
             }
 
@@ -1836,99 +1950,121 @@ struct TabOverview: View {
                 )
             }
         )
-        .contentShape(Rectangle())
-        .onTapGesture {
-            guard draggingTabID == nil else { return }
-            if selectionMode {
-                if !selectedTabIDs.insert(tab.id).inserted {
-                    selectedTabIDs.remove(tab.id)
-                }
-            } else {
-                model.select(tab.id)
-                onDismiss()
-            }
-        }
-        .gesture(
-            LongPressGesture(minimumDuration: 0.28)
-                .sequenced(before: DragGesture(minimumDistance: 0, coordinateSpace: .global))
-                .updating($isTabHoldGestureActive) { _, state, _ in
-                    state = true
-                }
-                .onChanged { value in
+        .overlay(
+            TabCardGestureOverlay(
+                isLongPressEnabled: !selectionMode && contextMenuTab == nil && !isSettlingDrop,
+                excludeTopRightCloseSize: (!selectionMode && !isHeroSingle && !isDraggingThis) ? 38 : 0,
+                onTap: {
+                    guard draggingTabID == nil else { return }
+                    if selectionMode {
+                        if !selectedTabIDs.insert(tab.id).inserted {
+                            selectedTabIDs.remove(tab.id)
+                        }
+                    } else {
+                        model.select(tab.id)
+                        onDismiss()
+                    }
+                },
+                onLongPressBegan: { screenPt in
                     guard !selectionMode && contextMenuTab == nil && !isSettlingDrop else { return }
                     guard draggingTabID == nil || draggingTabID == tab.id else { return }
-                    switch value {
-                    case .first(true):
-                        break
-                    case .second(true, let drag):
-                        if draggingTabID != tab.id {
-                            let fallbackFrame = CGRect(
-                                x: UIScreen.main.bounds.midX - 80,
-                                y: UIScreen.main.bounds.midY - cardHeight * 0.5,
-                                width: 160,
-                                height: cardHeight + 24
-                            )
-                            let frame = tabFrames[tab.id] ?? fallbackFrame
-                            let center = CGPoint(x: frame.midX, y: frame.midY)
-                            dragSessionID = UUID()
-                            dragCardWidth = frame.width
-                            dragCardThumbHeight = cardHeight
-                            dragCardIsHero = isHeroSingle
-                            dragOriginCenter = center
-                            dragCardGlobalCenter = center
-                            dragCardScale = 1.0
-                            dragFirstLocation = drag?.location
-                            dragMovedBeyondThreshold = false
-                            dragOriginIndex = index
-                            dragTargetIndex = index
-                            dragSlotFrames = groupTabs.map { tabFrames[$0.id] ?? .zero }
-                            draggingTabID = tab.id
-                            UIImpactFeedbackGenerator(style: .medium).impactOccurred()
-                            withAnimation(.spring(response: 0.22, dampingFraction: 0.80)) {
-                                dragCardScale = 1.06
-                            }
-                        }
-                        if let drag {
-                            if dragFirstLocation == nil {
-                                dragFirstLocation = drag.location
-                            }
-                            guard let firstLoc = dragFirstLocation else { return }
-                            let dx = drag.location.x - firstLoc.x
-                            let dy = drag.location.y - firstLoc.y
-                            if !dragMovedBeyondThreshold {
-                                guard hypot(dx, dy) > 16 else { return }
-                                dragMovedBeyondThreshold = true
-                            }
-                            let nextCenter = CGPoint(
-                                x: dragOriginCenter.x + dx,
-                                y: dragOriginCenter.y + dy
-                            )
-                            dragCardGlobalCenter = nextCenter
-
-                            if !isHeroSingle && !searchMode {
-                                for candidateIdx in dragSlotFrames.indices {
-                                    guard candidateIdx < groupTabs.count,
-                                          groupTabs[candidateIdx].isPinned == tab.isPinned else { continue }
-                                    let slotRect = dragSlotFrames[candidateIdx]
-                                    guard slotRect.width > 10 && slotRect.height > 10 else { continue }
-                                    if slotRect.insetBy(dx: 14, dy: 14).contains(nextCenter) {
-                                        if dragTargetIndex != candidateIdx {
-                                            dragTargetIndex = candidateIdx
-                                            UIImpactFeedbackGenerator(style: .light).impactOccurred()
-                                        }
-                                        break
-                                    }
-                                }
-                            }
-                        }
-                    default:
-                        break
+                    let fallbackFrame = CGRect(
+                        x: UIScreen.main.bounds.midX - 80,
+                        y: UIScreen.main.bounds.midY - cardHeight * 0.5,
+                        width: 160,
+                        height: cardHeight + 24
+                    )
+                    let frame = tabFrames[tab.id] ?? fallbackFrame
+                    let center = CGPoint(x: frame.midX, y: frame.midY)
+                    dragSessionID = UUID()
+                    dragCardWidth = frame.width
+                    dragCardThumbHeight = cardHeight
+                    dragCardIsHero = isHeroSingle
+                    dragOriginCenter = center
+                    dragCardGlobalCenter = center
+                    dragCardScale = 1.0
+                    dragFirstLocation = screenPt
+                    dragMovedBeyondThreshold = false
+                    dragOriginIndex = index
+                    dragTargetIndex = index
+                    dragSlotFrames = groupTabs.map { tabFrames[$0.id] ?? .zero }
+                    draggingTabID = tab.id
+                    UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+                    withAnimation(.spring(response: 0.16, dampingFraction: 0.80)) {
+                        dragCardScale = 1.06
                     }
-                }
-                .onEnded { _ in
+                },
+                onLongPressChanged: { screenPt in
+                    guard draggingTabID == tab.id && !isSettlingDrop else { return }
+                    if dragFirstLocation == nil {
+                        dragFirstLocation = screenPt
+                    }
+                    guard let firstLoc = dragFirstLocation else { return }
+                    let dx = screenPt.x - firstLoc.x
+                    let dy = screenPt.y - firstLoc.y
+                    if !dragMovedBeyondThreshold {
+                        guard hypot(dx, dy) > 18 else { return }
+                        dragMovedBeyondThreshold = true
+                    }
+                    let nextCenter = CGPoint(
+                        x: dragOriginCenter.x + dx,
+                        y: dragOriginCenter.y + dy
+                    )
+                    dragCardGlobalCenter = nextCenter
+
+                    if !isHeroSingle && !searchMode {
+                        for candidateIdx in dragSlotFrames.indices {
+                            guard candidateIdx < groupTabs.count,
+                                  groupTabs[candidateIdx].isPinned == tab.isPinned else { continue }
+                            let slotRect = dragSlotFrames[candidateIdx]
+                            guard slotRect.width > 10 && slotRect.height > 10 else { continue }
+                            if slotRect.insetBy(dx: 14, dy: 14).contains(nextCenter) {
+                                if dragTargetIndex != candidateIdx {
+                                    dragTargetIndex = candidateIdx
+                                    UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                                }
+                                break
+                            }
+                        }
+                    }
+                },
+                onLongPressEnded: {
+                    guard draggingTabID == tab.id else { return }
                     finalizeActiveTabDrag(in: groupTabs)
+                },
+                onLongPressCancelled: {
+                    guard draggingTabID == tab.id && !isSettlingDrop else { return }
+                    draggingTabID = nil
+                    dragCardScale = 1.0
+                    dragFirstLocation = nil
+                    dragMovedBeyondThreshold = false
+                    dragOriginIndex = nil
+                    dragTargetIndex = nil
+                    dragSlotFrames = []
                 }
+            )
         )
+        .overlay(alignment: .topTrailing) {
+            if !selectionMode && !isHeroSingle && !isDraggingThis {
+                Button {
+                    UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                    withAnimation(.spring(response: 0.28, dampingFraction: 0.82)) {
+                        model.close(tab.id)
+                    }
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 10, weight: .bold))
+                        .foregroundStyle(.white.opacity(0.92))
+                        .frame(width: 24, height: 24)
+                        .background(Color.black.opacity(0.58), in: Circle())
+                        .overlay(Circle().strokeBorder(Color.white.opacity(0.20), lineWidth: 0.6))
+                        .frame(width: 34, height: 34)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(LiquidGlassPressStyle())
+                .padding(2)
+            }
+        }
     }
 
     private func finalizeActiveTabDrag(in groupTabs: [BrowserTab]) {
@@ -1943,14 +2079,14 @@ struct TabOverview: View {
         dragMovedBeyondThreshold = false
 
         if !wasDragged, let liftedTab {
-            // Held and released WITHOUT moving -> open floating Liquid Glass context menu (링크 복사하기, 탭 고정 등)!
+            // Held and released WITHOUT moving -> INSTANTLY open floating Liquid Glass context menu!
             draggingTabID = nil
             dragCardScale = 1.0
             dragOriginIndex = nil
             dragTargetIndex = nil
             dragSlotFrames = []
             UIImpactFeedbackGenerator(style: .soft).impactOccurred()
-            withAnimation(.spring(response: 0.32, dampingFraction: 0.82)) {
+            withAnimation(.spring(response: 0.20, dampingFraction: 0.88)) {
                 contextMenuTab = liftedTab
             }
             return
@@ -2028,10 +2164,10 @@ struct TabOverview: View {
                 onDismiss()
             }
         }
-        .onLongPressGesture(minimumDuration: 0.42) {
+        .onLongPressGesture(minimumDuration: 0.20) {
             guard !selectionMode else { return }
             UIImpactFeedbackGenerator(style: .medium).impactOccurred()
-            withAnimation(.spring(response: 0.34, dampingFraction: 0.80)) {
+            withAnimation(.spring(response: 0.20, dampingFraction: 0.88)) {
                 contextMenuTab = tab
             }
         }
@@ -2770,6 +2906,80 @@ struct ToolbarEditorSheet: View {
     }
 }
 
+// MARK: - Page Tools Menu Editor Sheet (URL Field Left Button Customization!)
+
+struct PageToolsEditorSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    @ObservedObject var model: BrowserModel
+
+    private var availableToAdd: [PageToolsMenuItem] {
+        let active = Set(model.preferences.pageToolsItems)
+        return PageToolsMenuItem.allCases.filter { !active.contains($0) }
+    }
+
+    var body: some View {
+        NavigationStack {
+            List {
+                Section {
+                    ForEach(model.preferences.pageToolsItems) { item in
+                        HStack {
+                            Label(item.title, systemImage: item.systemImage)
+                            Spacer()
+                            if model.preferences.pageToolsItems.count > 1 {
+                                Button(role: .destructive) {
+                                    model.preferences.pageToolsItems.removeAll { $0 == item }
+                                    model.savePreferences()
+                                } label: {
+                                    Image(systemName: "minus.circle.fill").foregroundStyle(.red)
+                                }
+                                .buttonStyle(.plain)
+                            }
+                        }
+                    }
+                    .onMove { src, dst in
+                        model.preferences.pageToolsItems.move(fromOffsets: src, toOffset: dst)
+                        model.savePreferences()
+                    }
+                } header: {
+                    Text("현재 페이지 도구 항목 (드래그하여 순서 변경)")
+                } footer: {
+                    Text("주소창 왼쪽 버튼(페이지 도구)을 눌렀을 때 표시되는 항목과 순서를 자유롭게 편집할 수 있습니다.")
+                }
+
+                if !availableToAdd.isEmpty {
+                    Section("추가 가능한 항목 (\(availableToAdd.count))") {
+                        ForEach(availableToAdd) { item in
+                            Button {
+                                model.preferences.pageToolsItems.append(item)
+                                model.savePreferences()
+                            } label: {
+                                HStack {
+                                    Label(item.title, systemImage: item.systemImage)
+                                    Spacer()
+                                    Image(systemName: "plus.circle.fill").foregroundStyle(.blue)
+                                }
+                            }
+                        }
+                    }
+                }
+
+                Section {
+                    Button("기본 페이지 도구 구성으로 복원") {
+                        model.preferences.pageToolsItems = PageToolsMenuItem.defaultOrder
+                        model.savePreferences()
+                    }
+                }
+            }
+            .environment(\.editMode, .constant(.active))
+            .navigationTitle("페이지 도구 메뉴 편집")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) { Button("완료") { dismiss() } }
+            }
+        }
+    }
+}
+
 // MARK: - Full Categorized Settings Sheet (Exact 8-Category Android SettingsActivity.kt Parity!)
 
 struct SettingsSheet: View {
@@ -2783,6 +2993,7 @@ struct SettingsSheet: View {
     var onOpenProfiles: () -> Void
     var onCheckUpdates: () -> Void
     @State private var showToolbarEditor = false
+    @State private var showPageToolsEditor = false
     @State private var confirmClearAllData = false
     @State private var confirmResetSettings = false
 
@@ -2849,6 +3060,7 @@ struct SettingsSheet: View {
                                 Toggle("위로 스크롤 시 도구모음 펼치기", isOn: $model.preferences.expandToolbarOnScrollUp)
                                 Toggle("캡처 영역 좌우 여백 표시", isOn: $model.preferences.captureSideMargins)
                                 Button("도구모음 바로가기 편집...") { showToolbarEditor = true }
+                                Button("페이지 도구 메뉴 편집 (URL 왼쪽 버튼)...") { showPageToolsEditor = true }
                             }
                             Section("글자 및 페이지 기본 배율") {
                                 Stepper("기본 배율: \(Int((model.preferences.fontScale * 100).rounded()))%",
@@ -2991,6 +3203,9 @@ struct SettingsSheet: View {
             }
             .sheet(isPresented: $showToolbarEditor) {
                 ToolbarEditorSheet(model: model)
+            }
+            .sheet(isPresented: $showPageToolsEditor) {
+                PageToolsEditorSheet(model: model)
             }
             .confirmationDialog("방문 기록·쿠키·캐시·미리보기를 모두 삭제할까요?", isPresented: $confirmClearAllData, titleVisibility: .visible) {
                 Button("모두 삭제", role: .destructive) { Task { await model.clearBrowsingData() } }

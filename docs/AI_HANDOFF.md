@@ -1,3 +1,21 @@
+# 2026-11-24 Antigravity: iOS 탭 목록 빠른 길게 누르기·릴리스 즉시 컨텍스트 메뉴(`TabCardGestureOverlay`) + URL 왼쪽 페이지 도구 메뉴 편집(`PageToolsEditorSheet`) (`iOS build 91`)
+
+- 작업 워크스페이스: `E:/DEV/CODEX/BROWSER`
+- 사용자 요청:
+  1. iOS 탭 목록에서 탭을 길게 누르고 움직이지 않고 뗄 때 컨텍스트 메뉴가 너무 오래 걸리는 문제 개선 (길게 누르고 빠르게 떼도 즉시 메뉴 표시)
+  2. URL 필드 왼쪽 버튼(페이지 도구: `워터마크 제거`, `영역 캡처`, `배율` 등) 영역도 설정에서 항목 편집·순서 변경 가능하게 추가
+- 해결:
+  1. **탭 목록 즉각 반응 길게 누르기·0ms 릴리스 컨텍스트 메뉴 (`apps/ios/Omyaru/BrowserViews.swift`, `LiquidGlassComponents.swift`)**:
+     - 원인: SwiftUI `LongPressGesture(0.28).sequenced(before: DragGesture(minimumDistance: 0))`은 손가락을 움직이지 않고 뗄 때 `DragGesture`가 시작되지 않아 SwiftUI `SequenceGesture`의 내부 핸드오프 타임아웃(~0.7~1.0초)이 지난 뒤에야 `@GestureState`가 초기화되며 컨텍스트 메뉴가 열렸고, `LiquidGlassMorphContainer`의 `0.34s` 블러/확대 애니메이션이 지연을 더했음.
+     - 해결: 개별 탭 카드에 네이티브 UIKit `TabCardGestureOverlay`(`TabCardTouchView` + `UITapGestureRecognizer` + `UILongPressGestureRecognizer(minimumPressDuration: 0.18, allowableMovement: 14)`)를 `.overlay`로 직접 배치하고 우측 상단 닫기(`×`) `38×38pt` 영역은 `point(inside:)`에서 패스스루 처리. `0.18초` 만에 즉시 카드가 들리고, 움직이지 않고(`≤ 18pt`) 손을 떼는 순간 `UILongPressGestureRecognizer.ended`가 **0ms 지연**으로 발동하며 `LiquidGlassMorphContainer` 고속 스프링(`response: 0.20, dampingFraction: 0.88, initialScale: 0.86, initialBlur: 3`)으로 컨텍스트 메뉴가 즉시 팝업됨(드래그 시 기존 무변경 시각 슬롯 시프트·120fps 이동 유지). 리스트 보기 행의 길게 누르기도 `0.20초`로 단축.
+  2. **URL 왼쪽 페이지 도구 메뉴 커스터마이징 (`apps/ios/Omyaru/OmyaruApp.swift`, `LiquidGlassComponents.swift`, `BrowserViews.swift`)**:
+     - `PageToolsMenuItem`(23종: 배율 조절, 북마크 추가·편집, 페이지 찾기, 콘텐츠 차단기, 데스크톱/모바일, 실시간 영역 캡처, 워터마크 제거, 미디어 PiP 바, 이미지 고속 선로딩, 유저스크립트 빠른 토글, 확장 프로그램 설정, 책장, 북마크 목록, 방문 기록, 다운로드, 주소 복사, 공유, 현재 탭 복제, 새 탭, 닫은 탭 다시 열기, VPN, 동기화, 설정) 신설 및 `BrowserPreferences.pageToolsItems` 추가(기존 `omyaru.ios.preferences.v3` 설정이 초기화되지 않도록 모든 필드 `decodeIfPresent` 기반 하위 호환 `init(from:)` 구현).
+     - `LiquidGlassPageToolsPopover`가 사용자 지정 순서·항목을 그대로 동적 렌더링하고 하단에 `"페이지 도구 편집"` 바로가기 제공(주소창 왼쪽 버튼 길게 누르기로도 즉시 편집 진입).
+     - `SettingsSheet` → `화면 및 모양` → `주소창 및 스크롤 동작`에 **`페이지 도구 메뉴 편집 (URL 왼쪽 버튼)...`**(`PageToolsEditorSheet`: 드래그 순서 변경, 항목 추가·제거, 기본값 복원) 추가.
+  - iOS 빌드 번호: `90` → **`91`** (`Info.plist`, `OmyaruApp.swift`).
+
+---
+
 # 2026-11-24 Antigravity: iOS 탭 목록 길게 누르기 미이동 릴리스 메뉴 확정 표시(`@GestureState`) + 전용 책장 잠금(자동 잠금 시간 · 아이폰 잠금 연동 · Face ID/PIN/비밀번호) (`iOS build 90`)
 
 - 작업 워크스페이스: `E:/DEV/CODEX/BROWSER`

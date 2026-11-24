@@ -391,6 +391,105 @@ enum ToolbarShortcutAction: String, CaseIterable, Codable, Identifiable {
     static let defaultOrder: [ToolbarShortcutAction] = [.back, .forward, .home, .capture, .bookshelf, .tabs, .menu]
 }
 
+/// Customizable items shown in the URL-bar left button ("페이지 도구") popover!
+enum PageToolsMenuItem: String, CaseIterable, Codable, Identifiable, Hashable {
+    case zoomControls = "zoomControls"
+    case bookmarkEdit = "bookmarkEdit"
+    case findInPage = "findInPage"
+    case contentBlocking = "contentBlocking"
+    case desktopSite = "desktopSite"
+    case capture = "capture"
+    case watermark = "watermark"
+    case mediaPiP = "mediaPiP"
+    case imagePreloader = "imagePreloader"
+    case userScripts = "userScripts"
+    case extensions = "extensions"
+    case bookshelf = "bookshelf"
+    case bookmarks = "bookmarks"
+    case history = "history"
+    case downloads = "downloads"
+    case copyAddress = "copyAddress"
+    case share = "share"
+    case duplicateTab = "duplicateTab"
+    case newTab = "newTab"
+    case reopenClosedTab = "reopenClosedTab"
+    case vpn = "vpn"
+    case driveSync = "driveSync"
+    case settings = "settings"
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .zoomControls: return "페이지 배율 조절 (- / % / +)"
+        case .bookmarkEdit: return "북마크 추가 · 편집"
+        case .findInPage: return "페이지에서 찾기"
+        case .contentBlocking: return "콘텐츠 차단기 켜기/끄기"
+        case .desktopSite: return "데스크톱 / 모바일 사이트"
+        case .capture: return "실시간 영역 캡처"
+        case .watermark: return "워터마크 제거"
+        case .mediaPiP: return "미디어 PiP · 건너뛰기 바"
+        case .imagePreloader: return "이미지 고속 선로딩"
+        case .userScripts: return "유저스크립트 빠른 토글"
+        case .extensions: return "확장 프로그램 설정"
+        case .bookshelf: return "책장 열기"
+        case .bookmarks: return "북마크 목록"
+        case .history: return "방문 기록"
+        case .downloads: return "다운로드"
+        case .copyAddress: return "주소 복사"
+        case .share: return "공유"
+        case .duplicateTab: return "현재 탭 복제"
+        case .newTab: return "새 탭"
+        case .reopenClosedTab: return "닫은 탭 다시 열기"
+        case .vpn: return "VPN · 보안 DNS"
+        case .driveSync: return "Google Drive 동기화"
+        case .settings: return "설정"
+        }
+    }
+
+    var systemImage: String {
+        switch self {
+        case .zoomControls: return "textformat.size"
+        case .bookmarkEdit: return "bookmark"
+        case .findInPage: return "doc.text.magnifyingglass"
+        case .contentBlocking: return "shield.lefthalf.filled"
+        case .desktopSite: return "desktopcomputer"
+        case .capture: return "viewfinder"
+        case .watermark: return "wand.and.stars"
+        case .mediaPiP: return "pip.enter"
+        case .imagePreloader: return "bolt.fill"
+        case .userScripts: return "puzzlepiece.extension.fill"
+        case .extensions: return "puzzlepiece.extension"
+        case .bookshelf: return "books.vertical"
+        case .bookmarks: return "book"
+        case .history: return "clock"
+        case .downloads: return "arrow.down.circle"
+        case .copyAddress: return "doc.on.doc"
+        case .share: return "square.and.arrow.up"
+        case .duplicateTab: return "plus.square.on.square"
+        case .newTab: return "plus.square"
+        case .reopenClosedTab: return "arrow.uturn.backward"
+        case .vpn: return "network.badge.shield.half.filled"
+        case .driveSync: return "arrow.triangle.2.circlepath.icloud"
+        case .settings: return "gearshape"
+        }
+    }
+
+    static let defaultOrder: [PageToolsMenuItem] = [
+        .zoomControls,
+        .bookmarkEdit,
+        .findInPage,
+        .contentBlocking,
+        .desktopSite,
+        .capture,
+        .watermark,
+        .mediaPiP,
+        .imagePreloader,
+        .userScripts,
+        .extensions
+    ]
+}
+
 struct BrowserPreferences: Codable, Equatable {
     // General
     var searchEngine: SearchEngineChoice = .google
@@ -408,6 +507,7 @@ struct BrowserPreferences: Codable, Equatable {
     var fontScale: Double = 1.0
     var compactToolbar: Bool = false
     var toolbarShortcuts: [ToolbarShortcutAction] = ToolbarShortcutAction.defaultOrder
+    var pageToolsItems: [PageToolsMenuItem] = PageToolsMenuItem.defaultOrder
 
     // Tabs
     var tabThumbnailAspectRatio: TabAspectRatioChoice = .portrait
@@ -447,6 +547,78 @@ struct BrowserPreferences: Codable, Equatable {
     var proxyIsSOCKS5: Bool = true
     var proxyHost: String = "127.0.0.1"
     var proxyPort: Int = 1080
+
+    enum CodingKeys: String, CodingKey {
+        case searchEngine, customSearchTemplate, homePage, pipSeekSeconds
+        case pageColorScheme, liquidGlassUi, addressBarPosition, hideToolbarOnScroll
+        case expandToolbarOnScrollUp, captureSideMargins, fontScale, compactToolbar
+        case toolbarShortcuts, pageToolsItems
+        case tabThumbnailAspectRatio, tabGridColumns, tabsStartFromBottom
+        case showKeyboardOnNewTab, keepKeyboardAcrossTabSwitch, restoreTabs
+        case openLinksInNewTab, showTabThumbnails
+        case trackingProtection, cookiePolicy, globalPrivacyControl, automaticHTTPS
+        case clearDataOnExit, blockPopups, contentBlockingExceptions
+        case showFullURL, backgroundAudio, javaScriptEnabled, desktopModeDefault
+        case watermarkRemoverUrl, enableImagePreloader, hideCookieNotices
+        case unlockCopyAndContextMenu, enableMediaPiPHelper, forceWebDarkMode
+        case dnsPreset, customDoHURL, proxyEnabled, proxyIsSOCKS5, proxyHost, proxyPort
+    }
+
+    init() {}
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        searchEngine = try c.decodeIfPresent(SearchEngineChoice.self, forKey: .searchEngine) ?? .google
+        customSearchTemplate = try c.decodeIfPresent(String.self, forKey: .customSearchTemplate) ?? "https://duckduckgo.com/?q=%s"
+        homePage = try c.decodeIfPresent(String.self, forKey: .homePage) ?? "about:blank"
+        pipSeekSeconds = try c.decodeIfPresent(Int.self, forKey: .pipSeekSeconds) ?? 10
+
+        pageColorScheme = try c.decodeIfPresent(PageColorSchemeChoice.self, forKey: .pageColorScheme) ?? .dark
+        liquidGlassUi = try c.decodeIfPresent(Bool.self, forKey: .liquidGlassUi) ?? false
+        addressBarPosition = try c.decodeIfPresent(AddressBarPositionChoice.self, forKey: .addressBarPosition) ?? .bottom
+        hideToolbarOnScroll = try c.decodeIfPresent(Bool.self, forKey: .hideToolbarOnScroll) ?? true
+        expandToolbarOnScrollUp = try c.decodeIfPresent(Bool.self, forKey: .expandToolbarOnScrollUp) ?? true
+        captureSideMargins = try c.decodeIfPresent(Bool.self, forKey: .captureSideMargins) ?? true
+        fontScale = try c.decodeIfPresent(Double.self, forKey: .fontScale) ?? 1.0
+        compactToolbar = try c.decodeIfPresent(Bool.self, forKey: .compactToolbar) ?? false
+        toolbarShortcuts = try c.decodeIfPresent([ToolbarShortcutAction].self, forKey: .toolbarShortcuts) ?? ToolbarShortcutAction.defaultOrder
+        pageToolsItems = try c.decodeIfPresent([PageToolsMenuItem].self, forKey: .pageToolsItems) ?? PageToolsMenuItem.defaultOrder
+
+        tabThumbnailAspectRatio = try c.decodeIfPresent(TabAspectRatioChoice.self, forKey: .tabThumbnailAspectRatio) ?? .portrait
+        tabGridColumns = try c.decodeIfPresent(Int.self, forKey: .tabGridColumns) ?? 2
+        tabsStartFromBottom = try c.decodeIfPresent(Bool.self, forKey: .tabsStartFromBottom) ?? true
+        showKeyboardOnNewTab = try c.decodeIfPresent(Bool.self, forKey: .showKeyboardOnNewTab) ?? false
+        keepKeyboardAcrossTabSwitch = try c.decodeIfPresent(Bool.self, forKey: .keepKeyboardAcrossTabSwitch) ?? false
+        restoreTabs = try c.decodeIfPresent(Bool.self, forKey: .restoreTabs) ?? true
+        openLinksInNewTab = try c.decodeIfPresent(Bool.self, forKey: .openLinksInNewTab) ?? true
+        showTabThumbnails = try c.decodeIfPresent(Bool.self, forKey: .showTabThumbnails) ?? true
+
+        trackingProtection = try c.decodeIfPresent(TrackingProtectionLevel.self, forKey: .trackingProtection) ?? .strict
+        cookiePolicy = try c.decodeIfPresent(CookiePolicyLevel.self, forKey: .cookiePolicy) ?? .isolateCrossSite
+        globalPrivacyControl = try c.decodeIfPresent(Bool.self, forKey: .globalPrivacyControl) ?? true
+        automaticHTTPS = try c.decodeIfPresent(Bool.self, forKey: .automaticHTTPS) ?? true
+        clearDataOnExit = try c.decodeIfPresent(Bool.self, forKey: .clearDataOnExit) ?? false
+        blockPopups = try c.decodeIfPresent(Bool.self, forKey: .blockPopups) ?? true
+        contentBlockingExceptions = try c.decodeIfPresent([String].self, forKey: .contentBlockingExceptions) ?? []
+
+        showFullURL = try c.decodeIfPresent(Bool.self, forKey: .showFullURL) ?? true
+        backgroundAudio = try c.decodeIfPresent(Bool.self, forKey: .backgroundAudio) ?? true
+        javaScriptEnabled = try c.decodeIfPresent(Bool.self, forKey: .javaScriptEnabled) ?? true
+        desktopModeDefault = try c.decodeIfPresent(Bool.self, forKey: .desktopModeDefault) ?? false
+        watermarkRemoverUrl = try c.decodeIfPresent(String.self, forKey: .watermarkRemoverUrl) ?? ""
+        enableImagePreloader = try c.decodeIfPresent(Bool.self, forKey: .enableImagePreloader) ?? true
+        hideCookieNotices = try c.decodeIfPresent(Bool.self, forKey: .hideCookieNotices) ?? true
+        unlockCopyAndContextMenu = try c.decodeIfPresent(Bool.self, forKey: .unlockCopyAndContextMenu) ?? true
+        enableMediaPiPHelper = try c.decodeIfPresent(Bool.self, forKey: .enableMediaPiPHelper) ?? true
+        forceWebDarkMode = try c.decodeIfPresent(Bool.self, forKey: .forceWebDarkMode) ?? false
+
+        dnsPreset = try c.decodeIfPresent(DnsProviderPreset.self, forKey: .dnsPreset) ?? .system
+        customDoHURL = try c.decodeIfPresent(String.self, forKey: .customDoHURL) ?? "https://cloudflare-dns.com/dns-query"
+        proxyEnabled = try c.decodeIfPresent(Bool.self, forKey: .proxyEnabled) ?? false
+        proxyIsSOCKS5 = try c.decodeIfPresent(Bool.self, forKey: .proxyIsSOCKS5) ?? true
+        proxyHost = try c.decodeIfPresent(String.self, forKey: .proxyHost) ?? "127.0.0.1"
+        proxyPort = try c.decodeIfPresent(Int.self, forKey: .proxyPort) ?? 1080
+    }
 }
 
 // MARK: - Main Browser ViewModel & WebKit Controller
@@ -457,7 +629,7 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
     static let defaultProfileID = UUID(uuidString: "00000000-0000-0000-0000-000000000010")!
     static let defaultGroupID = UUID(uuidString: "00000000-0000-0000-0000-000000000002")!
     static let appVersionName = "0.15.18"
-    static let appBuildNumber = 90
+    static let appBuildNumber = 91
 
     var isApplyingRemoteSync: Bool = false
 
