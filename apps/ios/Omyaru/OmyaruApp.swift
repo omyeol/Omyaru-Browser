@@ -658,8 +658,8 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
     static let privateGroupID = UUID(uuidString: "00000000-0000-0000-0000-000000000001")!
     static let defaultProfileID = UUID(uuidString: "00000000-0000-0000-0000-000000000010")!
     static let defaultGroupID = UUID(uuidString: "00000000-0000-0000-0000-000000000002")!
-    static let appVersionName = "1.0.1"
-    static let appBuildNumber = 110
+    static let appVersionName = "1.0.2"
+    static let appBuildNumber = 111
 
     var isApplyingRemoteSync: Bool = false
 
@@ -688,6 +688,7 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
     @Published var estimatedProgress: Double = 0.0
     @Published var isLoading: Bool = false
     @Published var isChromeCollapsed: Bool = false
+    @Published var chromeCollapseProgress: CGFloat = 0.0
     @Published var failedLoadURL: String? = nil
     @Published var failedLoadMessage: String? = nil
     @Published var scrollFraction: Double = 0.0
@@ -1444,6 +1445,72 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
         lastScrollActivity = Date()
     }
 
+    func setChromeCollapsed(_ collapsed: Bool, animated: Bool = true) {
+        let target: CGFloat = collapsed ? 1.0 : 0.0
+        toolbarScrollAccumulator = 0
+        let stateChanged = (isChromeCollapsed != collapsed)
+        if stateChanged {
+            isChromeCollapsed = collapsed
+        }
+        if animated {
+            withAnimation(.spring(response: 0.36, dampingFraction: 0.84)) {
+                chromeCollapseProgress = target
+            }
+        } else {
+            chromeCollapseProgress = target
+        }
+        if stateChanged {
+            updateAllWebViewContentInsets()
+        }
+    }
+
+    func scrollViewWillBeginDragging(_ scrollView: UIScrollView) {
+        toolbarScrollAccumulator = 0
+        lastScrollOffsetY = scrollView.contentOffset.y + scrollView.adjustedContentInset.top
+    }
+
+    func scrollViewWillEndDragging(
+        _ scrollView: UIScrollView,
+        withVelocity velocity: CGPoint,
+        targetContentOffset: UnsafeMutablePointer<CGPoint>
+    ) {
+        guard preferences.hideToolbarOnScroll else { return }
+        if !isChromeCollapsed {
+            if velocity.y > 0.75 && toolbarScrollAccumulator >= 14 {
+                setChromeCollapsed(true, animated: true)
+            } else if chromeCollapseProgress > 0.001 {
+                setChromeCollapsed(false, animated: true)
+            }
+        } else if preferences.expandToolbarOnScrollUp {
+            let targetY = targetContentOffset.pointee.y + scrollView.adjustedContentInset.top
+            if (velocity.y < -1.15 && -toolbarScrollAccumulator >= 20) || targetY <= 16 {
+                setChromeCollapsed(false, animated: true)
+            } else if chromeCollapseProgress < 0.999 {
+                setChromeCollapsed(true, animated: true)
+            }
+        }
+    }
+
+    func scrollViewDidEndDragging(_ scrollView: UIScrollView, willDecelerate decelerate: Bool) {
+        if !decelerate {
+            settleChromeCollapseProgress()
+        }
+    }
+
+    func scrollViewDidEndDecelerating(_ scrollView: UIScrollView) {
+        settleChromeCollapseProgress()
+    }
+
+    private func settleChromeCollapseProgress() {
+        let target: CGFloat = isChromeCollapsed ? 1.0 : 0.0
+        toolbarScrollAccumulator = 0
+        if abs(chromeCollapseProgress - target) > 0.001 {
+            withAnimation(.spring(response: 0.34, dampingFraction: 0.84)) {
+                chromeCollapseProgress = target
+            }
+        }
+    }
+
     func scrollViewDidScroll(_ scrollView: UIScrollView) {
         let viewportH = max(1, scrollView.bounds.height)
         let contentH = scrollView.contentSize.height
@@ -1468,9 +1535,8 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
         }
 
         guard preferences.hideToolbarOnScroll else {
-            if isChromeCollapsed {
-                isChromeCollapsed = false
-                updateAllWebViewContentInsets()
+            if isChromeCollapsed || chromeCollapseProgress != 0 {
+                setChromeCollapsed(false, animated: true)
             }
             return
         }
@@ -1479,33 +1545,46 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
         lastScrollOffsetY = y
         if y <= 8 {
             toolbarScrollAccumulator = 0
-            if preferences.expandToolbarOnScrollUp && isChromeCollapsed {
-                isChromeCollapsed = false
-                updateAllWebViewContentInsets()
+            if (isChromeCollapsed && preferences.expandToolbarOnScrollUp) || (!isChromeCollapsed && chromeCollapseProgress > 0.001) {
+                setChromeCollapsed(false, animated: true)
             }
+            return
+        }
+        let maxScrollY = max(0, contentH - viewportH)
+        if scrollable <= 24 || y > maxScrollY + 4 {
             return
         }
         if delta == 0 || abs(delta) > viewportH { return }
 
-        if delta > 0 {
-            if toolbarScrollAccumulator < 0 { toolbarScrollAccumulator = 0 }
-            toolbarScrollAccumulator += delta
-            if !isChromeCollapsed && toolbarScrollAccumulator >= 24 {
-                toolbarScrollAccumulator = 0
-                isChromeCollapsed = true
-                updateAllWebViewContentInsets()
+        let isUserInteracting = scrollView.isDragging || scrollView.isTracking
+
+        if !isChromeCollapsed {
+            // Track signed downward drag from 0; slight pull-back smoothly reverses morph 1:1 with finger!
+            toolbarScrollAccumulator = max(0, toolbarScrollAccumulator + delta)
+            if toolbarScrollAccumulator >= 36 {
+                setChromeCollapsed(true, animated: true)
+            } else if isUserInteracting {
+                let scrub = min(0.45, toolbarScrollAccumulator / 80.0)
+                if abs(scrub - chromeCollapseProgress) >= 0.004 || (scrub == 0 && chromeCollapseProgress != 0) {
+                    chromeCollapseProgress = scrub
+                }
             }
         } else {
             guard preferences.expandToolbarOnScrollUp else {
                 toolbarScrollAccumulator = 0
                 return
             }
-            if toolbarScrollAccumulator > 0 { toolbarScrollAccumulator = 0 }
-            toolbarScrollAccumulator += delta
-            if isChromeCollapsed && toolbarScrollAccumulator <= -14 {
-                toolbarScrollAccumulator = 0
-                isChromeCollapsed = false
-                updateAllWebViewContentInsets()
+            // Track signed upward drag (negative); dead zone 18pt, gentle pill swell 18..80pt, expand commit at 80pt!
+            toolbarScrollAccumulator = min(0, toolbarScrollAccumulator + delta)
+            let upDist = -toolbarScrollAccumulator
+            if upDist >= 80 {
+                setChromeCollapsed(false, animated: true)
+            } else if isUserInteracting {
+                let swell: CGFloat = upDist > 18 ? min(0.32, (upDist - 18) / 195.0) : 0
+                let scrub = 1.0 - swell
+                if abs(scrub - chromeCollapseProgress) >= 0.004 || (scrub == 1.0 && chromeCollapseProgress != 1.0) {
+                    chromeCollapseProgress = scrub
+                }
             }
         }
     }
@@ -1768,7 +1847,7 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
     func open(_ rawEntry: String) {
         let value = rawEntry.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !value.isEmpty else { return }
-        isChromeCollapsed = false
+        setChromeCollapsed(false, animated: true)
         if value == "about:blank" {
             setTab(activeID) { $0.url = "about:blank"; $0.title = "새 탭" }
             return
@@ -1878,10 +1957,9 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
         }
         if !background {
             activeID = tab.id
-            isChromeCollapsed = false
+            setChromeCollapsed(false, animated: false)
             failedLoadURL = nil
             failedLoadMessage = nil
-            updateAllWebViewContentInsets()
         }
         if let url {
             loadedTabIDs.insert(tab.id)
@@ -1922,10 +2000,9 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
     func select(_ id: UUID) {
         guard let tab = tabs.first(where: { $0.id == id }) else { return }
         activeID = id
-        isChromeCollapsed = false
+        setChromeCollapsed(false, animated: false)
         failedLoadURL = nil
         failedLoadMessage = nil
-        updateAllWebViewContentInsets()
         if tab.isPrivate {
             activeGroupID = Self.privateGroupID
         } else {
@@ -2201,10 +2278,9 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
         }
     }
     func home() {
-        isChromeCollapsed = false
+        setChromeCollapsed(false, animated: true)
         failedLoadURL = nil
         failedLoadMessage = nil
-        updateAllWebViewContentInsets()
         if preferences.homePage == "about:blank" || preferences.homePage.isEmpty {
             setTab(activeID) { $0.url = "about:blank"; $0.title = "새 탭" }
         } else {
@@ -2514,9 +2590,8 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
             estimatedProgress = 0.15
             failedLoadURL = nil
             failedLoadMessage = nil
-            if isChromeCollapsed {
-                isChromeCollapsed = false
-                updateAllWebViewContentInsets()
+            if isChromeCollapsed || chromeCollapseProgress > 0.001 {
+                setChromeCollapsed(false, animated: true)
             }
         }
     }

@@ -3,6 +3,48 @@ import UIKit
 
 // MARK: - iOS 26 Safari Liquid Glass Design Primitives (Solid Flat by Default, Liquid Glass Only When Enabled)
 
+/// Asymmetric rounded rectangle with independent top & bottom corner radii (matches iOS 26 Safari concentric URL island: 38.5pt top / 45.5pt bottom)
+struct SafariIslandShape: InsettableShape {
+    var topRadius: CGFloat
+    var bottomRadius: CGFloat
+    var insetAmount: CGFloat = 0
+
+    var animatableData: AnimatablePair<CGFloat, CGFloat> {
+        get { AnimatablePair(topRadius, bottomRadius) }
+        set {
+            topRadius = newValue.first
+            bottomRadius = newValue.second
+        }
+    }
+
+    func inset(by amount: CGFloat) -> SafariIslandShape {
+        var copy = self
+        copy.insetAmount += amount
+        return copy
+    }
+
+    func path(in rect: CGRect) -> Path {
+        let r = rect.insetBy(dx: insetAmount, dy: insetAmount)
+        guard r.width > 0, r.height > 0 else { return Path() }
+        let maxR = min(r.width, r.height) * 0.5
+        let tr = max(0, min(maxR, topRadius - insetAmount))
+        let br = max(0, min(maxR, bottomRadius - insetAmount))
+        let total = tr + br
+        let scale = total > r.height ? (r.height / max(total, 0.001)) : 1.0
+        let tR = tr * scale
+        let bR = br * scale
+
+        var p = Path()
+        p.move(to: CGPoint(x: r.midX, y: r.minY))
+        p.addArc(tangent1End: CGPoint(x: r.maxX, y: r.minY), tangent2End: CGPoint(x: r.maxX, y: r.midY), radius: tR)
+        p.addArc(tangent1End: CGPoint(x: r.maxX, y: r.maxY), tangent2End: CGPoint(x: r.midX, y: r.maxY), radius: bR)
+        p.addArc(tangent1End: CGPoint(x: r.minX, y: r.maxY), tangent2End: CGPoint(x: r.minX, y: r.midY), radius: bR)
+        p.addArc(tangent1End: CGPoint(x: r.minX, y: r.minY), tangent2End: CGPoint(x: r.midX, y: r.minY), radius: tR)
+        p.closeSubpath()
+        return p
+    }
+}
+
 private struct LiquidGlassEnabledKey: EnvironmentKey {
     static let defaultValue: Bool = false
 }

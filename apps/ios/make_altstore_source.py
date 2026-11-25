@@ -9,8 +9,8 @@ from datetime import date
 def read_bundle_version(plist_path: pathlib.Path) -> tuple[str, str]:
     with plist_path.open("rb") as fp:
         info = plistlib.load(fp)
-    version = str(info.get("CFBundleShortVersionString") or "1.0.1")
-    build = str(info.get("CFBundleVersion") or "110")
+    version = str(info.get("CFBundleShortVersionString") or "1.0.2")
+    build = str(info.get("CFBundleVersion") or "111")
     return version, build
 
 
@@ -58,9 +58,9 @@ def main() -> None:
                 "date": date.today().isoformat(),
                 "localizedDescription": (
                     f"v{version} (build {build_version}): "
-                    "URL 필드 섬 모서리 곡률을 Safari와 동일하게(43pt 연속 곡률) 통일, "
-                    "설정에 '주소창에 도메인만 표시 (예: naver.com)' 옵션 추가(편집 시 전체 URL 표시), "
-                    "옵션 OFF 상태에서도 주소창 축소 시 항상 간략한 도메인(naver.com 등)만 표시하도록 개선 (iOS · Android)."
+                    "Safari 동일 비대칭 동심원 URL 필드 섬 곡률(상단 38.5pt · 하단 45.5pt · 좌우 여백 12pt) 정밀 일치, "
+                    "축소 URL 필드 섬을 Safari와 동일한 도메인 맞춤 초컴팩트 폭(약 93pt × 31pt)으로 개선, "
+                    "스크롤 연동 인터랙티브 모핑(살짝 올렸다 내렸다 할 때 손가락을 1:1 따라오며 축소/확장 예고·복원 및 Safari 동일 임계값 36pt 축소 / 80pt 확장) 적용 (iOS · Android)."
                 ),
                 "downloadURL": download_url,
                 "size": ipa.stat().st_size,

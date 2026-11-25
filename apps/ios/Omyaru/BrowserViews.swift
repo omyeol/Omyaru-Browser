@@ -820,6 +820,20 @@ private struct ProgressiveGaussianBlurView: UIViewRepresentable {
 
 // MARK: - Main Browser Screen
 
+private struct AnimatedProgressReader<Content: View>: View, Animatable {
+    var progress: CGFloat
+    let content: (CGFloat) -> Content
+
+    var animatableData: CGFloat {
+        get { progress }
+        set { progress = newValue }
+    }
+
+    var body: some View {
+        content(progress)
+    }
+}
+
 struct BrowserScreen: View {
     @EnvironmentObject private var model: BrowserModel
     @State private var address: String = ""
@@ -1038,8 +1052,7 @@ struct BrowserScreen: View {
                 .opacity(toolbarVisible ? 1.0 : 0.0)
                 .offset(y: toolbarVisible ? 0 : (isBottomBar ? 20 : -20))
                 .allowsHitTesting(toolbarVisible && !showTabs && !isHeroMorphing && !showPageTools && !showBrowserMenu)
-                .animation(.spring(response: 0.42, dampingFraction: 0.78), value: model.isChromeCollapsed)
-                .animation(.spring(response: 0.36, dampingFraction: 0.82), value: addressFocused)
+                .animation(.spring(response: 0.36, dampingFraction: 0.84), value: addressFocused)
                 .animation(.easeInOut(duration: 0.2), value: model.status)
             }
             .zIndex(22)
@@ -1252,9 +1265,8 @@ struct BrowserScreen: View {
         }
         .onChange(of: addressFocused) { focused in
             if focused {
-                if model.isChromeCollapsed {
-                    model.isChromeCollapsed = false
-                    model.updateAllWebViewContentInsets()
+                if model.isChromeCollapsed || model.chromeCollapseProgress > 0.001 {
+                    model.setChromeCollapsed(false, animated: true)
                 }
                 address = model.currentURL == "about:blank" ? "" : model.currentURL
             } else {
@@ -1603,58 +1615,68 @@ struct BrowserScreen: View {
     private var androidOnSurfaceColor: Color { Color(red: 0.945, green: 0.910, blue: 0.894) }
     private var androidMutedColor: Color { Color(red: 0.725, green: 0.682, blue: 0.667) }
 
+    private var screenContainerWidth: CGFloat {
+        let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+        return scenes.first(where: { $0.activationState == .foregroundActive })?.keyWindow?.bounds.width
+            ?? scenes.first?.keyWindow?.bounds.width
+            ?? UIScreen.main.bounds.width
+    }
+
+    private func collapsedPillWidth(for text: String) -> CGFloat {
+        let font = UIFont.systemFont(ofSize: 12.5, weight: .semibold)
+        let textW = (text as NSString).size(withAttributes: [.font: font]).width
+        return min(156, max(82, ceil(textW) + 30))
+    }
+
     private func expandCollapsedToolbar() {
         UIImpactFeedbackGenerator(style: .light).impactOccurred()
-        withAnimation(.spring(response: 0.42, dampingFraction: 0.78)) {
-            model.isChromeCollapsed = false
-            model.updateAllWebViewContentInsets()
-        }
+        model.setChromeCollapsed(false, animated: true)
     }
 
     private var floatingAndroidToolbarRegion: some View {
         let isBottom = model.preferences.addressBarPosition == .bottom
         let collapsed = model.isChromeCollapsed && !model.isStartPage && !addressFocused
+        let progress: CGFloat = (model.isStartPage || addressFocused) ? 0.0 : max(0.0, min(1.0, model.chromeCollapseProgress))
+        let expBot: CGFloat = screenSafeAreaInsets.bottom > 0 ? 13 : 10
+        let colBot: CGFloat = screenSafeAreaInsets.bottom > 0 ? 15 : 12
+        let bottomPad: CGFloat = isBottom ? (addressFocused ? 8 : (expBot + (colBot - expBot) * progress)) : 0
         let suggestions = (addressFocused && !address.isEmpty) ? model.urlSuggestions(for: address) : []
         return VStack(spacing: 4) {
             if isBottom && !suggestions.isEmpty {
                 floatingSuggestionsCard(suggestions)
-                    .padding(.horizontal, 8)
+                    .padding(.horizontal, 12)
             }
             if isBottom && model.isLoading {
                 androidProgressStrip
-                    .padding(.horizontal, 8)
+                    .padding(.horizontal, 12)
             }
 
             ZStack(alignment: isBottom ? .bottom : .top) {
                 if collapsed {
                     Color.clear
                         .frame(maxWidth: .infinity)
-                        .frame(height: 56)
+                        .frame(height: 54)
                         .contentShape(Rectangle())
                         .onTapGesture {
                             expandCollapsedToolbar()
                         }
                 }
 
-                morphingUrlIsland(collapsed: collapsed)
-                    .padding(.horizontal, 8)
+                AnimatedProgressReader(progress: progress) { animatedP in
+                    morphingUrlIsland(progress: animatedP, isBottom: isBottom)
+                }
                     .padding(.top, isBottom ? 0 : 6)
-                    .padding(
-                        .bottom,
-                        isBottom
-                            ? (addressFocused ? 8 : (collapsed ? (screenSafeAreaInsets.bottom > 0 ? 15 : 12) : (screenSafeAreaInsets.bottom > 0 ? 14 : 10)))
-                            : 0
-                    )
+                    .padding(.bottom, bottomPad)
             }
             .frame(maxWidth: .infinity)
 
             if !isBottom && model.isLoading {
                 androidProgressStrip
-                    .padding(.horizontal, 8)
+                    .padding(.horizontal, 12)
             }
             if !isBottom && !suggestions.isEmpty {
                 floatingSuggestionsCard(suggestions)
-                    .padding(.horizontal, 8)
+                    .padding(.horizontal, 12)
             }
         }
     }
@@ -1723,30 +1745,62 @@ struct BrowserScreen: View {
         .padding(.horizontal, 4)
     }
 
-    // Exact iOS 26 Safari Continuous Liquid Glass Morphing URL Island (matches KakaoTalk_20261124_214451018.mp4!)
-    private func morphingUrlIsland(collapsed: Bool) -> some View {
-        let outerCorner: CGFloat = collapsed ? 17.5 : 43
+    // Exact iOS 26 Safari Continuous Liquid Glass Morphing URL Island (38.5pt top / 45.5pt bottom concentric radii + live scroll-coupled morph!)
+    private func morphingUrlIsland(progress: CGFloat, isBottom: Bool) -> some View {
+        let p = max(0.0, min(1.0, progress))
+        let chromeReveal = max(0.0, min(1.0, (0.66 - p) / 0.66))
+        let pillPhase = max(0.0, min(1.0, (p - 0.66) / 0.34))
+        let isCollapsedDisplay = p >= 0.50
+
+        let row1H: CGFloat = p <= 0.66
+            ? (48.0 - 4.0 * (1.0 - chromeReveal))
+            : (44.0 - 13.0 * pillPhase)
+        let row2H: CGFloat = 44.0 * chromeReveal
+        let vSpacing: CGFloat = 8.0 * chromeReveal
+        let topPad: CGFloat = 13.0 * chromeReveal
+        let botPad: CGFloat = 12.0 * chromeReveal
+        let totalH: CGFloat = topPad + row1H + vSpacing + row2H + botPad
+
+        let collapsedTitle = model.collapsedPillTitle
+        let expandedW = max(240.0, screenContainerWidth - 24.0)
+        let collapsedW = collapsedPillWidth(for: collapsedTitle)
+        let currentW = expandedW + (collapsedW - expandedW) * p
+
+        let collapsedR = totalH * 0.5
+        let expTopR: CGFloat = isBottom ? 38.5 : 45.5
+        let expBotR: CGFloat = isBottom ? 45.5 : 38.5
+        let topR = expTopR * chromeReveal + collapsedR * (1.0 - chromeReveal)
+        let botR = expBotR * chromeReveal + collapsedR * (1.0 - chromeReveal)
+        let islandShape = SafariIslandShape(topRadius: topR, bottomRadius: botR)
+
         let activeShortcuts = model.preferences.toolbarShortcuts.isEmpty
             ? ToolbarShortcutAction.defaultOrder
             : model.preferences.toolbarShortcuts
-        let displayURL = collapsed
-            ? model.collapsedPillTitle
+        let displayURL = isCollapsedDisplay
+            ? collapsedTitle
             : (address.isEmpty ? "검색 또는 주소 입력" : address)
+        let textScale: CGFloat = 1.0 - 0.17 * p
+        let textLeadPad: CGFloat = 14.0 * (1.0 - chromeReveal) + (model.preferences.showFullURL ? 50.0 : 78.0) * chromeReveal
+        let textTrailPad: CGFloat = 14.0 * (1.0 - chromeReveal) + 78.0 * chromeReveal
 
-        return VStack(spacing: collapsed ? 0 : 8) {
-            // Row 1: Smoothly morphs between 48pt expanded address capsule and 36pt compact centered Safari pill
+        return VStack(spacing: vSpacing) {
+            // Row 1: Smoothly morphs 1:1 with scroll drag between 48pt expanded address capsule and 31pt tight Safari pill
             ZStack {
-                // Inner dark capsule dissolves seamlessly when shrinking into the compact pill
+                // Inner dark capsule dissolves seamlessly as chromeReveal -> 0
                 Capsule()
-                    .fill(model.preferences.liquidGlassUi ? Color.white.opacity(collapsed ? 0.0 : 0.08) : androidFieldColor.opacity(collapsed ? 0.0 : 1.0))
+                    .fill(
+                        model.preferences.liquidGlassUi
+                            ? Color.white.opacity(0.08 * chromeReveal)
+                            : androidFieldColor.opacity(chromeReveal)
+                    )
                     .overlay(
                         Capsule()
                             .strokeBorder(
                                 addressFocused
                                     ? androidAccentColor
                                     : (model.preferences.liquidGlassUi
-                                        ? Color.white.opacity(collapsed ? 0.0 : 0.18)
-                                        : androidOutlineColor.opacity(collapsed ? 0.0 : 1.0)),
+                                        ? Color.white.opacity(0.18 * chromeReveal)
+                                        : androidOutlineColor.opacity(chromeReveal)),
                                 lineWidth: addressFocused ? 1.2 : 0.8
                             )
                     )
@@ -1767,35 +1821,35 @@ struct BrowserScreen: View {
                     }
                     .padding(.leading, 48)
                     .padding(.trailing, 42)
-                    .opacity((addressFocused && !collapsed) ? 1.0 : 0.0)
-                    .allowsHitTesting(addressFocused && !collapsed)
+                    .opacity((addressFocused && !isCollapsedDisplay) ? 1.0 : 0.0)
+                    .allowsHitTesting(addressFocused && !isCollapsedDisplay)
 
-                // Single continuous dead-center domain/URL label (glides & scales seamlessly during Safari collapse/expand!)
+                // Single continuous dead-center domain/URL label (glides & scales 1:1 during scroll morph!)
                 Text(displayURL)
-                    .font(.system(size: 15, weight: collapsed ? .semibold : .medium))
+                    .font(.system(size: 15, weight: isCollapsedDisplay ? .semibold : .medium))
                     .foregroundStyle(
-                        address.isEmpty && !collapsed
+                        address.isEmpty && !isCollapsedDisplay
                             ? androidMutedColor
-                            : (collapsed ? .white : androidOnSurfaceColor)
+                            : (isCollapsedDisplay ? .white : androidOnSurfaceColor)
                     )
-                    .shadow(color: .black.opacity(collapsed ? 0.65 : 0.0), radius: collapsed ? 2 : 0)
+                    .shadow(color: .black.opacity(0.65 * p), radius: 2 * p)
                     .lineLimit(1)
-                    .scaleEffect(collapsed ? 0.83 : 1.0)
-                    .padding(.leading, collapsed ? 14 : (model.preferences.showFullURL ? 50 : 78))
-                    .padding(.trailing, collapsed ? 14 : 78)
+                    .scaleEffect(textScale)
+                    .padding(.leading, textLeadPad)
+                    .padding(.trailing, textTrailPad)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .contentShape(Rectangle())
                     .opacity(addressFocused ? 0.0 : 1.0)
                     .allowsHitTesting(!addressFocused)
                     .onTapGesture {
-                        if collapsed {
+                        if model.isChromeCollapsed || isCollapsedDisplay {
                             expandCollapsedToolbar()
                         } else {
                             addressFocused = true
                         }
                     }
 
-                // Left Page Tools Button + Right Bookmark/Reload/Clear Buttons (fade & scale inside Row 1)
+                // Left Page Tools Button + Right Bookmark/Reload/Clear Buttons (fade & scale smoothly with chromeReveal)
                 HStack(spacing: 0) {
                     Button {
                         UIImpactFeedbackGenerator(style: .light).impactOccurred()
@@ -1858,13 +1912,13 @@ struct BrowserScreen: View {
                     }
                 }
                 .padding(.horizontal, 6)
-                .opacity(collapsed ? 0.0 : 1.0)
-                .scaleEffect(collapsed ? 0.68 : 1.0)
-                .allowsHitTesting(!collapsed)
+                .opacity(chromeReveal)
+                .scaleEffect(0.72 + 0.28 * chromeReveal)
+                .allowsHitTesting(chromeReveal > 0.5)
             }
-            .frame(height: collapsed ? 35 : 48)
+            .frame(height: row1H)
 
-            // Row 2: Action icons smoothly fold vertically & scale down inside the clipping Liquid Glass shell!
+            // Row 2: Action icons smoothly fold vertically & scale down inside the clipping island!
             GeometryReader { navGeo in
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 2) {
@@ -1876,37 +1930,36 @@ struct BrowserScreen: View {
                     .frame(minWidth: navGeo.size.width, minHeight: 44)
                 }
             }
-            .frame(height: collapsed ? 0 : 44)
-            .scaleEffect(collapsed ? 0.78 : 1.0, anchor: .top)
-            .opacity(collapsed ? 0.0 : 1.0)
+            .frame(height: row2H)
+            .scaleEffect(0.76 + 0.24 * chromeReveal, anchor: .top)
+            .opacity(pow(chromeReveal, 1.35))
             .clipped()
-            .allowsHitTesting(!collapsed)
+            .allowsHitTesting(chromeReveal > 0.5)
         }
-        .padding(.horizontal, collapsed ? 4 : 12)
-        .padding(.top, collapsed ? 0 : 13)
-        .padding(.bottom, collapsed ? 0 : 12)
-        .frame(maxWidth: collapsed ? 186 : .infinity)
-        .clipShape(RoundedRectangle(cornerRadius: outerCorner, style: .continuous))
+        .padding(.horizontal, 12.0 * chromeReveal)
+        .padding(.top, topPad)
+        .padding(.bottom, botPad)
+        .frame(width: currentW)
+        .clipShape(islandShape)
         .background {
-            let shape = RoundedRectangle(cornerRadius: outerCorner, style: .continuous)
             if model.preferences.liquidGlassUi {
                 LiquidGlassShapeBackground(
-                    shape: shape,
-                    tintOpacity: collapsed ? 0.30 : 0.44,
-                    rimOpacity: collapsed ? 0.32 : 0.34,
-                    specularOpacity: collapsed ? 0.20 : 0.24,
-                    shadowRadius: collapsed ? 10 : 16
+                    shape: islandShape,
+                    tintOpacity: 0.44 - 0.14 * p,
+                    rimOpacity: 0.34 - 0.02 * p,
+                    specularOpacity: 0.24 - 0.04 * p,
+                    shadowRadius: 16 - 6 * p
                 )
             } else {
-                shape
-                    .fill(Color(red: 0.129, green: 0.114, blue: 0.106, opacity: collapsed ? 0.84 : 0.92))
+                islandShape
+                    .fill(Color(red: 0.129, green: 0.114, blue: 0.106, opacity: 0.92 - 0.08 * p))
                     .overlay(
-                        shape.strokeBorder(androidOutlineColor, lineWidth: 1.0)
+                        islandShape.strokeBorder(androidOutlineColor, lineWidth: 1.0)
                     )
-                    .shadow(color: .black.opacity(0.30), radius: collapsed ? 6 : 10, y: 4)
+                    .shadow(color: .black.opacity(0.30), radius: 10 - 4 * p, y: 4)
             }
         }
-        .contentShape(RoundedRectangle(cornerRadius: outerCorner, style: .continuous))
+        .contentShape(islandShape)
     }
 
     private func androidToolbarButton(for shortcut: ToolbarShortcutAction) -> some View {
