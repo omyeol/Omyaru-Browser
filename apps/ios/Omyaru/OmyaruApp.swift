@@ -647,7 +647,7 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
     static let defaultProfileID = UUID(uuidString: "00000000-0000-0000-0000-000000000010")!
     static let defaultGroupID = UUID(uuidString: "00000000-0000-0000-0000-000000000002")!
     static let appVersionName = "0.15.18"
-    static let appBuildNumber = 105
+    static let appBuildNumber = 106
 
     var isApplyingRemoteSync: Bool = false
 
@@ -704,6 +704,7 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
     private var pullRefreshStartedAt: [UUID: Date] = [:]
     var tabCardThumbRects: [UUID: CGRect] = [:]
     var tabCardIsHeroMap: [UUID: Bool] = [:]
+    var savedTabOverviewScrollY: [UUID: CGFloat] = [:]
     private var compiledContentRuleList: WKContentRuleList? = nil
     private var lastScrollOffsetY: CGFloat = 0
     private var toolbarScrollAccumulator: CGFloat = 0

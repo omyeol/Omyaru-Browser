@@ -534,6 +534,155 @@ private struct ClosingTabGhostCardView<Content: View>: View {
     }
 }
 
+/// Non-intrusive UIScrollView bridge for TabOverview:
+/// - Preserves scroll position via KVO (never touches SwiftUI's UIScrollView.delegate)
+/// - Applies exact pre-flight scroll offset before Hero Zoom shrink so the active tab NEVER overlaps top/bottom buttons!
+private struct TabGridScrollBridge: UIViewRepresentable {
+    let targetInitialScrollY: CGFloat
+    let maxScrollY: CGFloat
+    let shouldApplyInitialScroll: Bool
+    let isLayoutReady: Bool
+    let onInitialScrollApplied: (CGFloat) -> Void
+    let onScrollOffsetChanged: (CGFloat) -> Void
+
+    final class ProbeView: UIView {
+        var onWindowAttached: (() -> Void)?
+
+        override func didMoveToWindow() {
+            super.didMoveToWindow()
+            if window != nil {
+                onWindowAttached?()
+            }
+        }
+    }
+
+    final class Coordinator {
+        weak var probeView: ProbeView?
+        weak var scrollView: UIScrollView?
+        var observation: NSKeyValueObservation?
+        var hasAppliedInitialScroll = false
+        var lastReportedY: CGFloat = -999
+        var targetY: CGFloat = 0
+        var maxY: CGFloat = 0
+        var shouldApply: Bool = false
+        var isLayoutReady: Bool = false
+        var onInitialScrollApplied: (CGFloat) -> Void
+        var onScrollOffsetChanged: (CGFloat) -> Void
+
+        init(
+            onInitialScrollApplied: @escaping (CGFloat) -> Void,
+            onScrollOffsetChanged: @escaping (CGFloat) -> Void
+        ) {
+            self.onInitialScrollApplied = onInitialScrollApplied
+            self.onScrollOffsetChanged = onScrollOffsetChanged
+        }
+
+        deinit {
+            observation?.invalidate()
+        }
+
+        private func findScrollViewIfNeeded() {
+            guard scrollView == nil, let start = probeView else { return }
+            var cur = start.superview
+            while let v = cur {
+                if let sv = v as? UIScrollView, !sv.isPagingEnabled {
+                    scrollView = sv
+                    observation = sv.observe(\.contentOffset, options: [.new]) { [weak self] sv, _ in
+                        guard let self, self.hasAppliedInitialScroll else { return }
+                        let minY = -sv.adjustedContentInset.top
+                        let y = max(0, sv.contentOffset.y - minY)
+                        if abs(y - self.lastReportedY) > 1.0 {
+                            self.lastReportedY = y
+                            self.onScrollOffsetChanged(y)
+                        }
+                    }
+                    break
+                }
+                cur = v.superview
+            }
+        }
+
+        func applyIfReady(retryCount: Int = 0) {
+            findScrollViewIfNeeded()
+            guard !hasAppliedInitialScroll, isLayoutReady else { return }
+            guard shouldApply else {
+                hasAppliedInitialScroll = true
+                let minY = -(scrollView?.adjustedContentInset.top ?? 0)
+                let curY = max(0, (scrollView?.contentOffset.y ?? minY) - minY)
+                lastReportedY = curY
+                onScrollOffsetChanged(curY)
+                DispatchQueue.main.async { [weak self] in
+                    self?.onInitialScrollApplied(curY)
+                }
+                return
+            }
+            guard let sv = scrollView else {
+                if retryCount < 6 {
+                    DispatchQueue.main.async { [weak self] in
+                        self?.applyIfReady(retryCount: retryCount + 1)
+                    }
+                }
+                return
+            }
+            sv.layoutIfNeeded()
+            let minY = -sv.adjustedContentInset.top
+            let availableScroll = max(0, sv.contentSize.height + sv.adjustedContentInset.bottom + sv.adjustedContentInset.top - sv.bounds.height)
+            if sv.bounds.height < 10 || (targetY > 1 && availableScroll < 1 && retryCount < 6) {
+                DispatchQueue.main.async { [weak self] in
+                    self?.applyIfReady(retryCount: retryCount + 1)
+                }
+                return
+            }
+            hasAppliedInitialScroll = true
+            let effectiveMax = availableScroll > 1 ? availableScroll : maxY
+            let clampedY = min(max(0, effectiveMax), max(0, targetY))
+            let actualOffsetY = minY + clampedY
+            if abs(sv.contentOffset.y - actualOffsetY) > 0.5 {
+                sv.setContentOffset(CGPoint(x: sv.contentOffset.x, y: actualOffsetY), animated: false)
+                sv.layoutIfNeeded()
+            }
+            lastReportedY = clampedY
+            onScrollOffsetChanged(clampedY)
+            DispatchQueue.main.async { [weak self] in
+                self?.onInitialScrollApplied(clampedY)
+            }
+        }
+    }
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(
+            onInitialScrollApplied: onInitialScrollApplied,
+            onScrollOffsetChanged: onScrollOffsetChanged
+        )
+    }
+
+    func makeUIView(context: Context) -> ProbeView {
+        let v = ProbeView(frame: .zero)
+        v.isUserInteractionEnabled = false
+        v.backgroundColor = .clear
+        let coord = context.coordinator
+        coord.probeView = v
+        v.onWindowAttached = { [weak coord] in
+            coord?.applyIfReady(retryCount: 0)
+        }
+        return v
+    }
+
+    func updateUIView(_ uiView: ProbeView, context: Context) {
+        let coord = context.coordinator
+        coord.probeView = uiView
+        coord.onInitialScrollApplied = onInitialScrollApplied
+        coord.onScrollOffsetChanged = onScrollOffsetChanged
+        if !coord.hasAppliedInitialScroll {
+            coord.targetY = targetInitialScrollY
+            coord.maxY = maxScrollY
+            coord.shouldApply = shouldApplyInitialScroll
+            coord.isLayoutReady = isLayoutReady
+            coord.applyIfReady(retryCount: 0)
+        }
+    }
+}
+
 // MARK: - Main Browser Screen
 
 struct BrowserScreen: View {
@@ -680,6 +829,7 @@ struct BrowserScreen: View {
             if showTabs {
                 TabOverview(
                     initialGroupID: model.activeGroupID,
+                    initialSavedScrollOffsets: model.savedTabOverviewScrollY,
                     morphProgress: overviewMorphProgress,
                     isExpandingToWeb: isExpandingToWeb,
                     hiddenHeroTabID: heroMorphHiddenTabID,
@@ -2285,6 +2435,7 @@ private struct TabCardGestureOverlay: UIViewRepresentable {
 
 struct TabOverview: View {
     @EnvironmentObject private var model: BrowserModel
+    let initialSavedScrollOffsets: [UUID: CGFloat]
     var morphProgress: CGFloat = 1.0
     var isExpandingToWeb: Bool = false
     var hiddenHeroTabID: UUID? = nil
@@ -2341,6 +2492,7 @@ struct TabOverview: View {
 
     init(
         initialGroupID: UUID = BrowserModel.defaultGroupID,
+        initialSavedScrollOffsets: [UUID: CGFloat] = [:],
         morphProgress: CGFloat = 1.0,
         isExpandingToWeb: Bool = false,
         hiddenHeroTabID: UUID? = nil,
@@ -2349,6 +2501,7 @@ struct TabOverview: View {
         onNewTabWithHero: @escaping (CGRect?, Bool) -> Void = { _, _ in },
         onDismiss: @escaping () -> Void
     ) {
+        self.initialSavedScrollOffsets = initialSavedScrollOffsets
         self.morphProgress = morphProgress
         self.isExpandingToWeb = isExpandingToWeb
         self.hiddenHeroTabID = hiddenHeroTabID
@@ -2390,6 +2543,7 @@ struct TabOverview: View {
 
             VStack(spacing: 0) {
                 liquidGlassTopBar
+                    .zIndex(10)
 
                 // Exact Frames 00:15 -> 00:21: Native Interactive Horizontal Swipe Pager across ALL Groups!
                 TabView(selection: $pagedGroupID) {
@@ -2401,8 +2555,10 @@ struct TabOverview: View {
                 .tabViewStyle(.page(indexDisplayMode: .never))
                 .scrollDisabled(draggingTabID != nil || contextMenuTab != nil)
                 .animation(.spring(response: 0.34, dampingFraction: 0.86), value: pagedGroupID)
+                .zIndex(1)
 
                 liquidGlassBottomCarouselBar
+                    .zIndex(10)
             }
             .scaleEffect(isExpandingToWeb ? (0.95 + 0.05 * morphProgress) : 1.0)
             .opacity(Double(morphProgress))
@@ -2634,14 +2790,32 @@ struct TabOverview: View {
             let heroH = min(outerGeo.size.height * 0.60, heroW * 1.38)
             let cellWidth = max(46, (contentW - CGFloat(colCount - 1) * 12) / CGFloat(colCount))
             let gridThumbHeight = min(290, max(78, cellWidth * ratio))
+            let gridCellH = gridThumbHeight + 25
             let rowCount = max(1, (groupTabs.count + colCount - 1) / colCount)
-            let estimatedGridH = CGFloat(rowCount) * (gridThumbHeight + 25) + CGFloat(max(0, rowCount - 1)) * 14 + 36
+            let headerOffset: CGFloat = (headerTitle == nil ? 0 : 50)
+            let gridTopPad: CGFloat = isSingleHero ? 0 : 8
+            let naturalGridH: CGFloat = isSingleHero
+                ? (16 + heroH + 25 + 16)
+                : (gridTopPad + CGFloat(rowCount) * gridCellH + CGFloat(max(0, rowCount - 1)) * 14 + 16)
+            let totalContentH = headerOffset + naturalGridH + 12
+            let viewportH = max(1, outerGeo.size.height)
+            let maxScrollY = max(0, totalContentH - viewportH)
             let activeIndex = groupTabs.firstIndex(where: { $0.id == model.activeID })
-            let isOverflowing = (!isSingleHero && useGridLayout && estimatedGridH > outerGeo.size.height - 20)
-            let needsInitialScroll = isOverflowing && (
-                (activeIndex.map { $0 >= colCount } ?? false) ||
-                (activeIndex == nil && model.preferences.tabsStartFromBottom)
+            let desiredScrollY = computeDesiredInitialScrollY(
+                groupID: groupID,
+                activeIndex: activeIndex,
+                colCount: colCount,
+                headerOffset: headerOffset,
+                gridTopPad: gridTopPad,
+                gridCellH: gridCellH,
+                viewportH: viewportH,
+                maxScrollY: maxScrollY,
+                isSingleHero: isSingleHero
             )
+            let activeCardTopInContent: CGFloat = activeIndex.map {
+                headerOffset + gridTopPad + CGFloat($0 / colCount) * (gridCellH + 14)
+            } ?? 0
+            let needsInitialScroll = (!isSingleHero && useGridLayout && desiredScrollY > 1.0)
 
             ScrollViewReader { proxy in
                 ScrollView(showsIndicators: false) {
@@ -2651,8 +2825,8 @@ struct TabOverview: View {
                             Text(headerTitle)
                                 .font(.system(size: 28, weight: .bold))
                                 .foregroundStyle(.white)
+                                .frame(height: 38, alignment: .leading)
                                 .padding(.horizontal, 16)
-                                .padding(.top, 4)
                         }
 
                         if groupTabs.isEmpty {
@@ -2691,48 +2865,62 @@ struct TabOverview: View {
                         }
                     }
                     .padding(.bottom, 12)
+                    .background(
+                        TabGridScrollBridge(
+                            targetInitialScrollY: desiredScrollY,
+                            maxScrollY: maxScrollY,
+                            shouldApplyInitialScroll: needsInitialScroll,
+                            isLayoutReady: outerGeo.size.height > 100,
+                            onInitialScrollApplied: { _ in
+                                initialScrollAppearedGroupIDs.insert(groupID)
+                                guard groupID == model.activeGroupID else { return }
+                                if !needsInitialScroll {
+                                    commitFramesAndSignalReady(
+                                        groupID: groupID,
+                                        groupTabs: groupTabs,
+                                        cardH: isSingleHero ? heroH : gridThumbHeight,
+                                        isSingleHero: isSingleHero
+                                    )
+                                }
+                            },
+                            onScrollOffsetChanged: { offsetY in
+                                model.savedTabOverviewScrollY[groupID] = offsetY
+                            }
+                        )
+                        .frame(width: 1, height: 1)
+                        .allowsHitTesting(false)
+                    )
                 }
                 .scrollDisabled(draggingTabID != nil || contextMenuTab != nil)
                 .onAppear {
                     groupViewportRects[groupID] = outerGeo.frame(in: .global)
                     guard groupID == model.activeGroupID else { return }
-                    initialScrollAppearedGroupIDs.insert(groupID)
                     if needsInitialScroll {
-                        if groupTabs.contains(where: { $0.id == model.activeID }) {
-                            proxy.scrollTo(model.activeID, anchor: .center)
-                        } else if model.preferences.tabsStartFromBottom, let lastID = groupTabs.last?.id {
-                            proxy.scrollTo(lastID, anchor: .bottom)
-                        }
-                        // Safety fallback if scrollTo clamped with <2pt change (beats BrowserScreen's 120ms timer)
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.06) {
+                        // Safety fallback if UIScrollView scroll finishes without moving >2pt (beats BrowserScreen's 120ms timer)
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.07) {
                             guard !initialScrollReadyGroupIDs.contains(groupID) else { return }
-                            let currentCardH = isSingleHero ? heroH : gridThumbHeight
-                            for tab in groupTabs {
-                                if let rect = tabFrames[tab.id] {
-                                    model.tabCardThumbRects[tab.id] = CGRect(x: rect.minX, y: rect.minY, width: rect.width, height: currentCardH)
-                                    model.tabCardIsHeroMap[tab.id] = isSingleHero
-                                }
-                            }
-                            initialScrollReadyGroupIDs.insert(groupID)
-                            onCardRectsUpdated()
+                            commitFramesAndSignalReady(
+                                groupID: groupID,
+                                groupTabs: groupTabs,
+                                cardH: isSingleHero ? heroH : gridThumbHeight,
+                                isSingleHero: isSingleHero
+                            )
                         }
                     } else {
-                        let currentCardH = isSingleHero ? heroH : gridThumbHeight
-                        for tab in groupTabs {
-                            if let rect = tabFrames[tab.id] {
-                                model.tabCardThumbRects[tab.id] = CGRect(x: rect.minX, y: rect.minY, width: rect.width, height: currentCardH)
-                                model.tabCardIsHeroMap[tab.id] = isSingleHero
-                            }
-                        }
-                        initialScrollReadyGroupIDs.insert(groupID)
-                        onCardRectsUpdated()
+                        commitFramesAndSignalReady(
+                            groupID: groupID,
+                            groupTabs: groupTabs,
+                            cardH: isSingleHero ? heroH : gridThumbHeight,
+                            isSingleHero: isSingleHero
+                        )
                     }
                 }
                 .onChange(of: outerGeo.size) { _ in
                     groupViewportRects[groupID] = outerGeo.frame(in: .global)
                 }
                 .onPreferenceChange(TabCardFramePreferenceKey.self) { frames in
-                    groupViewportRects[groupID] = outerGeo.frame(in: .global)
+                    let vpRect = outerGeo.frame(in: .global)
+                    groupViewportRects[groupID] = vpRect
                     let currentCardH = isSingleHero ? heroH : gridThumbHeight
                     for (id, rect) in frames {
                         tabFrames[id] = rect
@@ -2741,13 +2929,12 @@ struct TabOverview: View {
 
                     if groupID == model.activeGroupID && needsInitialScroll && !initialScrollReadyGroupIDs.contains(groupID) {
                         if let activeRect = frames[model.activeID] {
+                            let expectedActiveMinY = vpRect.minY + activeCardTopInContent - desiredScrollY
+                            let matchesExpected = abs(activeRect.minY - expectedActiveMinY) < 24
                             if preScrollActiveMinY[groupID] == nil {
                                 preScrollActiveMinY[groupID] = activeRect.minY
-                                let viewportMidY = outerGeo.frame(in: .global).midY
-                                let alreadyCenteredAfterAppear = initialScrollAppearedGroupIDs.contains(groupID)
-                                    && abs(activeRect.midY - viewportMidY) < 16
-                                guard alreadyCenteredAfterAppear else { return }
-                            } else if let preY = preScrollActiveMinY[groupID], abs(activeRect.minY - preY) <= 2.0 {
+                                guard matchesExpected && initialScrollAppearedGroupIDs.contains(groupID) else { return }
+                            } else if let preY = preScrollActiveMinY[groupID], abs(activeRect.minY - preY) <= 2.0 && !matchesExpected {
                                 return
                             }
                             initialScrollReadyGroupIDs.insert(groupID)
@@ -2769,6 +2956,61 @@ struct TabOverview: View {
         }
     }
 
+    private func computeDesiredInitialScrollY(
+        groupID: UUID,
+        activeIndex: Int?,
+        colCount: Int,
+        headerOffset: CGFloat,
+        gridTopPad: CGFloat,
+        gridCellH: CGFloat,
+        viewportH: CGFloat,
+        maxScrollY: CGFloat,
+        isSingleHero: Bool
+    ) -> CGFloat {
+        guard !isSingleHero, useGridLayout, maxScrollY > 1.0 else { return 0 }
+        let savedRaw = initialSavedScrollOffsets[groupID]
+        let defaultScrollY: CGFloat = model.preferences.tabsStartFromBottom ? maxScrollY : 0
+        let baseScrollY = min(maxScrollY, max(0, savedRaw ?? defaultScrollY))
+
+        guard let activeIndex else { return baseScrollY }
+        let row = activeIndex / colCount
+        let cardTop = headerOffset + gridTopPad + CGFloat(row) * (gridCellH + 14)
+        let cardBottom = cardTop + gridCellH
+
+        // Exact Safari top/bottom bar clearance margins inside outerGeo (outerGeo lies strictly between top & bottom bars)
+        let topClearance: CGFloat = 8
+        let bottomClearance: CGFloat = 12
+
+        let visibleTop = cardTop - baseScrollY
+        let visibleBottom = cardBottom - baseScrollY
+
+        if visibleTop < topClearance {
+            // Card was tucked under / above the top buttons -> scroll UP just enough so card clears top bar cleanly
+            return min(maxScrollY, max(0, cardTop - topClearance))
+        }
+        if visibleBottom > viewportH - bottomClearance {
+            // Card (or its title) was tucked under / below the bottom buttons -> scroll DOWN just enough so card clears bottom bar cleanly
+            return min(maxScrollY, max(0, cardBottom - (viewportH - bottomClearance)))
+        }
+        return baseScrollY
+    }
+
+    private func commitFramesAndSignalReady(
+        groupID: UUID,
+        groupTabs: [BrowserTab],
+        cardH: CGFloat,
+        isSingleHero: Bool
+    ) {
+        for tab in groupTabs {
+            if let rect = tabFrames[tab.id] {
+                model.tabCardThumbRects[tab.id] = CGRect(x: rect.minX, y: rect.minY, width: rect.width, height: cardH)
+                model.tabCardIsHeroMap[tab.id] = isSingleHero
+            }
+        }
+        initialScrollReadyGroupIDs.insert(groupID)
+        onCardRectsUpdated()
+    }
+
     private func unifiedTabGrid(
         groupTabs: [BrowserTab],
         groupID: UUID,
@@ -2785,12 +3027,13 @@ struct TabOverview: View {
     ) -> some View {
         let colSpacing: CGFloat = 12
         let rowSpacing: CGFloat = 14
+        let gridTopPad: CGFloat = isSingleHero ? 0 : 8
         let gridCellH = gridThumbHeight + 25
         let heroCellH = heroH + 25
         let rowCount = max(1, (groupTabs.count + colCount - 1) / colCount)
         let naturalGridH: CGFloat = isSingleHero
             ? (16 + heroCellH + 16)
-            : (CGFloat(rowCount) * gridCellH + CGFloat(max(0, rowCount - 1)) * rowSpacing + 16)
+            : (gridTopPad + CGFloat(rowCount) * gridCellH + CGFloat(max(0, rowCount - 1)) * rowSpacing + 16)
         let minContainerH = max(0, outerGeo.size.height - (headerTitle == nil ? 12 : 54))
         let groupGhosts = closingGhosts.filter { $0.groupID == groupID }
 
@@ -2873,7 +3116,7 @@ struct TabOverview: View {
         let cardH = isSingleHero ? heroH : gridThumbHeight
         let cellH = isSingleHero ? heroCellH : gridCellH
         let slotX = isSingleHero ? max(0, (contentW - heroW) * 0.5) : CGFloat(col) * (cellWidth + colSpacing)
-        let slotY = isSingleHero ? 16 : CGFloat(row) * (gridCellH + rowSpacing)
+        let slotY = isSingleHero ? 16 : (8 + CGFloat(row) * (gridCellH + rowSpacing))
 
         return safariTabCard(
             tab: tab,
@@ -2989,7 +3232,7 @@ struct TabOverview: View {
         let cardH = isSingleHero ? heroH : thumbH
         let cellH = cardH + 25
         let slotX = isSingleHero ? max(0, (contentW - heroW) * 0.5) : CGFloat(col) * (cellW + 12)
-        let slotY = isSingleHero ? 16 : CGFloat(row) * (gridCellH + 14)
+        let slotY = isSingleHero ? 16 : (8 + CGFloat(row) * (gridCellH + 14))
 
         closeTabWithSafariAnimation(
             tab: tab,
