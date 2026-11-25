@@ -647,7 +647,7 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
     static let defaultProfileID = UUID(uuidString: "00000000-0000-0000-0000-000000000010")!
     static let defaultGroupID = UUID(uuidString: "00000000-0000-0000-0000-000000000002")!
     static let appVersionName = "0.15.18"
-    static let appBuildNumber = 107
+    static let appBuildNumber = 108
 
     var isApplyingRemoteSync: Bool = false
 
@@ -1355,7 +1355,7 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
         let topInset: CGFloat
         if preferences.addressBarPosition == .bottom {
             topInset = 0
-            bottomInset = isChromeCollapsed ? 46 : 124
+            bottomInset = isChromeCollapsed ? 52 : 124
         } else {
             topInset = isChromeCollapsed ? 56 : 124
             bottomInset = 0

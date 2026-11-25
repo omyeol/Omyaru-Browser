@@ -683,6 +683,141 @@ private struct TabGridScrollBridge: UIViewRepresentable {
     }
 }
 
+/// Official UIKit multi-band progressive Gaussian blur for the top status-bar edge (zero milky tint bar, zero private APIs).
+private final class GaussianBlurBandView: UIView {
+    private let effectView = UIVisualEffectView(effect: nil)
+    private let maskLayer = CAGradientLayer()
+    private var animator: UIViewPropertyAnimator?
+    private let intensity: CGFloat
+    private var isLightStyle: Bool
+    private var foregroundObserver: NSObjectProtocol?
+
+    init(intensity: CGFloat, isLight: Bool, midStop: NSNumber, midAlpha: CGFloat) {
+        self.intensity = intensity
+        self.isLightStyle = isLight
+        super.init(frame: .zero)
+        isUserInteractionEnabled = false
+        backgroundColor = .clear
+        clipsToBounds = true
+
+        effectView.isUserInteractionEnabled = false
+        effectView.overrideUserInterfaceStyle = isLight ? .light : .dark
+        addSubview(effectView)
+
+        maskLayer.colors = [
+            UIColor.black.cgColor,
+            UIColor.black.withAlphaComponent(midAlpha).cgColor,
+            UIColor.clear.cgColor
+        ]
+        maskLayer.locations = [0.0, midStop, 1.0]
+        maskLayer.startPoint = CGPoint(x: 0.5, y: 0.0)
+        maskLayer.endPoint = CGPoint(x: 0.5, y: 1.0)
+        layer.mask = maskLayer
+
+        foregroundObserver = NotificationCenter.default.addObserver(
+            forName: UIApplication.willEnterForegroundNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.rebuildAnimator()
+        }
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    deinit {
+        if let obs = foregroundObserver {
+            NotificationCenter.default.removeObserver(obs)
+        }
+        animator?.stopAnimation(true)
+        animator = nil
+    }
+
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        if window != nil {
+            rebuildAnimator()
+        }
+    }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        effectView.frame = bounds
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        maskLayer.frame = bounds
+        CATransaction.commit()
+    }
+
+    func updateStyle(isLight: Bool) {
+        guard isLightStyle != isLight else { return }
+        isLightStyle = isLight
+        effectView.overrideUserInterfaceStyle = isLight ? .light : .dark
+        rebuildAnimator()
+    }
+
+    private func rebuildAnimator() {
+        animator?.stopAnimation(true)
+        animator = nil
+        effectView.effect = nil
+        let targetStyle: UIBlurEffect.Style = isLightStyle ? .systemUltraThinMaterialLight : .systemUltraThinMaterialDark
+        let anim = UIViewPropertyAnimator(duration: 1.0, curve: .linear) { [weak self] in
+            self?.effectView.effect = UIBlurEffect(style: targetStyle)
+        }
+        anim.pausesOnCompletion = true
+        anim.fractionComplete = intensity
+        animator = anim
+    }
+}
+
+private final class ProgressiveGaussianBlurContainerView: UIView {
+    private let bands: [(view: GaussianBlurBandView, heightRatio: CGFloat)]
+
+    init(isLight: Bool) {
+        self.bands = [
+            (GaussianBlurBandView(intensity: 0.14, isLight: isLight, midStop: 0.50, midAlpha: 0.52), 1.00),
+            (GaussianBlurBandView(intensity: 0.25, isLight: isLight, midStop: 0.55, midAlpha: 0.45), 0.82),
+            (GaussianBlurBandView(intensity: 0.38, isLight: isLight, midStop: 0.60, midAlpha: 0.40), 0.64),
+            (GaussianBlurBandView(intensity: 0.52, isLight: isLight, midStop: 0.65, midAlpha: 0.35), 0.46)
+        ]
+        super.init(frame: .zero)
+        isUserInteractionEnabled = false
+        backgroundColor = .clear
+        for band in bands {
+            addSubview(band.view)
+        }
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        let w = bounds.width
+        let h = bounds.height
+        for band in bands {
+            band.view.frame = CGRect(x: 0, y: 0, width: w, height: h * band.heightRatio)
+        }
+    }
+
+    func updateStyle(isLight: Bool) {
+        for band in bands {
+            band.view.updateStyle(isLight: isLight)
+        }
+    }
+}
+
+private struct ProgressiveGaussianBlurView: UIViewRepresentable {
+    let isLight: Bool
+
+    func makeUIView(context: Context) -> ProgressiveGaussianBlurContainerView {
+        ProgressiveGaussianBlurContainerView(isLight: isLight)
+    }
+
+    func updateUIView(_ uiView: ProgressiveGaussianBlurContainerView, context: Context) {
+        uiView.updateStyle(isLight: isLight)
+    }
+}
+
 // MARK: - Main Browser Screen
 
 struct BrowserScreen: View {
@@ -857,12 +992,11 @@ struct BrowserScreen: View {
                 .zIndex(isHeroMorphing ? 5 : 15)
             }
 
-            // Safari-style seamless top color fill (y == 0) + subtle progressive edge blur + Morphing Liquid Glass URL Island
+            // Safari-style seamless top color fill (y == 0) + progressive top Gaussian blur + Morphing Liquid Glass URL Island
             ZStack {
                 VStack(spacing: 0) {
                     topEdgeBlurOverlay
                     Spacer(minLength: 0)
-                    bottomEdgeBlurOverlay
                 }
                 .ignoresSafeArea()
                 .allowsHitTesting(false)
@@ -1142,10 +1276,10 @@ struct BrowserScreen: View {
 
     private var topEdgeBlurOverlay: some View {
         let safeTop = max(44, screenSafeAreaInsets.top)
-        let h = safeTop + 16
+        let h = safeTop + 24
         let topFillColor = model.activePageTopUIColor.map { Color(uiColor: $0) }
         return ZStack(alignment: .top) {
-            // Seamless top color fill at scroll y == 0 (matches Safari Screenshot 3 — fills notch/Dynamic Island sides!)
+            // Seamless top color fill at scroll y == 0 (fills notch/Dynamic Island sides!)
             if !model.isStartPage, let topFillColor {
                 topFillColor
                     .frame(height: safeTop)
@@ -1153,47 +1287,12 @@ struct BrowserScreen: View {
                     .animation(.easeOut(duration: 0.16), value: model.isAtTopOfPage)
             }
 
-            // Subtle progressive frosted edge blur when scrolling page content passes behind Dynamic Island sides
-            Rectangle()
-                .fill(.ultraThinMaterial)
-                .environment(\.colorScheme, model.activePageTopIsLight ? .light : .dark)
-                .opacity((model.isAtTopOfPage && !model.isStartPage) ? 0.0 : 0.86)
+            // Silky multi-band progressive Gaussian blur when scrolling page content passes behind Dynamic Island
+            ProgressiveGaussianBlurView(isLight: model.activePageTopIsLight)
                 .frame(height: h)
-                .mask(
-                    LinearGradient(
-                        stops: [
-                            .init(color: .black, location: 0.0),
-                            .init(color: .black.opacity(0.72), location: 0.56),
-                            .init(color: .black.opacity(0.22), location: 0.82),
-                            .init(color: .clear, location: 1.0)
-                        ],
-                        startPoint: .top,
-                        endPoint: .bottom
-                    )
-                )
-                .animation(.easeOut(duration: 0.16), value: model.isAtTopOfPage)
+                .opacity((model.isAtTopOfPage && !model.isStartPage) ? 0.0 : 1.0)
+                .animation(.easeOut(duration: 0.18), value: model.isAtTopOfPage)
         }
-    }
-
-    private var bottomEdgeBlurOverlay: some View {
-        let h = max(36, screenSafeAreaInsets.bottom + 14)
-        return Rectangle()
-            .fill(.ultraThinMaterial)
-            .environment(\.colorScheme, model.activePageBottomIsLight ? .light : .dark)
-            .opacity(0.78)
-            .frame(height: h)
-            .mask(
-                LinearGradient(
-                    stops: [
-                        .init(color: .clear, location: 0.0),
-                        .init(color: .black.opacity(0.20), location: 0.25),
-                        .init(color: .black.opacity(0.66), location: 0.60),
-                        .init(color: .black, location: 1.0)
-                    ],
-                    startPoint: .top,
-                    endPoint: .bottom
-                )
-            )
     }
 
     private func syncAddressField() {
@@ -1528,7 +1627,7 @@ struct BrowserScreen: View {
                 if collapsed {
                     Color.clear
                         .frame(maxWidth: .infinity)
-                        .frame(height: 48)
+                        .frame(height: 56)
                         .contentShape(Rectangle())
                         .onTapGesture {
                             expandCollapsedToolbar()
@@ -1541,7 +1640,7 @@ struct BrowserScreen: View {
                     .padding(
                         .bottom,
                         isBottom
-                            ? (addressFocused ? 8 : (collapsed ? (screenSafeAreaInsets.bottom > 0 ? 8 : 6) : (screenSafeAreaInsets.bottom > 0 ? 14 : 10)))
+                            ? (addressFocused ? 8 : (collapsed ? (screenSafeAreaInsets.bottom > 0 ? 15 : 12) : (screenSafeAreaInsets.bottom > 0 ? 14 : 10)))
                             : 0
                     )
             }
@@ -1624,7 +1723,7 @@ struct BrowserScreen: View {
 
     // Exact iOS 26 Safari Continuous Liquid Glass Morphing URL Island (matches KakaoTalk_20261124_214451018.mp4!)
     private func morphingUrlIsland(collapsed: Bool) -> some View {
-        let outerCorner: CGFloat = collapsed ? 18 : (model.preferences.liquidGlassUi ? 34 : 30)
+        let outerCorner: CGFloat = collapsed ? 17.5 : (model.preferences.liquidGlassUi ? 34 : 30)
         let activeShortcuts = model.preferences.toolbarShortcuts.isEmpty
             ? ToolbarShortcutAction.defaultOrder
             : model.preferences.toolbarShortcuts
@@ -1761,7 +1860,7 @@ struct BrowserScreen: View {
                 .scaleEffect(collapsed ? 0.68 : 1.0)
                 .allowsHitTesting(!collapsed)
             }
-            .frame(height: collapsed ? 36 : 48)
+            .frame(height: collapsed ? 35 : 48)
 
             // Row 2: Action icons smoothly fold vertically & scale down inside the clipping Liquid Glass shell!
             GeometryReader { navGeo in
