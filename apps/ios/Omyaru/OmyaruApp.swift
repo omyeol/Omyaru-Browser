@@ -647,7 +647,7 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
     static let defaultProfileID = UUID(uuidString: "00000000-0000-0000-0000-000000000010")!
     static let defaultGroupID = UUID(uuidString: "00000000-0000-0000-0000-000000000002")!
     static let appVersionName = "0.15.18"
-    static let appBuildNumber = 103
+    static let appBuildNumber = 104
 
     var isApplyingRemoteSync: Bool = false
 
@@ -1229,10 +1229,14 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
         }
     }
 
-    func captureSnapshot(for id: UUID) {
+    func captureSnapshot(for id: UUID, completion: (() -> Void)? = nil) {
         guard preferences.showTabThumbnails, let view = webViews[id],
               let tab = tabs.first(where: { $0.id == id }), tab.url != "about:blank",
-              view.bounds.width > 10, view.bounds.height > 10 else { return }
+              !view.isHidden, view.window != nil, view.alpha > 0.01,
+              view.bounds.width > 10, view.bounds.height > 10 else {
+            completion?()
+            return
+        }
         let config = WKSnapshotConfiguration()
         config.snapshotWidth = NSNumber(value: Double(min(UIScreen.main.bounds.width * 1.6, 600)))
         let svTop = view.scrollView.adjustedContentInset.top
@@ -1240,8 +1244,9 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
         if cropTop > 4 && view.bounds.height > cropTop + 120 {
             config.rect = CGRect(x: 0, y: cropTop, width: view.bounds.width, height: view.bounds.height - cropTop)
         }
-        view.takeSnapshot(with: config) { [weak self] image, _ in
-            guard let self, let image else { return }
+        view.takeSnapshot(with: config) { [weak self, weak view] image, _ in
+            defer { completion?() }
+            guard let self, let image, let view, !view.isHidden else { return }
             self.tabSnapshots[id] = image
             if !tab.isPrivate, let jpg = image.jpegData(compressionQuality: 0.78) {
                 let target = self.snapshotsDirectory.appendingPathComponent("\(id.uuidString).jpg")
@@ -1875,7 +1880,6 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
 
     func select(_ id: UUID) {
         guard let tab = tabs.first(where: { $0.id == id }) else { return }
-        captureSnapshot(for: activeID)
         activeID = id
         isChromeCollapsed = false
         failedLoadURL = nil

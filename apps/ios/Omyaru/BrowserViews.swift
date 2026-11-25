@@ -145,7 +145,7 @@ final class HeroBrowserHostView: UIView {
         let w = bounds.width
         let h = bounds.height
         guard w > 1, h > 1 else { return }
-        let safeTop = max(lastSafeTop, currentWebView?.safeAreaInsets.top ?? lastSafeTop)
+        let safeTop = max(lastSafeTop, currentWebView?.scrollView.adjustedContentInset.top ?? lastSafeTop)
         fallbackTopFillView.frame = CGRect(x: 0, y: 0, width: w, height: safeTop)
         let availH = max(1, h - safeTop)
         if fallbackImageSize.width > 1 && fallbackImageSize.height > 1 {
@@ -197,7 +197,16 @@ final class HeroBrowserHostView: UIView {
             if bounds.width <= 1 || bounds.height <= 1 {
                 pendingCommand = command
             } else {
-                execute(command: command, allowLivePortal: wasSameVisibleWebView && isWebViewCommitted)
+                let allowLivePortal: Bool
+                switch command.kind {
+                case .shrinkToCard:
+                    allowLivePortal = wasSameVisibleWebView
+                case .expandFromCard:
+                    allowLivePortal = wasSameVisibleWebView && isWebViewCommitted
+                case .idle:
+                    allowLivePortal = false
+                }
+                execute(command: command, allowLivePortal: allowLivePortal)
             }
         }
     }
@@ -351,7 +360,46 @@ final class HeroBrowserHostView: UIView {
     }
 }
 
-private struct HeroBrowserHostRepresentable: UIViewRepresentable {
+private final class HeroBrowserHostViewController: UIViewController {
+    let hostView = HeroBrowserHostView()
+
+    override func loadView() {
+        view = hostView
+    }
+
+    override func viewDidAppear(_ animated: Bool) {
+        super.viewDidAppear(animated)
+        syncSafeArea()
+    }
+
+    override func viewSafeAreaInsetsDidChange() {
+        super.viewSafeAreaInsetsDidChange()
+        syncSafeArea()
+    }
+
+    override func viewDidLayoutSubviews() {
+        super.viewDidLayoutSubviews()
+        syncSafeArea()
+    }
+
+    func syncSafeArea() {
+        guard let win = view.window else { return }
+        let winSafe = win.safeAreaInsets
+        let frameInWin = view.convert(view.bounds, to: win)
+        let expectedTop = max(0, winSafe.top - frameInWin.minY)
+        let expectedBottom = max(0, frameInWin.maxY - (win.bounds.height - winSafe.bottom))
+        let rawTop = max(0, view.safeAreaInsets.top - additionalSafeAreaInsets.top)
+        let rawBottom = max(0, view.safeAreaInsets.bottom - additionalSafeAreaInsets.bottom)
+        let neededTop = max(0, expectedTop - rawTop)
+        let neededBottom = max(0, expectedBottom - rawBottom)
+        if abs(additionalSafeAreaInsets.top - neededTop) > 0.5 ||
+           abs(additionalSafeAreaInsets.bottom - neededBottom) > 0.5 {
+            additionalSafeAreaInsets = UIEdgeInsets(top: neededTop, left: 0, bottom: neededBottom, right: 0)
+        }
+    }
+}
+
+private struct HeroBrowserHostRepresentable: UIViewControllerRepresentable {
     let webView: WKWebView
     let fallbackSnapshot: UIImage?
     let topColor: UIColor
@@ -359,12 +407,13 @@ private struct HeroBrowserHostRepresentable: UIViewRepresentable {
     let safeTop: CGFloat
     let command: HeroMorphCommand
 
-    func makeUIView(context: Context) -> HeroBrowserHostView {
-        HeroBrowserHostView()
+    func makeUIViewController(context: Context) -> HeroBrowserHostViewController {
+        HeroBrowserHostViewController()
     }
 
-    func updateUIView(_ view: HeroBrowserHostView, context: Context) {
-        view.updateContent(
+    func updateUIViewController(_ controller: HeroBrowserHostViewController, context: Context) {
+        controller.syncSafeArea()
+        controller.hostView.updateContent(
             webView: webView,
             fallbackSnapshot: fallbackSnapshot,
             topColor: topColor,
@@ -467,6 +516,8 @@ struct BrowserScreen: View {
     @State private var heroMorphHiddenTabID: UUID? = nil
     @State private var heroMorphToken = UUID()
     @State private var pendingOpenHeroTabID: UUID? = nil
+    @State private var openHeroSnapshotReady = true
+    @State private var openHeroFlightEnded = false
     @State private var overviewMorphProgress: CGFloat = 1.0
     @State private var toolbarVisible = true
     @FocusState private var addressFocused: Bool
@@ -532,6 +583,11 @@ struct BrowserScreen: View {
                         .ignoresSafeArea()
                     } else {
                         ZStack {
+                            // Permanent safe-area anchor keeps this ZStack's safeAreaInsets 100% constant
+                            // even while showTabs/isHeroMorphing are true (prevents 59pt WKWebView jump & 11-12s blink!)
+                            Color.clear
+                                .allowsHitTesting(false)
+
                             HeroBrowserHostRepresentable(
                                 webView: model.webView(for: tab.id, loadIfNeeded: true),
                                 fallbackSnapshot: model.tabSnapshots[tab.id],
@@ -542,14 +598,16 @@ struct BrowserScreen: View {
                             )
                             .ignoresSafeArea()
 
-                            if !showTabs && !isHeroMorphing {
-                                FastScrollBarOverlay(model: model)
-                                    .padding(.top, isBottomBar ? 8 : (model.isChromeCollapsed ? 58 : 124))
-                                    .padding(.bottom, isBottomBar ? (model.isChromeCollapsed ? 48 : 126) : 8)
+                            FastScrollBarOverlay(model: model)
+                                .padding(.top, isBottomBar ? 8 : (model.isChromeCollapsed ? 58 : 124))
+                                .padding(.bottom, isBottomBar ? (model.isChromeCollapsed ? 48 : 126) : 8)
+                                .opacity((showTabs || isHeroMorphing) ? 0.0 : 1.0)
+                                .allowsHitTesting(!showTabs && !isHeroMorphing)
 
-                                if let failedURL = model.failedLoadURL {
-                                    pageErrorOverlay(failedURL: failedURL)
-                                }
+                            if let failedURL = model.failedLoadURL {
+                                pageErrorOverlay(failedURL: failedURL)
+                                    .opacity((showTabs || isHeroMorphing) ? 0.0 : 1.0)
+                                    .allowsHitTesting(!showTabs && !isHeroMorphing)
                             }
                         }
                     }
@@ -561,6 +619,7 @@ struct BrowserScreen: View {
             // TabOverview placed AFTER Live Browser in ZStack: behind (zIndex 5) during morph, in front (zIndex 15) while browsing tabs!
             if showTabs {
                 TabOverview(
+                    initialGroupID: model.activeGroupID,
                     morphProgress: overviewMorphProgress,
                     hiddenHeroTabID: heroMorphHiddenTabID,
                     onCardRectsUpdated: {
@@ -1614,7 +1673,6 @@ struct BrowserScreen: View {
 
     private func openTabOverviewWithHero() {
         let activeID = model.activeID
-        model.captureSnapshot(for: activeID)
         addressFocused = false
         showPageTools = false
         showBrowserMenu = false
@@ -1624,6 +1682,18 @@ struct BrowserScreen: View {
         let token = UUID()
         heroMorphToken = token
         pendingOpenHeroTabID = activeID
+        openHeroFlightEnded = false
+        openHeroSnapshotReady = model.isStartPage
+        if !model.isStartPage {
+            model.captureSnapshot(for: activeID) {
+                guard heroMorphToken == token else { return }
+                openHeroSnapshotReady = true
+                // Wait one main-thread turn so SwiftUI renders the fresh snapshot into the resting card before revealing
+                DispatchQueue.main.async {
+                    finishOpenHeroIfReady(token: token, force: false)
+                }
+            }
+        }
         let initialRect = model.tabCardThumbRects[activeID] ?? CGRect(
             x: screen.midX - 88,
             y: screen.midY - 115,
@@ -1649,8 +1719,8 @@ struct BrowserScreen: View {
             toolbarVisible = false
         }
 
-        // Fallback trigger if TabOverview preference callback takes >40ms (e.g. list mode or cached layout)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.04) {
+        // Fallback trigger if TabOverview preference/scroll callback takes >120ms (e.g. list mode)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
             guard heroMorphToken == token, pendingOpenHeroTabID == activeID else { return }
             let fallbackRect = model.tabCardThumbRects[activeID] ?? initialRect
             let isHero = model.tabCardIsHeroMap[activeID] ?? initialIsHero
@@ -1664,6 +1734,28 @@ struct BrowserScreen: View {
               rect.width > 20, rect.height > 20 else { return }
         let isHero = model.tabCardIsHeroMap[tabID] ?? false
         launchOpenHeroFlight(tabID: tabID, targetRect: rect, isHero: isHero, token: heroMorphToken)
+    }
+
+    private func finishOpenHeroIfReady(token: UUID, force: Bool) {
+        guard heroMorphToken == token, isHeroMorphing, !isExpandingToWeb else { return }
+        guard force || (openHeroFlightEnded && openHeroSnapshotReady) else { return }
+        // Step 1: Promote TabOverview to front (zIndex 15) and reveal resting card FIRST
+        var promoteTx = Transaction()
+        promoteTx.disablesAnimations = true
+        withTransaction(promoteTx) {
+            isHeroMorphing = false
+            heroMorphHiddenTabID = nil
+        }
+        // Step 2: One frame later (now guaranteed safely behind opaque TabOverview!), reset HeroBrowserHostView to idle
+        DispatchQueue.main.async {
+            guard heroMorphToken == token else { return }
+            var resetTx = Transaction()
+            resetTx.disablesAnimations = true
+            withTransaction(resetTx) {
+                heroMorphProgress = 0.0
+                heroMorphCommand = HeroMorphCommand(kind: .idle)
+            }
+        }
     }
 
     private func launchOpenHeroFlight(tabID: UUID, targetRect: CGRect, isHero: Bool, token: UUID) {
@@ -1695,23 +1787,12 @@ struct BrowserScreen: View {
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.36) {
             guard heroMorphToken == token else { return }
-            // Step 1: Promote TabOverview to front (zIndex 15) and reveal resting card FIRST
-            var promoteTx = Transaction()
-            promoteTx.disablesAnimations = true
-            withTransaction(promoteTx) {
-                isHeroMorphing = false
-                heroMorphHiddenTabID = nil
-            }
-            // Step 2: One frame later (now guaranteed safely behind opaque TabOverview!), reset HeroBrowserHostView to idle
-            DispatchQueue.main.async {
-                guard heroMorphToken == token else { return }
-                var resetTx = Transaction()
-                resetTx.disablesAnimations = true
-                withTransaction(resetTx) {
-                    heroMorphProgress = 0.0
-                    heroMorphCommand = HeroMorphCommand(kind: .idle)
-                }
-            }
+            openHeroFlightEnded = true
+            finishOpenHeroIfReady(token: token, force: false)
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.50) {
+            guard heroMorphToken == token else { return }
+            finishOpenHeroIfReady(token: token, force: true)
         }
     }
 
@@ -2132,7 +2213,7 @@ struct TabOverview: View {
     var onDismiss: () -> Void
 
     @Namespace private var pillNamespace
-    @State private var pagedGroupID: UUID = BrowserModel.defaultGroupID
+    @State private var pagedGroupID: UUID
     @State private var searchMode = false
     @State private var searchQuery = ""
     @State private var selectionMode = false
@@ -2170,7 +2251,26 @@ struct TabOverview: View {
     @State private var dragSlotFrames: [CGRect] = []
     @State private var isSettlingDrop = false
     @State private var tabFrames: [UUID: CGRect] = [:]
+    @State private var initialScrollReadyGroupIDs: Set<UUID> = []
+    @State private var initialScrollAppearedGroupIDs: Set<UUID> = []
+    @State private var preScrollActiveMinY: [UUID: CGFloat] = [:]
     @FocusState private var searchFieldFocused: Bool
+
+    init(
+        initialGroupID: UUID = BrowserModel.defaultGroupID,
+        morphProgress: CGFloat = 1.0,
+        hiddenHeroTabID: UUID? = nil,
+        onCardRectsUpdated: @escaping () -> Void = {},
+        onSelectTabWithHero: @escaping (UUID, CGRect?, Bool) -> Void = { _, _, _ in },
+        onDismiss: @escaping () -> Void
+    ) {
+        self.morphProgress = morphProgress
+        self.hiddenHeroTabID = hiddenHeroTabID
+        self.onCardRectsUpdated = onCardRectsUpdated
+        self.onSelectTabWithHero = onSelectTabWithHero
+        self.onDismiss = onDismiss
+        _pagedGroupID = State(initialValue: initialGroupID)
+    }
 
     private func displayedTabs(for groupID: UUID) -> [BrowserTab] {
         let q = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -2445,6 +2545,14 @@ struct TabOverview: View {
             let heroH = min(outerGeo.size.height * 0.60, heroW * 1.38)
             let cellWidth = max(46, (outerGeo.size.width - 28 - CGFloat(colCount - 1) * 12) / CGFloat(colCount))
             let gridThumbHeight = min(290, max(78, cellWidth * ratio))
+            let rowCount = max(1, (groupTabs.count + colCount - 1) / colCount)
+            let estimatedGridH = CGFloat(rowCount) * (gridThumbHeight + 26) + CGFloat(max(0, rowCount - 1)) * 14 + 36
+            let activeIndex = groupTabs.firstIndex(where: { $0.id == model.activeID })
+            let isOverflowing = (!isSingleHero && useGridLayout && estimatedGridH > outerGeo.size.height - 20)
+            let needsInitialScroll = isOverflowing && (
+                (activeIndex.map { $0 >= colCount } ?? false) ||
+                (activeIndex == nil && model.preferences.tabsStartFromBottom)
+            )
 
             ScrollViewReader { proxy in
                 ScrollView(showsIndicators: false) {
@@ -2501,25 +2609,69 @@ struct TabOverview: View {
                 }
                 .scrollDisabled(draggingTabID != nil || contextMenuTab != nil)
                 .onAppear {
-                    let rowCount = max(1, (groupTabs.count + colCount - 1) / colCount)
-                    let estimatedGridH = CGFloat(rowCount) * (gridThumbHeight + 26) + CGFloat(max(0, rowCount - 1)) * 14 + 36
-                    if estimatedGridH > outerGeo.size.height {
+                    guard groupID == model.activeGroupID else { return }
+                    initialScrollAppearedGroupIDs.insert(groupID)
+                    if needsInitialScroll {
                         if groupTabs.contains(where: { $0.id == model.activeID }) {
                             proxy.scrollTo(model.activeID, anchor: .center)
                         } else if model.preferences.tabsStartFromBottom, let lastID = groupTabs.last?.id {
                             proxy.scrollTo(lastID, anchor: .bottom)
                         }
+                        // Safety fallback if scrollTo clamped with <2pt change (beats BrowserScreen's 120ms timer)
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.06) {
+                            guard !initialScrollReadyGroupIDs.contains(groupID) else { return }
+                            let currentCardH = isSingleHero ? heroH : gridThumbHeight
+                            for tab in groupTabs {
+                                if let rect = tabFrames[tab.id] {
+                                    model.tabCardThumbRects[tab.id] = CGRect(x: rect.minX, y: rect.minY, width: rect.width, height: currentCardH)
+                                    model.tabCardIsHeroMap[tab.id] = isSingleHero
+                                }
+                            }
+                            initialScrollReadyGroupIDs.insert(groupID)
+                            onCardRectsUpdated()
+                        }
+                    } else {
+                        let currentCardH = isSingleHero ? heroH : gridThumbHeight
+                        for tab in groupTabs {
+                            if let rect = tabFrames[tab.id] {
+                                model.tabCardThumbRects[tab.id] = CGRect(x: rect.minX, y: rect.minY, width: rect.width, height: currentCardH)
+                                model.tabCardIsHeroMap[tab.id] = isSingleHero
+                            }
+                        }
+                        initialScrollReadyGroupIDs.insert(groupID)
+                        onCardRectsUpdated()
                     }
                 }
                 .onPreferenceChange(TabCardFramePreferenceKey.self) { frames in
                     let currentCardH = isSingleHero ? heroH : gridThumbHeight
                     for (id, rect) in frames {
                         tabFrames[id] = rect
+                    }
+                    guard !frames.isEmpty else { return }
+
+                    if groupID == model.activeGroupID && needsInitialScroll && !initialScrollReadyGroupIDs.contains(groupID) {
+                        if let activeRect = frames[model.activeID] {
+                            if preScrollActiveMinY[groupID] == nil {
+                                preScrollActiveMinY[groupID] = activeRect.minY
+                                let viewportMidY = outerGeo.frame(in: .global).midY
+                                let alreadyCenteredAfterAppear = initialScrollAppearedGroupIDs.contains(groupID)
+                                    && abs(activeRect.midY - viewportMidY) < 16
+                                guard alreadyCenteredAfterAppear else { return }
+                            } else if let preY = preScrollActiveMinY[groupID], abs(activeRect.minY - preY) <= 2.0 {
+                                return
+                            }
+                            initialScrollReadyGroupIDs.insert(groupID)
+                        } else {
+                            return
+                        }
+                    }
+
+                    for (id, rect) in frames {
                         let thumbRect = CGRect(x: rect.minX, y: rect.minY, width: rect.width, height: currentCardH)
                         model.tabCardThumbRects[id] = thumbRect
                         model.tabCardIsHeroMap[id] = isSingleHero
                     }
-                    if !frames.isEmpty {
+                    if groupID == model.activeGroupID && (!needsInitialScroll || initialScrollReadyGroupIDs.contains(groupID)) {
                         onCardRectsUpdated()
                     }
                 }
