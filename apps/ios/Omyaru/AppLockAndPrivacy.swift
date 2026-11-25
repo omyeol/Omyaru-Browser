@@ -40,11 +40,38 @@ final class AppLockManager: ObservableObject {
         didSet { UserDefaults.standard.set(appSwitchBlackShield, forKey: "omyaru.ios.lock.blackShield") }
     }
     @Published var isLocked: Bool = false
+    @Published var isAuthenticatingBiometrics: Bool = false
+    @Published var isBiometricUnlockGrace: Bool = false
     @Published var errorMessage: String = ""
 
     private var deviceLockObserver: NSObjectProtocol? = nil
+    private var biometricGraceTask: DispatchWorkItem? = nil
     private let hashKey = "omyaru.ios.lock.pinHash"
     private let saltKey = "omyaru.ios.lock.pinSalt"
+
+    var suppressInactiveShield: Bool {
+        isAuthenticatingBiometrics || isBiometricUnlockGrace
+    }
+
+    private func beginBiometricGrace() {
+        biometricGraceTask?.cancel()
+        isBiometricUnlockGrace = true
+        let task = DispatchWorkItem { [weak self] in
+            Task { @MainActor in
+                self?.isBiometricUnlockGrace = false
+            }
+        }
+        biometricGraceTask = task
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0, execute: task)
+    }
+
+    func clearBiometricGrace() {
+        biometricGraceTask?.cancel()
+        biometricGraceTask = nil
+        if isBiometricUnlockGrace {
+            isBiometricUnlockGrace = false
+        }
+    }
 
     init() {
         let d = UserDefaults.standard
@@ -140,32 +167,41 @@ final class AppLockManager: ObservableObject {
     }
 
     func lockIfNeeded() {
+        clearBiometricGrace()
         if isEnabled && hasSecret && lockOnBackground {
             isLocked = true
         }
     }
 
     func onDeviceLocked() {
+        clearBiometricGrace()
         if isEnabled && hasSecret && lockOnDeviceLock {
             isLocked = true
         }
     }
 
     func unlockWithBiometrics() async {
-        guard isEnabled, useBiometrics else { return }
+        guard isEnabled, useBiometrics, !isAuthenticatingBiometrics else { return }
         let context = LAContext()
         var error: NSError?
         guard context.canEvaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, error: &error) else {
             return
         }
+        isAuthenticatingBiometrics = true
+        defer { isAuthenticatingBiometrics = false }
         do {
             let success = try await context.evaluatePolicy(
                 .deviceOwnerAuthenticationWithBiometrics,
                 localizedReason: "Omyaru Browser 잠금 해제"
             )
             if success {
-                isLocked = false
-                errorMessage = ""
+                beginBiometricGrace()
+                var tx = Transaction()
+                tx.disablesAnimations = true
+                withTransaction(tx) {
+                    isLocked = false
+                    errorMessage = ""
+                }
             }
         } catch {
             errorMessage = "생체 인증을 완료하지 못했습니다. 암호를 입력해 주세요."
@@ -448,12 +484,39 @@ final class BookshelfLockManager: ObservableObject {
         didSet { UserDefaults.standard.set(lockOnBackground, forKey: "omyaru.ios.bookshelfLock.onBackground") }
     }
     @Published var isLocked: Bool = false
+    @Published var isAuthenticatingBiometrics: Bool = false
+    @Published var isBiometricUnlockGrace: Bool = false
     @Published var errorMessage: String = ""
 
     private var lastInactiveAt: Date? = nil
     private var deviceLockObserver: NSObjectProtocol? = nil
+    private var biometricGraceTask: DispatchWorkItem? = nil
     private let hashKey = "omyaru.ios.bookshelfLock.pinHash"
     private let saltKey = "omyaru.ios.bookshelfLock.pinSalt"
+
+    var suppressInactiveShield: Bool {
+        isAuthenticatingBiometrics || isBiometricUnlockGrace
+    }
+
+    private func beginBiometricGrace() {
+        biometricGraceTask?.cancel()
+        isBiometricUnlockGrace = true
+        let task = DispatchWorkItem { [weak self] in
+            Task { @MainActor in
+                self?.isBiometricUnlockGrace = false
+            }
+        }
+        biometricGraceTask = task
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0, execute: task)
+    }
+
+    func clearBiometricGrace() {
+        biometricGraceTask?.cancel()
+        biometricGraceTask = nil
+        if isBiometricUnlockGrace {
+            isBiometricUnlockGrace = false
+        }
+    }
 
     init() {
         let d = UserDefaults.standard
@@ -585,12 +648,14 @@ final class BookshelfLockManager: ObservableObject {
     }
 
     func lockNow() {
+        clearBiometricGrace()
         guard isEnabled else { return }
         isLocked = true
         lastInactiveAt = Date()
     }
 
     func onDeviceLocked() {
+        clearBiometricGrace()
         guard isEnabled, lockOnDeviceLock else { return }
         isLocked = true
         lastInactiveAt = Date()
@@ -608,6 +673,7 @@ final class BookshelfLockManager: ObservableObject {
     }
 
     func onBookshelfClosed() {
+        clearBiometricGrace()
         guard isEnabled else { return }
         lastInactiveAt = Date()
         if lockTimeout == .immediately {
@@ -616,6 +682,7 @@ final class BookshelfLockManager: ObservableObject {
     }
 
     func onAppBackgrounded() {
+        clearBiometricGrace()
         guard isEnabled else { return }
         lastInactiveAt = Date()
         if lockOnBackground || lockTimeout == .immediately {
@@ -624,6 +691,7 @@ final class BookshelfLockManager: ObservableObject {
     }
 
     func onAppForegrounded() {
+        clearBiometricGrace()
         guard isEnabled else { return }
         evaluateTimeoutLockIfNeeded()
     }
@@ -637,7 +705,7 @@ final class BookshelfLockManager: ObservableObject {
     }
 
     func unlockWithDeviceAuth() async {
-        guard isEnabled else { return }
+        guard isEnabled, !isAuthenticatingBiometrics else { return }
         let context = LAContext()
         var error: NSError?
         let policy: LAPolicy = hasSecret ? .deviceOwnerAuthenticationWithBiometrics : .deviceOwnerAuthentication
@@ -648,15 +716,22 @@ final class BookshelfLockManager: ObservableObject {
             }
             return
         }
+        isAuthenticatingBiometrics = true
+        defer { isAuthenticatingBiometrics = false }
         do {
             let success = try await context.evaluatePolicy(
                 policy,
                 localizedReason: "Omyaru 책장 잠금 해제"
             )
             if success {
-                isLocked = false
-                lastInactiveAt = nil
-                errorMessage = ""
+                beginBiometricGrace()
+                var tx = Transaction()
+                tx.disablesAnimations = true
+                withTransaction(tx) {
+                    isLocked = false
+                    lastInactiveAt = nil
+                    errorMessage = ""
+                }
             }
         } catch {
             errorMessage = hasSecret

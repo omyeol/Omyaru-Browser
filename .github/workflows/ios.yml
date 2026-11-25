@@ -56,7 +56,12 @@ jobs:
         run: |
           VERSION="${{ steps.meta.outputs.version }}"
           TAG="v${VERSION}"
+          NOTES_FILE="apps/ios/release-notes-v${VERSION}.md"
           if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "has_version_release=true" >> "$GITHUB_OUTPUT"
+            echo "url=https://github.com/omyeol/Omyaru-Browser/releases/download/${TAG}/Omyaru-v${VERSION}-ios.ipa" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.ref }}" = "refs/heads/main" ] && [ -f "$NOTES_FILE" ]; then
+            gh release create "$TAG" --title "Omyaru Browser ${TAG}" --notes-file "$NOTES_FILE" --target main
             echo "has_version_release=true" >> "$GITHUB_OUTPUT"
             echo "url=https://github.com/omyeol/Omyaru-Browser/releases/download/${TAG}/Omyaru-v${VERSION}-ios.ipa" >> "$GITHUB_OUTPUT"
           else

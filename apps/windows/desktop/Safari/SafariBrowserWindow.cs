@@ -211,10 +211,28 @@ internal sealed partial class SafariBrowserWindow : Window
   internal bool HasValidSafariLayout => ActualWidth >= 900 && ActualHeight >= 600 &&
       _toolbarHost.ActualHeight >= 40 && _addressCapsule.ActualWidth >= 220;
 
+  private static BitmapSource? LoadEmbeddedAppIcon()
+  {
+    try
+    {
+      using var stream = typeof(SafariBrowserWindow).Assembly.GetManifestResourceStream("Omyaru.AppIcon.ico");
+      if (stream is null) return null;
+      var decoder = new IconBitmapDecoder(stream, BitmapCreateOptions.PreservePixelFormat, BitmapCacheOption.OnLoad);
+      var best = decoder.Frames.OrderByDescending(f => f.PixelWidth).FirstOrDefault();
+      if (best is not null && best.CanFreeze) best.Freeze();
+      return best;
+    }
+    catch
+    {
+      return null;
+    }
+  }
+
   internal SafariBrowserWindow(bool enableAutomaticSync = true)
   {
     _enableAutomaticSync = enableAutomaticSync;
-    Title = "Omyaru — Safari Style";
+    Title = "Omyaru";
+    Icon = LoadEmbeddedAppIcon();
     Width = 1440;
     Height = 900;
     MinWidth = 960;

@@ -8,15 +8,17 @@
     <Nullable>enable</Nullable>
     <AssemblyName>Omyaru</AssemblyName>
     <RootNamespace>PrivacyBrowser.Desktop</RootNamespace>
-    <Version>0.5.9</Version>
+    <Version>1.0.0</Version>
     <Company>Omyeol</Company>
     <Product>Omyaru Browser</Product>
     <Title>Omyaru Browser</Title>
+    <ApplicationIcon>Omyaru.ico</ApplicationIcon>
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <PlatformTarget>x64</PlatformTarget>
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
   </PropertyGroup>
   <ItemGroup>
+    <EmbeddedResource Include="Omyaru.ico" LogicalName="Omyaru.AppIcon.ico" />
     <EmbeddedResource Include="$(OmyaruGoogleClientJson)" LogicalName="Omyaru.GoogleDriveClient.json" Condition="'$(OmyaruGoogleClientJson)' != ''" />
     <PackageReference Include="NAudio" Version="2.2.1" />
     <PackageReference Include="Microsoft.Web.WebView2" Version="1.0.4129.50" GeneratePathProperty="true" ExcludeAssets="compile;runtime;build;buildTransitive" />

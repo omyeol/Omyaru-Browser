@@ -1023,9 +1023,8 @@ struct BookshelfView: View {
             BookshelfLockOverlayView {
                 dismiss()
             }
-            .transition(.opacity)
             .zIndex(50)
-        } else if scenePhase != .active && bookshelfLock.isEnabled {
+        } else if scenePhase != .active && bookshelfLock.isEnabled && !(scenePhase == .inactive && bookshelfLock.suppressInactiveShield) {
             Color.black
                 .ignoresSafeArea()
                 .overlay {
@@ -1035,6 +1034,11 @@ struct BookshelfView: View {
                 }
                 .zIndex(60)
         }
+        }
+        .onChange(of: scenePhase) { phase in
+            if phase == .active || phase == .background {
+                bookshelfLock.clearBiometricGrace()
+            }
         }
         .onAppear {
             bookshelfLock.onBookshelfOpened()

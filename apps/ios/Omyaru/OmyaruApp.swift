@@ -10,10 +10,22 @@ struct OmyaruApp: App {
     @Environment(\.scenePhase) private var scenePhase
     @StateObject private var browser = BrowserModel()
     @ObservedObject private var appLock = AppLockManager.shared
+    @ObservedObject private var bookshelfLock = BookshelfLockManager.shared
     @ObservedObject private var driveSync = DriveSyncManager.shared
     @ObservedObject private var sharedFolder = SharedSyncFolderManager.shared
     @State private var showInitialSyncFolderPrompt = false
     @State private var promptedFolderThisLaunch = false
+
+    private var shouldShowInactivePrivacyShield: Bool {
+        guard scenePhase != .active else { return false }
+        guard appLock.isEnabled || appLock.appSwitchBlackShield else { return false }
+        // Never flash the lock-icon shield during Face ID/Touch ID authentication or right after biometric unlock
+        // while iOS transitions scenePhase back from .inactive -> .active!
+        if scenePhase == .inactive && (appLock.suppressInactiveShield || bookshelfLock.suppressInactiveShield) {
+            return false
+        }
+        return true
+    }
 
     private var effectiveRootColorScheme: ColorScheme? {
         if appLock.isLocked { return .dark }
@@ -32,10 +44,9 @@ struct OmyaruApp: App {
 
                 if appLock.isLocked {
                     AppLockOverlayView()
-                        .transition(.opacity)
                 }
 
-                if scenePhase != .active && (appLock.isEnabled || appLock.appSwitchBlackShield) {
+                if shouldShowInactivePrivacyShield {
                     Color.black
                         .ignoresSafeArea()
                         .overlay {
@@ -90,6 +101,7 @@ struct OmyaruApp: App {
                         }
                     }
                 case .active:
+                    appLock.clearBiometricGrace()
                     OmyaruBackgroundSyncScheduler.shared.browserRef = browser
                     BookshelfLockManager.shared.onAppForegrounded()
                     OmyaruSyncLiveActivityController.shared.onAppMovedToForeground()
@@ -646,8 +658,8 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
     static let privateGroupID = UUID(uuidString: "00000000-0000-0000-0000-000000000001")!
     static let defaultProfileID = UUID(uuidString: "00000000-0000-0000-0000-000000000010")!
     static let defaultGroupID = UUID(uuidString: "00000000-0000-0000-0000-000000000002")!
-    static let appVersionName = "0.15.18"
-    static let appBuildNumber = 108
+    static let appVersionName = "1.0.0"
+    static let appBuildNumber = 109
 
     var isApplyingRemoteSync: Bool = false
 
