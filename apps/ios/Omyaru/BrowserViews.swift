@@ -427,6 +427,7 @@ private struct HeroBrowserHostRepresentable: UIViewControllerRepresentable {
 private struct SafariStartPageHeroModifier: ViewModifier, Animatable {
     var progress: CGFloat
     let isMorphing: Bool
+    let isNewTabBloom: Bool
     let screenSize: CGSize
     let safeTop: CGFloat
     let cardRect: CGRect
@@ -445,13 +446,17 @@ private struct SafariStartPageHeroModifier: ViewModifier, Animatable {
         let target = (cardRect.width > 20 && cardRect.height > 20)
             ? cardRect
             : CGRect(x: w * 0.5 - 88, y: h * 0.5 - 115, width: 176, height: 230)
-        let curX = target.minX * t
-        let curY = target.minY * t
-        let curW = w + (target.width - w) * t
-        let curH = h + (target.height - h) * t
+        let bloomFactor: CGFloat = (isNewTabBloom && isMorphing) ? (1.0 - 0.08 * t) : 1.0
+        let rawW = w + (target.width - w) * t
+        let rawH = h + (target.height - h) * t
+        let curW = rawW * bloomFactor
+        let curH = rawH * bloomFactor
+        let curX = target.minX * t + (rawW - curW) * 0.5
+        let curY = target.minY * t + (rawH - curH) * 0.5
         let scale = max(0.05, curW / w)
         let corner: CGFloat = isMorphing ? (46 * (1 - t) + cardCornerRadius * t) : 0
-        let borderAlpha = Double(min(1.0, max(0.0, (t - 0.10) / 0.72)))
+        let borderAlpha = isNewTabBloom ? 0.0 : Double(min(1.0, max(0.0, (t - 0.10) / 0.72)))
+        let contentAlpha = (isNewTabBloom && isMorphing) ? Double(min(1.0, max(0.0, (1.0 - t) / 0.32))) : 1.0
 
         content
             .frame(width: w, height: h)
@@ -469,10 +474,63 @@ private struct SafariStartPageHeroModifier: ViewModifier, Animatable {
                         .strokeBorder(borderColor.opacity(borderAlpha), lineWidth: 2.6)
                 }
             }
+            .opacity(contentAlpha)
             .position(
                 x: isMorphing ? (curX + curW * 0.5) : (w * 0.5),
                 y: isMorphing ? (curY + curH * 0.5) : (h * 0.5)
             )
+    }
+}
+
+private struct AnimatableGridHeightModifier: ViewModifier, Animatable {
+    let width: CGFloat
+    var height: CGFloat
+
+    var animatableData: CGFloat {
+        get { height }
+        set { height = newValue }
+    }
+
+    func body(content: Content) -> some View {
+        content.frame(width: width, height: max(1, height), alignment: .topLeading)
+    }
+}
+
+private struct ClosingTabGhost: Identifiable {
+    let id: UUID
+    let tab: BrowserTab
+    let groupID: UUID
+    let slotX: CGFloat
+    let slotY: CGFloat
+    let width: CGFloat
+    let cardHeight: CGFloat
+    let cellHeight: CGFloat
+    let isHeroSingle: Bool
+    let wasLastTab: Bool
+    let collapsedRow: Bool
+}
+
+private struct ClosingTabGhostCardView<Content: View>: View {
+    let targetScale: CGFloat
+    let duration: Double
+    let content: Content
+    @State private var dismissed = false
+
+    init(targetScale: CGFloat, duration: Double, @ViewBuilder content: () -> Content) {
+        self.targetScale = targetScale
+        self.duration = duration
+        self.content = content()
+    }
+
+    var body: some View {
+        content
+            .scaleEffect(dismissed ? targetScale : 1.0, anchor: .center)
+            .opacity(dismissed ? 0.0 : 1.0)
+            .onAppear {
+                withAnimation(.easeOut(duration: duration)) {
+                    dismissed = true
+                }
+            }
     }
 }
 
@@ -508,6 +566,7 @@ struct BrowserScreen: View {
     @State private var updateMessage: String? = nil
     @State private var isHeroMorphing = false
     @State private var isExpandingToWeb = false
+    @State private var isNewTabHeroBloom = false
     @State private var heroMorphCommand = HeroMorphCommand(kind: .idle)
     @State private var heroMorphProgress: CGFloat = 0.0
     @State private var heroTargetRect: CGRect = .zero
@@ -572,6 +631,7 @@ struct BrowserScreen: View {
                                 SafariStartPageHeroModifier(
                                     progress: heroMorphProgress,
                                     isMorphing: isHeroMorphing,
+                                    isNewTabBloom: isNewTabHeroBloom,
                                     screenSize: CGSize(width: w, height: h),
                                     safeTop: safeTop,
                                     cardRect: localCard,
@@ -621,12 +681,16 @@ struct BrowserScreen: View {
                 TabOverview(
                     initialGroupID: model.activeGroupID,
                     morphProgress: overviewMorphProgress,
+                    isExpandingToWeb: isExpandingToWeb,
                     hiddenHeroTabID: heroMorphHiddenTabID,
                     onCardRectsUpdated: {
                         tryLaunchPendingOpenHeroFlight()
                     },
                     onSelectTabWithHero: { tabID, sourceRect, isHero in
                         closeTabOverviewWithHero(selectedTabID: tabID, sourceRect: sourceRect, isHero: isHero)
+                    },
+                    onNewTabWithHero: { slotRect, isHero in
+                        openNewTabWithHero(fromSlotRect: slotRect, isHero: isHero)
                     },
                     onDismiss: {
                         let activeID = model.activeID
@@ -1706,6 +1770,7 @@ struct BrowserScreen: View {
         tx.disablesAnimations = true
         withTransaction(tx) {
             isExpandingToWeb = false
+            isNewTabHeroBloom = false
             heroTargetRect = initialRect
             heroTargetCornerRadius = initialIsHero ? 22 : 18
             heroTargetBorderColor = UIColor(profileBorderColor(for: activeID))
@@ -1796,7 +1861,17 @@ struct BrowserScreen: View {
         }
     }
 
-    private func closeTabOverviewWithHero(selectedTabID: UUID, sourceRect: CGRect?, isHero: Bool) {
+    private func openNewTabWithHero(fromSlotRect: CGRect?, isHero: Bool) {
+        let createdID = model.newTab()
+        closeTabOverviewWithHero(
+            selectedTabID: createdID,
+            sourceRect: fromSlotRect,
+            isHero: isHero,
+            isNewTabBloom: true
+        )
+    }
+
+    private func closeTabOverviewWithHero(selectedTabID: UUID, sourceRect: CGRect?, isHero: Bool, isNewTabBloom: Bool = false) {
         let token = UUID()
         heroMorphToken = token
         pendingOpenHeroTabID = nil
@@ -1822,6 +1897,7 @@ struct BrowserScreen: View {
         tx.disablesAnimations = true
         withTransaction(tx) {
             isExpandingToWeb = true
+            isNewTabHeroBloom = isNewTabBloom
             heroTargetRect = startRect
             heroTargetCornerRadius = corner
             heroTargetBorderColor = borderUI
@@ -1840,8 +1916,10 @@ struct BrowserScreen: View {
         if model.isStartPage {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.016) {
                 guard heroMorphToken == token else { return }
-                withAnimation(.spring(response: 0.34, dampingFraction: 0.88)) {
+                withAnimation(.spring(response: isNewTabBloom ? 0.36 : 0.34, dampingFraction: 0.88)) {
                     heroMorphProgress = 0.0
+                }
+                withAnimation(.easeOut(duration: 0.24)) {
                     overviewMorphProgress = 0.0
                 }
             }
@@ -1857,7 +1935,7 @@ struct BrowserScreen: View {
                 toolbarVisible = true
             }
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.38) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + (isNewTabBloom ? 0.40 : 0.38)) {
             guard heroMorphToken == token else { return }
             var endTx = Transaction()
             endTx.disablesAnimations = true
@@ -1865,6 +1943,7 @@ struct BrowserScreen: View {
                 showTabs = false
                 isHeroMorphing = false
                 isExpandingToWeb = false
+                isNewTabHeroBloom = false
                 heroMorphHiddenTabID = nil
                 toolbarVisible = true
                 heroMorphCommand = HeroMorphCommand(kind: .idle)
@@ -2207,9 +2286,11 @@ private struct TabCardGestureOverlay: UIViewRepresentable {
 struct TabOverview: View {
     @EnvironmentObject private var model: BrowserModel
     var morphProgress: CGFloat = 1.0
+    var isExpandingToWeb: Bool = false
     var hiddenHeroTabID: UUID? = nil
     var onCardRectsUpdated: () -> Void = {}
     var onSelectTabWithHero: (UUID, CGRect?, Bool) -> Void = { _, _, _ in }
+    var onNewTabWithHero: (CGRect?, Bool) -> Void = { _, _ in }
     var onDismiss: () -> Void
 
     @Namespace private var pillNamespace
@@ -2254,20 +2335,26 @@ struct TabOverview: View {
     @State private var initialScrollReadyGroupIDs: Set<UUID> = []
     @State private var initialScrollAppearedGroupIDs: Set<UUID> = []
     @State private var preScrollActiveMinY: [UUID: CGFloat] = [:]
+    @State private var closingGhosts: [ClosingTabGhost] = []
+    @State private var groupViewportRects: [UUID: CGRect] = [:]
     @FocusState private var searchFieldFocused: Bool
 
     init(
         initialGroupID: UUID = BrowserModel.defaultGroupID,
         morphProgress: CGFloat = 1.0,
+        isExpandingToWeb: Bool = false,
         hiddenHeroTabID: UUID? = nil,
         onCardRectsUpdated: @escaping () -> Void = {},
         onSelectTabWithHero: @escaping (UUID, CGRect?, Bool) -> Void = { _, _, _ in },
+        onNewTabWithHero: @escaping (CGRect?, Bool) -> Void = { _, _ in },
         onDismiss: @escaping () -> Void
     ) {
         self.morphProgress = morphProgress
+        self.isExpandingToWeb = isExpandingToWeb
         self.hiddenHeroTabID = hiddenHeroTabID
         self.onCardRectsUpdated = onCardRectsUpdated
         self.onSelectTabWithHero = onSelectTabWithHero
+        self.onNewTabWithHero = onNewTabWithHero
         self.onDismiss = onDismiss
         _pagedGroupID = State(initialValue: initialGroupID)
     }
@@ -2317,6 +2404,7 @@ struct TabOverview: View {
 
                 liquidGlassBottomCarouselBar
             }
+            .scaleEffect(isExpandingToWeb ? (0.95 + 0.05 * morphProgress) : 1.0)
             .opacity(Double(morphProgress))
 
             // Full-screen floating lifted tab card in exact .global screen coordinates (zero TabView offset mismatch!)
@@ -2541,12 +2629,13 @@ struct TabOverview: View {
 
         return GeometryReader { outerGeo in
             let isSingleHero = (groupTabs.count == 1 && headerTitle == nil && !selectionMode)
+            let contentW = max(120, outerGeo.size.width - 28)
             let heroW = min(outerGeo.size.width * 0.68, 285)
             let heroH = min(outerGeo.size.height * 0.60, heroW * 1.38)
-            let cellWidth = max(46, (outerGeo.size.width - 28 - CGFloat(colCount - 1) * 12) / CGFloat(colCount))
+            let cellWidth = max(46, (contentW - CGFloat(colCount - 1) * 12) / CGFloat(colCount))
             let gridThumbHeight = min(290, max(78, cellWidth * ratio))
             let rowCount = max(1, (groupTabs.count + colCount - 1) / colCount)
-            let estimatedGridH = CGFloat(rowCount) * (gridThumbHeight + 26) + CGFloat(max(0, rowCount - 1)) * 14 + 36
+            let estimatedGridH = CGFloat(rowCount) * (gridThumbHeight + 25) + CGFloat(max(0, rowCount - 1)) * 14 + 36
             let activeIndex = groupTabs.firstIndex(where: { $0.id == model.activeID })
             let isOverflowing = (!isSingleHero && useGridLayout && estimatedGridH > outerGeo.size.height - 20)
             let needsInitialScroll = isOverflowing && (
@@ -2584,21 +2673,17 @@ struct TabOverview: View {
                                 }
                             }
                             .padding(.horizontal, 14)
-                        } else if isSingleHero {
-                            // Exact Video Frame 00:01: Signature Single Large Centered Hero Card!
-                            HStack {
-                                Spacer(minLength: 0)
-                                safariTabCard(tab: groupTabs[0], index: 0, cardHeight: heroH, isHeroSingle: true, outerGeo: outerGeo, scrollProxy: proxy, groupTabs: groupTabs)
-                                    .frame(width: heroW)
-                                Spacer(minLength: 0)
-                            }
-                            .padding(.top, 16)
                         } else {
-                            deterministicTabGrid(
+                            unifiedTabGrid(
                                 groupTabs: groupTabs,
                                 groupID: groupID,
                                 colCount: colCount,
+                                contentW: contentW,
+                                cellWidth: cellWidth,
                                 gridThumbHeight: gridThumbHeight,
+                                heroW: heroW,
+                                heroH: heroH,
+                                isSingleHero: isSingleHero,
                                 headerTitle: headerTitle,
                                 outerGeo: outerGeo,
                                 scrollProxy: proxy
@@ -2609,6 +2694,7 @@ struct TabOverview: View {
                 }
                 .scrollDisabled(draggingTabID != nil || contextMenuTab != nil)
                 .onAppear {
+                    groupViewportRects[groupID] = outerGeo.frame(in: .global)
                     guard groupID == model.activeGroupID else { return }
                     initialScrollAppearedGroupIDs.insert(groupID)
                     if needsInitialScroll {
@@ -2642,7 +2728,11 @@ struct TabOverview: View {
                         onCardRectsUpdated()
                     }
                 }
+                .onChange(of: outerGeo.size) { _ in
+                    groupViewportRects[groupID] = outerGeo.frame(in: .global)
+                }
                 .onPreferenceChange(TabCardFramePreferenceKey.self) { frames in
+                    groupViewportRects[groupID] = outerGeo.frame(in: .global)
                     let currentCardH = isSingleHero ? heroH : gridThumbHeight
                     for (id, rect) in frames {
                         tabFrames[id] = rect
@@ -2679,93 +2769,281 @@ struct TabOverview: View {
         }
     }
 
-    private func deterministicTabGrid(
+    private func unifiedTabGrid(
         groupTabs: [BrowserTab],
         groupID: UUID,
         colCount: Int,
+        contentW: CGFloat,
+        cellWidth: CGFloat,
         gridThumbHeight: CGFloat,
+        heroW: CGFloat,
+        heroH: CGFloat,
+        isSingleHero: Bool,
         headerTitle: String?,
         outerGeo: GeometryProxy,
         scrollProxy: ScrollViewProxy
     ) -> some View {
+        let colSpacing: CGFloat = 12
+        let rowSpacing: CGFloat = 14
+        let gridCellH = gridThumbHeight + 25
+        let heroCellH = heroH + 25
         let rowCount = max(1, (groupTabs.count + colCount - 1) / colCount)
+        let naturalGridH: CGFloat = isSingleHero
+            ? (16 + heroCellH + 16)
+            : (CGFloat(rowCount) * gridCellH + CGFloat(max(0, rowCount - 1)) * rowSpacing + 16)
         let minContainerH = max(0, outerGeo.size.height - (headerTitle == nil ? 12 : 54))
-        return VStack {
-            if model.preferences.tabsStartFromBottom {
+        let groupGhosts = closingGhosts.filter { $0.groupID == groupID }
+
+        return VStack(spacing: 0) {
+            if model.preferences.tabsStartFromBottom && !isSingleHero {
                 Spacer(minLength: 0)
             }
-            VStack(spacing: 14) {
-                ForEach(0..<rowCount, id: \.self) { row in
-                    deterministicTabGridRow(
-                        row: row,
-                        colCount: colCount,
+            ZStack(alignment: .topLeading) {
+                // Departing closing-tab ghosts stay behind sliding siblings (zIndex 0) and shrink/fade per situation
+                ForEach(groupGhosts) { ghost in
+                    ClosingTabGhostCardView(
+                        targetScale: ghost.wasLastTab ? (ghost.collapsedRow ? 0.80 : 0.84) : 0.78,
+                        duration: ghost.wasLastTab ? (ghost.collapsedRow ? 0.24 : 0.28) : 0.21
+                    ) {
+                        safariTabCardVisual(
+                            tab: ghost.tab,
+                            cardHeight: ghost.cardHeight,
+                            isHeroSingle: ghost.isHeroSingle,
+                            isLiftedOverlay: false
+                        )
+                        .frame(width: ghost.width, height: ghost.cellHeight, alignment: .top)
+                    }
+                    .padding(.leading, ghost.slotX)
+                    .padding(.top, ghost.slotY)
+                    .allowsHitTesting(false)
+                    .zIndex(0)
+                }
+
+                // Flat ForEach keyed by tab.id preserves identity so middle-tab closes glide 2D smoothly (Left & Up-Right!)
+                ForEach(Array(groupTabs.enumerated()), id: \.element.id) { idx, tab in
+                    unifiedTabGridCell(
+                        tab: tab,
+                        idx: idx,
                         groupTabs: groupTabs,
                         groupID: groupID,
+                        colCount: colCount,
+                        contentW: contentW,
+                        cellWidth: cellWidth,
                         gridThumbHeight: gridThumbHeight,
+                        gridCellH: gridCellH,
+                        heroW: heroW,
+                        heroH: heroH,
+                        heroCellH: heroCellH,
+                        isSingleHero: isSingleHero,
+                        colSpacing: colSpacing,
+                        rowSpacing: rowSpacing,
                         outerGeo: outerGeo,
                         scrollProxy: scrollProxy
                     )
                 }
             }
+            .modifier(AnimatableGridHeightModifier(width: contentW, height: naturalGridH))
             .padding(.horizontal, 14)
-            .padding(.bottom, 16)
         }
-        .frame(minHeight: minContainerH)
+        .frame(minHeight: minContainerH, alignment: (model.preferences.tabsStartFromBottom && !isSingleHero) ? .bottom : .top)
     }
 
-    private func deterministicTabGridRow(
-        row: Int,
-        colCount: Int,
-        groupTabs: [BrowserTab],
-        groupID: UUID,
-        gridThumbHeight: CGFloat,
-        outerGeo: GeometryProxy,
-        scrollProxy: ScrollViewProxy
-    ) -> some View {
-        HStack(alignment: .top, spacing: 12) {
-            ForEach(0..<colCount, id: \.self) { col in
-                deterministicTabGridCell(
-                    idx: row * colCount + col,
-                    groupTabs: groupTabs,
-                    groupID: groupID,
-                    gridThumbHeight: gridThumbHeight,
-                    outerGeo: outerGeo,
-                    scrollProxy: scrollProxy
-                )
-            }
-        }
-    }
-
-    @ViewBuilder
-    private func deterministicTabGridCell(
+    private func unifiedTabGridCell(
+        tab: BrowserTab,
         idx: Int,
         groupTabs: [BrowserTab],
         groupID: UUID,
+        colCount: Int,
+        contentW: CGFloat,
+        cellWidth: CGFloat,
         gridThumbHeight: CGFloat,
+        gridCellH: CGFloat,
+        heroW: CGFloat,
+        heroH: CGFloat,
+        heroCellH: CGFloat,
+        isSingleHero: Bool,
+        colSpacing: CGFloat,
+        rowSpacing: CGFloat,
         outerGeo: GeometryProxy,
         scrollProxy: ScrollViewProxy
     ) -> some View {
-        if idx < groupTabs.count {
-            safariTabCard(
-                tab: groupTabs[idx],
-                index: idx,
-                cardHeight: gridThumbHeight,
-                isHeroSingle: false,
-                outerGeo: outerGeo,
-                scrollProxy: scrollProxy,
-                groupTabs: groupTabs
-            )
-            .id(groupTabs[idx].id)
-            .frame(maxWidth: .infinity)
-            .offset(visualShiftOffset(for: idx, groupID: groupID))
-            .animation(.spring(response: 0.28, dampingFraction: 0.80), value: dragTargetIndex)
-            .transition(.asymmetric(
-                insertion: .scale(scale: 0.90).combined(with: .opacity),
-                removal: .scale(scale: 0.72).combined(with: .opacity)
-            ))
-        } else {
-            Color.clear.frame(maxWidth: .infinity).frame(height: 1)
+        let row = idx / colCount
+        let col = idx % colCount
+        let cardW = isSingleHero ? heroW : cellWidth
+        let cardH = isSingleHero ? heroH : gridThumbHeight
+        let cellH = isSingleHero ? heroCellH : gridCellH
+        let slotX = isSingleHero ? max(0, (contentW - heroW) * 0.5) : CGFloat(col) * (cellWidth + colSpacing)
+        let slotY = isSingleHero ? 16 : CGFloat(row) * (gridCellH + rowSpacing)
+
+        return safariTabCard(
+            tab: tab,
+            index: idx,
+            cardHeight: cardH,
+            isHeroSingle: isSingleHero,
+            outerGeo: outerGeo,
+            scrollProxy: scrollProxy,
+            groupTabs: groupTabs,
+            onCloseAnimated: {
+                closeTabWithSafariAnimation(
+                    tab: tab,
+                    index: idx,
+                    groupTabs: groupTabs,
+                    groupID: groupID,
+                    colCount: colCount,
+                    slotX: slotX,
+                    slotY: slotY,
+                    width: cardW,
+                    cardHeight: cardH,
+                    cellHeight: cellH,
+                    isHeroSingle: isSingleHero
+                )
+            }
+        )
+        .frame(width: cardW, height: cellH, alignment: .top)
+        .id(tab.id)
+        .padding(.leading, slotX)
+        .padding(.top, slotY)
+        .offset(visualShiftOffset(for: idx, groupID: groupID))
+        .animation(.spring(response: 0.28, dampingFraction: 0.80), value: dragTargetIndex)
+        .zIndex(2)
+    }
+
+    private func closeTabWithSafariAnimation(
+        tab: BrowserTab,
+        index: Int,
+        groupTabs: [BrowserTab],
+        groupID: UUID,
+        colCount: Int,
+        slotX: CGFloat,
+        slotY: CGFloat,
+        width: CGFloat,
+        cardHeight: CGFloat,
+        cellHeight: CGFloat,
+        isHeroSingle: Bool
+    ) {
+        let totalBefore = groupTabs.count
+        let totalAfter = max(1, totalBefore - 1)
+        let rowsBefore = max(1, (totalBefore + colCount - 1) / colCount)
+        let rowsAfter = max(1, (totalAfter + colCount - 1) / colCount)
+        let wasLastTab = (index == totalBefore - 1)
+        let collapsedRow = (rowsAfter < rowsBefore) && (totalBefore > 1)
+
+        let ghostID = UUID()
+        let ghost = ClosingTabGhost(
+            id: ghostID,
+            tab: tab,
+            groupID: groupID,
+            slotX: slotX,
+            slotY: slotY,
+            width: width,
+            cardHeight: cardHeight,
+            cellHeight: cellHeight,
+            isHeroSingle: isHeroSingle,
+            wasLastTab: wasLastTab,
+            collapsedRow: collapsedRow
+        )
+
+        var mountTx = Transaction()
+        mountTx.disablesAnimations = true
+        withTransaction(mountTx) {
+            closingGhosts.append(ghost)
         }
+
+        let reflowSpring: Animation = collapsedRow
+            ? .spring(response: 0.36, dampingFraction: 0.86)
+            : .spring(response: 0.32, dampingFraction: 0.84)
+        withAnimation(reflowSpring) {
+            model.close(tab.id)
+        }
+
+        let ghostDuration: Double = wasLastTab ? (collapsedRow ? 0.24 : 0.28) : 0.21
+        DispatchQueue.main.asyncAfter(deadline: .now() + ghostDuration + 0.08) {
+            closingGhosts.removeAll { $0.id == ghostID }
+        }
+    }
+
+    private func closeTabByIDWithSafariAnimation(_ tabID: UUID, in groupID: UUID) {
+        let groupTabs = displayedTabs(for: groupID)
+        guard useGridLayout, let idx = groupTabs.firstIndex(where: { $0.id == tabID }) else {
+            withAnimation(.spring(response: 0.32, dampingFraction: 0.84)) {
+                model.close(tabID)
+            }
+            return
+        }
+        let tab = groupTabs[idx]
+        let headerTitle = model.groupHeaderTitle(for: groupID)
+        let colCount = min(10, max(1, model.preferences.tabGridColumns))
+        let ratio = model.preferences.tabThumbnailAspectRatio.heightRatio
+        let screen = UIScreen.main.bounds
+        let vp = groupViewportRects[groupID] ?? CGRect(x: 0, y: 120, width: screen.width, height: max(300, screen.height - 230))
+        let contentW = max(120, vp.width - 28)
+        let cellW = max(46, (contentW - CGFloat(colCount - 1) * 12) / CGFloat(colCount))
+        let thumbH = min(290, max(78, cellW * ratio))
+        let gridCellH = thumbH + 25
+        let heroW = min(vp.width * 0.68, 285)
+        let heroH = min(vp.height * 0.60, heroW * 1.38)
+        let isSingleHero = (groupTabs.count == 1 && headerTitle == nil && !selectionMode)
+        let row = idx / colCount
+        let col = idx % colCount
+        let cardW = isSingleHero ? heroW : cellW
+        let cardH = isSingleHero ? heroH : thumbH
+        let cellH = cardH + 25
+        let slotX = isSingleHero ? max(0, (contentW - heroW) * 0.5) : CGFloat(col) * (cellW + 12)
+        let slotY = isSingleHero ? 16 : CGFloat(row) * (gridCellH + 14)
+
+        closeTabWithSafariAnimation(
+            tab: tab,
+            index: idx,
+            groupTabs: groupTabs,
+            groupID: groupID,
+            colCount: colCount,
+            slotX: slotX,
+            slotY: slotY,
+            width: cardW,
+            cardHeight: cardH,
+            cellHeight: cellH,
+            isHeroSingle: isSingleHero
+        )
+    }
+
+    private func computeNewTabSlotRect(for groupID: UUID) -> (rect: CGRect, isHero: Bool) {
+        let currentTabs = displayedTabs(for: groupID)
+        let headerTitle = model.groupHeaderTitle(for: groupID)
+        let colCount = min(10, max(1, model.preferences.tabGridColumns))
+        let ratio = model.preferences.tabThumbnailAspectRatio.heightRatio
+        let screen = UIScreen.main.bounds
+        let vp = groupViewportRects[groupID] ?? CGRect(x: 0, y: 120, width: screen.width, height: max(300, screen.height - 230))
+        let contentW = max(120, vp.width - 28)
+        let cellW = max(46, (contentW - CGFloat(colCount - 1) * 12) / CGFloat(colCount))
+        let thumbH = min(290, max(78, cellW * ratio))
+        let heroW = min(vp.width * 0.68, 285)
+        let heroH = min(vp.height * 0.60, heroW * 1.38)
+
+        let count = currentTabs.count
+        if count == 0 && headerTitle == nil {
+            return (CGRect(x: vp.midX - heroW * 0.5, y: vp.minY + 16, width: heroW, height: heroH), true)
+        }
+
+        let newCol = count % colCount
+        let newRow = count / colCount
+        if useGridLayout && count > 0 {
+            if newCol > 0, let prev = tabFrames[currentTabs[count - 1].id], prev.width > 20 {
+                // Same row, immediately right of the last card (e.g. 3->4, 5->6)
+                let clampedY = min(max(vp.minY + 8, prev.minY), vp.maxY - thumbH * 0.55)
+                return (CGRect(x: prev.maxX + 12, y: clampedY, width: prev.width, height: thumbH), false)
+            }
+            if newCol == 0, let above = tabFrames[currentTabs[max(0, count - colCount)].id], above.width > 20 {
+                // First column of a brand-new row below (e.g. 4->5, 6->7)
+                let rawY = above.maxY + 14
+                let clampedY = min(max(vp.minY + 8, rawY), vp.maxY - thumbH * 0.58)
+                return (CGRect(x: above.minX, y: clampedY, width: above.width, height: thumbH), false)
+            }
+        }
+
+        let x = vp.minX + 14 + CGFloat(newCol) * (cellW + 12)
+        let rawY = vp.minY + (headerTitle == nil ? 0 : 46) + CGFloat(newRow) * (thumbH + 25 + 14)
+        let clampedY = min(max(vp.minY + 8, rawY), vp.maxY - thumbH * 0.58)
+        return (CGRect(x: x, y: clampedY, width: cellW, height: thumbH), false)
     }
 
     private func visualShiftOffset(for index: Int, groupID: UUID) -> CGSize {
@@ -2959,9 +3237,7 @@ struct TabOverview: View {
                         showingBatchMove = true
                     },
                     onCloseTab: {
-                        withAnimation(.spring(response: 0.28, dampingFraction: 0.82)) {
-                            model.close(targetTab.id)
-                        }
+                        closeTabByIDWithSafariAnimation(targetTab.id, in: pagedGroupID)
                     }
                 )
                 .scaleEffect(contextMenuExpanded ? 1.0 : 0.28, anchor: menuAnchor)
@@ -3085,6 +3361,7 @@ struct TabOverview: View {
                     .lineLimit(1)
                 if isHeroSingle { Spacer(minLength: 0) }
             }
+            .frame(height: 18)
             .padding(.horizontal, 4)
         }
     }
@@ -3098,7 +3375,8 @@ struct TabOverview: View {
         isHeroSingle: Bool,
         outerGeo: GeometryProxy,
         scrollProxy: ScrollViewProxy,
-        groupTabs: [BrowserTab]
+        groupTabs: [BrowserTab],
+        onCloseAnimated: (() -> Void)? = nil
     ) -> some View {
         let isDraggingThis = draggingTabID == tab.id
         let isContextMenuThis = contextMenuTab?.id == tab.id
@@ -3111,7 +3389,7 @@ struct TabOverview: View {
             isLiftedOverlay: false,
             hideThumbnail: isContextMenuThis || isHeroHiddenThis
         )
-        .opacity(isDraggingThis ? 0.0 : 1.0)
+        .opacity((isDraggingThis || (isHeroHiddenThis && isExpandingToWeb)) ? 0.0 : 1.0)
         .background(
             GeometryReader { geo in
                 Color.clear.preference(
@@ -3220,8 +3498,12 @@ struct TabOverview: View {
             if !selectionMode && !isHeroSingle && !isDraggingThis && !isContextMenuThis && !isHeroHiddenThis {
                 Button {
                     UIImpactFeedbackGenerator(style: .light).impactOccurred()
-                    withAnimation(.spring(response: 0.28, dampingFraction: 0.82)) {
-                        model.close(tab.id)
+                    if let onCloseAnimated {
+                        onCloseAnimated()
+                    } else {
+                        withAnimation(.spring(response: 0.32, dampingFraction: 0.84)) {
+                            model.close(tab.id)
+                        }
                     }
                 } label: {
                     Image(systemName: "xmark")
@@ -3363,8 +3645,8 @@ struct TabOverview: View {
             } else {
                 LiquidGlassCircleButton(systemImage: "plus", size: 48, iconSize: 20) {
                     UIImpactFeedbackGenerator(style: .light).impactOccurred()
-                    _ = model.newTab()
-                    onDismiss()
+                    let slot = computeNewTabSlotRect(for: pagedGroupID)
+                    onNewTabWithHero(slot.rect, slot.isHero)
                 }
             }
 
