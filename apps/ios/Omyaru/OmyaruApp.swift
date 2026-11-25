@@ -658,8 +658,8 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
     static let privateGroupID = UUID(uuidString: "00000000-0000-0000-0000-000000000001")!
     static let defaultProfileID = UUID(uuidString: "00000000-0000-0000-0000-000000000010")!
     static let defaultGroupID = UUID(uuidString: "00000000-0000-0000-0000-000000000002")!
-    static let appVersionName = "1.0.3"
-    static let appBuildNumber = 112
+    static let appVersionName = "1.0.4"
+    static let appBuildNumber = 113
 
     var isApplyingRemoteSync: Bool = false
 
@@ -721,12 +721,15 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
     private var compiledContentRuleList: WKContentRuleList? = nil
     private var lastScrollOffsetY: CGFloat = 0
     private var toolbarScrollAccumulator: CGFloat = 0
+    private var chromeSpringPos: CGFloat = 0.0
     private var chromeSpringTarget: CGFloat = 0.0
     private var chromeSpringVelocity: CGFloat = 0.0
     private var chromeSpringDisplayLink: CADisplayLink? = nil
     private var chromeSpringLastTimestamp: CFTimeInterval = 0
+    private var chromeSpringElapsed: CFTimeInterval = 0
     private var isChromeSpringCommitting: Bool = false
     private var isChromeSpringTracking: Bool = false
+    private var ignoreScrollForCurrentDrag: Bool = false
     private var visitRecordsByProfile: [UUID: [UrlSuggestionRecord]] = [:]
     private var activeDownloadTempInfo: (url: URL, suggestedName: String, mimeType: String)? = nil
     private var statusDismissTask: Task<Void, Never>? = nil
@@ -1455,12 +1458,14 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
         chromeSpringDisplayLink?.invalidate()
         chromeSpringDisplayLink = nil
         chromeSpringLastTimestamp = 0
+        chromeSpringElapsed = 0
     }
 
     private func startChromeSpringIfNeeded() {
         guard chromeSpringDisplayLink == nil else { return }
         let link = CADisplayLink(target: self, selector: #selector(stepChromeSpring(_:)))
         chromeSpringLastTimestamp = 0
+        chromeSpringElapsed = 0
         link.add(to: .main, forMode: .common)
         chromeSpringDisplayLink = link
     }
@@ -1471,11 +1476,14 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
         isChromeSpringTracking = tracking
         if committing {
             isChromeSpringCommitting = true
+            chromeSpringElapsed = 0
         }
-        if abs(chromeCollapseProgress - clamped) < 0.0015 && abs(chromeSpringVelocity) < 0.015 {
+        if abs(chromeSpringPos - clamped) < 0.003 && abs(chromeSpringVelocity) < 0.03 {
+            chromeSpringPos = clamped
             chromeCollapseProgress = clamped
             chromeSpringVelocity = 0
             isChromeSpringCommitting = false
+            isChromeSpringTracking = false
             stopChromeSpring()
             return
         }
@@ -1492,6 +1500,7 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
         }
         chromeSpringLastTimestamp = now
         let dt = min(1.0 / 30.0, max(1.0 / 240.0, rawDt))
+        chromeSpringElapsed += CFTimeInterval(dt)
 
         // Critically-damped fast tracking spring while scrubbing (eliminates 1-frame teleports!),
         // smooth Safari liquid spring on commit / release.
@@ -1500,7 +1509,7 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
         let k = omega * omega
         let c = 2.0 * zeta * omega
 
-        var x = chromeCollapseProgress
+        var x = chromeSpringPos
         var v = chromeSpringVelocity
         let target = chromeSpringTarget
         let subDt = dt * 0.5
@@ -1513,22 +1522,28 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
         if clampedX != x {
             v = 0
         }
+        chromeSpringPos = clampedX
         chromeSpringVelocity = v
 
-        if abs(target - clampedX) < 0.002 && abs(v) < 0.015 {
+        let timedOut = !isChromeSpringTracking && chromeSpringElapsed >= 0.65
+        if timedOut || (abs(target - clampedX) < 0.004 && abs(v) < 0.04) {
+            chromeSpringPos = target
             chromeCollapseProgress = target
             chromeSpringVelocity = 0
             isChromeSpringCommitting = false
             isChromeSpringTracking = false
             stopChromeSpring()
-        } else if abs(clampedX - chromeCollapseProgress) >= 0.0005 {
+        } else {
             chromeCollapseProgress = clampedX
         }
     }
 
-    func setChromeCollapsed(_ collapsed: Bool, animated: Bool = true) {
+    func setChromeCollapsed(_ collapsed: Bool, animated: Bool = true, lockCurrentDrag: Bool = false) {
         let target: CGFloat = collapsed ? 1.0 : 0.0
         toolbarScrollAccumulator = 0
+        if lockCurrentDrag {
+            ignoreScrollForCurrentDrag = true
+        }
         let stateChanged = (isChromeCollapsed != collapsed)
         if stateChanged {
             isChromeCollapsed = collapsed
@@ -1537,10 +1552,12 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
             driveChromeSpring(to: target, tracking: false, committing: true)
         } else {
             stopChromeSpring()
+            chromeSpringPos = target
             chromeSpringTarget = target
             chromeSpringVelocity = 0
             isChromeSpringCommitting = false
             isChromeSpringTracking = false
+            ignoreScrollForCurrentDrag = false
             chromeCollapseProgress = target
         }
         if stateChanged {
@@ -1549,17 +1566,16 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
     }
 
     func scrollViewWillBeginDragging(_ scrollView: UIScrollView) {
+        guard let activeWV = webViews[activeID], activeWV.scrollView === scrollView else { return }
         lastScrollOffsetY = scrollView.contentOffset.y + scrollView.adjustedContentInset.top
-        if isChromeSpringCommitting {
-            // Let an active commit spring finish smoothly without jumping
-            toolbarScrollAccumulator = 0
-            return
-        }
-        // Seed accumulator from current visual progress so touching down mid-settle NEVER jumps!
+        // A brand-new user touch ALWAYS unlocks previous-drag scroll ignore so scrolling down never gets stuck!
+        ignoreScrollForCurrentDrag = false
+        isChromeSpringCommitting = false
+        // Seed accumulator from current visual position so grabbing mid-motion NEVER jumps!
         if !isChromeCollapsed {
-            toolbarScrollAccumulator = chromeCollapseProgress * 80.0
+            toolbarScrollAccumulator = chromeSpringPos * 80.0
         } else {
-            let swell = max(0.0, 1.0 - chromeCollapseProgress)
+            let swell = max(0.0, 1.0 - chromeSpringPos)
             toolbarScrollAccumulator = swell > 0.002 ? -(18.0 + swell * 195.0) : 0
         }
     }
@@ -1569,20 +1585,22 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
         withVelocity velocity: CGPoint,
         targetContentOffset: UnsafeMutablePointer<CGPoint>
     ) {
+        guard let activeWV = webViews[activeID], activeWV.scrollView === scrollView else { return }
         guard preferences.hideToolbarOnScroll else { return }
-        if isChromeSpringCommitting { return }
+        if ignoreScrollForCurrentDrag || isChromeSpringCommitting { return }
+        let currentY = scrollView.contentOffset.y + scrollView.adjustedContentInset.top
+        let targetY = targetContentOffset.pointee.y + scrollView.adjustedContentInset.top
         if !isChromeCollapsed {
-            if velocity.y > 0.75 && toolbarScrollAccumulator >= 14 {
-                setChromeCollapsed(true, animated: true)
-            } else if chromeCollapseProgress > 0.002 || chromeSpringTarget > 0.002 {
+            if velocity.y > 0.55 && (toolbarScrollAccumulator >= 10 || (targetY - currentY) >= 48) {
+                setChromeCollapsed(true, animated: true, lockCurrentDrag: true)
+            } else if velocity.y <= 0.15 && (chromeSpringPos > 0.002 || chromeSpringTarget > 0.002) {
                 toolbarScrollAccumulator = 0
                 driveChromeSpring(to: 0.0, tracking: false, committing: false)
             }
         } else if preferences.expandToolbarOnScrollUp {
-            let targetY = targetContentOffset.pointee.y + scrollView.adjustedContentInset.top
             if (velocity.y < -1.15 && -toolbarScrollAccumulator >= 20) || targetY <= 16 {
-                setChromeCollapsed(false, animated: true)
-            } else if chromeCollapseProgress < 0.998 || chromeSpringTarget < 0.998 {
+                setChromeCollapsed(false, animated: true, lockCurrentDrag: true)
+            } else if velocity.y >= -0.15 && (chromeSpringPos < 0.998 || chromeSpringTarget < 0.998) {
                 toolbarScrollAccumulator = 0
                 driveChromeSpring(to: 1.0, tracking: false, committing: false)
             }
@@ -1590,12 +1608,16 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
     }
 
     func scrollViewDidEndDragging(_ scrollView: UIScrollView, willDecelerate decelerate: Bool) {
+        guard let activeWV = webViews[activeID], activeWV.scrollView === scrollView else { return }
         if !decelerate {
+            ignoreScrollForCurrentDrag = false
             settleChromeCollapseProgress()
         }
     }
 
     func scrollViewDidEndDecelerating(_ scrollView: UIScrollView) {
+        guard let activeWV = webViews[activeID], activeWV.scrollView === scrollView else { return }
+        ignoreScrollForCurrentDrag = false
         settleChromeCollapseProgress()
     }
 
@@ -1603,27 +1625,28 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
         if isChromeSpringCommitting { return }
         let target: CGFloat = isChromeCollapsed ? 1.0 : 0.0
         toolbarScrollAccumulator = 0
-        if abs(chromeCollapseProgress - target) > 0.002 || abs(chromeSpringTarget - target) > 0.002 {
+        if abs(chromeSpringPos - target) > 0.002 || abs(chromeSpringTarget - target) > 0.002 {
             driveChromeSpring(to: target, tracking: false, committing: false)
         }
     }
 
     func scrollViewDidScroll(_ scrollView: UIScrollView) {
+        guard let activeWV = webViews[activeID], activeWV.scrollView === scrollView else { return }
         let viewportH = max(1, scrollView.bounds.height)
         let contentH = scrollView.contentSize.height
-        let scrollable = contentH - viewportH
-        let adjustedY = max(0, scrollView.contentOffset.y + scrollView.adjustedContentInset.top)
+        let insetTop = scrollView.adjustedContentInset.top
+        let insetBot = scrollView.adjustedContentInset.bottom
+        let totalScrollable = (contentH + insetTop + insetBot) - viewportH
+        let adjustedY = max(0, scrollView.contentOffset.y + insetTop)
         let nowAtTop = adjustedY <= 3
         if isAtTopOfPage != nowAtTop {
             isAtTopOfPage = nowAtTop
         }
-        if let activeWV = webViews[activeID], activeWV.scrollView === scrollView {
-            updateScrollEdgeBackgroundColor(for: activeWV, tabID: activeID)
-        }
-        if scrollable > 40 {
+        updateScrollEdgeBackgroundColor(for: activeWV, tabID: activeID)
+        if totalScrollable > 40 {
             isScrollable = true
-            scrollViewportRatio = min(1.0, max(0.12, Double(viewportH / max(contentH, 1))))
-            scrollFraction = min(1.0, max(0.0, Double(adjustedY / max(scrollable, 1))))
+            scrollViewportRatio = min(1.0, max(0.12, Double(viewportH / max(contentH + insetTop + insetBot, 1))))
+            scrollFraction = min(1.0, max(0.0, Double(adjustedY / max(totalScrollable, 1))))
             if scrollView.isDragging || scrollView.isDecelerating {
                 lastScrollActivity = Date()
             }
@@ -1632,32 +1655,33 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
         }
 
         guard preferences.hideToolbarOnScroll else {
-            if isChromeCollapsed || chromeCollapseProgress > 0.001 || chromeSpringTarget > 0.001 {
+            if isChromeCollapsed || chromeSpringPos > 0.002 || chromeSpringTarget > 0.002 {
                 setChromeCollapsed(false, animated: true)
             }
             return
         }
-        let y = scrollView.contentOffset.y + scrollView.adjustedContentInset.top
+        let y = scrollView.contentOffset.y + insetTop
         let delta = y - lastScrollOffsetY
         lastScrollOffsetY = y
         if y <= 8 {
             toolbarScrollAccumulator = 0
             if (isChromeCollapsed && preferences.expandToolbarOnScrollUp)
-                || (!isChromeCollapsed && (chromeCollapseProgress > 0.002 || chromeSpringTarget > 0.002)) {
+                || (!isChromeCollapsed && (chromeSpringPos > 0.002 || chromeSpringTarget > 0.002)) {
                 if !(isChromeSpringCommitting && chromeSpringTarget == 0.0) {
-                    setChromeCollapsed(false, animated: true)
+                    setChromeCollapsed(false, animated: true, lockCurrentDrag: scrollView.isDragging)
                 }
             }
             return
         }
-        let maxScrollY = max(0, contentH - viewportH)
-        if scrollable <= 24 || y > maxScrollY + 4 {
+        // Account for adjustedContentInset.top + bottom so pages never falsely hit maxY early!
+        let maxY = max(0, totalScrollable)
+        if totalScrollable <= 24 || y > maxY + 4 {
             return
         }
         if delta == 0 || abs(delta) > viewportH { return }
 
-        // Never allow live scroll ticks to clobber an in-flight commit collapse/expand spring!
-        if isChromeSpringCommitting { return }
+        // Only ignore residual deltas from the SAME drag that already committed; a fresh drag always works!
+        if ignoreScrollForCurrentDrag || isChromeSpringCommitting { return }
 
         let isUserInteracting = scrollView.isDragging || scrollView.isTracking
 
@@ -1665,7 +1689,7 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
             // Track signed downward drag from 0; slight pull-back smoothly reverses morph with finger!
             toolbarScrollAccumulator = max(0, toolbarScrollAccumulator + delta)
             if toolbarScrollAccumulator >= 36 {
-                setChromeCollapsed(true, animated: true)
+                setChromeCollapsed(true, animated: true, lockCurrentDrag: isUserInteracting)
             } else if isUserInteracting {
                 let scrub = min(0.45, toolbarScrollAccumulator / 80.0)
                 driveChromeSpring(to: scrub, tracking: true, committing: false)
@@ -1679,7 +1703,7 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
             toolbarScrollAccumulator = min(0, toolbarScrollAccumulator + delta)
             let upDist = -toolbarScrollAccumulator
             if upDist >= 80 {
-                setChromeCollapsed(false, animated: true)
+                setChromeCollapsed(false, animated: true, lockCurrentDrag: isUserInteracting)
             } else if isUserInteracting {
                 let swell: CGFloat = upDist > 18 ? min(0.32, (upDist - 18) / 195.0) : 0
                 let scrub = 1.0 - swell
