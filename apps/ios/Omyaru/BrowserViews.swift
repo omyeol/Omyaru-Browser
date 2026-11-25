@@ -820,20 +820,6 @@ private struct ProgressiveGaussianBlurView: UIViewRepresentable {
 
 // MARK: - Main Browser Screen
 
-private struct AnimatedProgressReader<Content: View>: View, Animatable {
-    var progress: CGFloat
-    let content: (CGFloat) -> Content
-
-    var animatableData: CGFloat {
-        get { progress }
-        set { progress = newValue }
-    }
-
-    var body: some View {
-        content(progress)
-    }
-}
-
 struct BrowserScreen: View {
     @EnvironmentObject private var model: BrowserModel
     @State private var address: String = ""
@@ -1636,7 +1622,7 @@ struct BrowserScreen: View {
     private var floatingAndroidToolbarRegion: some View {
         let isBottom = model.preferences.addressBarPosition == .bottom
         let collapsed = model.isChromeCollapsed && !model.isStartPage && !addressFocused
-        let progress: CGFloat = (model.isStartPage || addressFocused) ? 0.0 : max(0.0, min(1.0, model.chromeCollapseProgress))
+        let progress: CGFloat = model.isStartPage ? 0.0 : max(0.0, min(1.0, model.chromeCollapseProgress))
         let expBot: CGFloat = screenSafeAreaInsets.bottom > 0 ? 13 : 10
         let colBot: CGFloat = screenSafeAreaInsets.bottom > 0 ? 15 : 12
         let bottomPad: CGFloat = isBottom ? (addressFocused ? 8 : (expBot + (colBot - expBot) * progress)) : 0
@@ -1652,19 +1638,19 @@ struct BrowserScreen: View {
             }
 
             ZStack(alignment: isBottom ? .bottom : .top) {
-                if collapsed {
-                    Color.clear
-                        .frame(maxWidth: .infinity)
-                        .frame(height: 54)
-                        .contentShape(Rectangle())
-                        .onTapGesture {
+                // Always-mounted empty-space tap catcher (no structural view tree insert/remove during morph!)
+                Color.clear
+                    .frame(maxWidth: .infinity)
+                    .frame(height: 54)
+                    .contentShape(Rectangle())
+                    .allowsHitTesting(collapsed)
+                    .onTapGesture {
+                        if collapsed {
                             expandCollapsedToolbar()
                         }
-                }
+                    }
 
-                AnimatedProgressReader(progress: progress) { animatedP in
-                    morphingUrlIsland(progress: animatedP, isBottom: isBottom)
-                }
+                morphingUrlIsland(progress: progress, isBottom: isBottom)
                     .padding(.top, isBottom ? 0 : 6)
                     .padding(.bottom, bottomPad)
             }

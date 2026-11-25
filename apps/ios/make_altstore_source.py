@@ -9,8 +9,8 @@ from datetime import date
 def read_bundle_version(plist_path: pathlib.Path) -> tuple[str, str]:
     with plist_path.open("rb") as fp:
         info = plistlib.load(fp)
-    version = str(info.get("CFBundleShortVersionString") or "1.0.2")
-    build = str(info.get("CFBundleVersion") or "111")
+    version = str(info.get("CFBundleShortVersionString") or "1.0.3")
+    build = str(info.get("CFBundleVersion") or "112")
     return version, build
 
 
@@ -58,9 +58,9 @@ def main() -> None:
                 "date": date.today().isoformat(),
                 "localizedDescription": (
                     f"v{version} (build {build_version}): "
-                    "Safari 동일 비대칭 동심원 URL 필드 섬 곡률(상단 38.5pt · 하단 45.5pt · 좌우 여백 12pt) 정밀 일치, "
-                    "축소 URL 필드 섬을 Safari와 동일한 도메인 맞춤 초컴팩트 폭(약 93pt × 31pt)으로 개선, "
-                    "스크롤 연동 인터랙티브 모핑(살짝 올렸다 내렸다 할 때 손가락을 1:1 따라오며 축소/확장 예고·복원 및 Safari 동일 임계값 36pt 축소 / 80pt 확장) 적용 (iOS · Android)."
+                    "URL 필드 섬 확대·축소 시 간헐적으로 1프레임에 갑자기 커지거나 작아지던 튐 현상을 완전 수정 — "
+                    "120Hz CADisplayLink/Choreographer 스프링 물리 엔진과 커밋 애니메이션 잠금을 도입해 "
+                    "손가락 드래그 연동·확장·축소·복원의 모든 전환이 100% 연속적으로 부드럽게 동작하도록 개선 (iOS · Android)."
                 ),
                 "downloadURL": download_url,
                 "size": ipa.stat().st_size,
