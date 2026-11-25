@@ -84,20 +84,30 @@ jobs:
           VERSION="${{ steps.meta.outputs.version }}"
           BUILD="${{ steps.meta.outputs.build }}"
           TAG="v${VERSION}"
+          NOTES_FILE="apps/ios/release-notes-v${VERSION}.md"
           if [ "${{ steps.download_url.outputs.has_version_release }}" = "true" ]; then
             gh release upload "$TAG" "$RUNNER_TEMP/Omyaru-v${VERSION}-ios.ipa" --clobber
+            if [ -f "$NOTES_FILE" ]; then
+              gh release edit "$TAG" --notes-file "$NOTES_FILE"
+            fi
           fi
           gh release view ios-latest >/dev/null 2>&1 || \
-            gh release create ios-latest --title "Omyaru iOS v${VERSION}" \
-              --notes "Omyaru iOS v${VERSION} (build ${BUILD}) for AltStore Classic — full Android v${VERSION} feature parity." \
+            gh release create ios-latest --title "Omyaru iOS v${VERSION} (build ${BUILD})" \
+              --notes "Omyaru iOS v${VERSION} (build ${BUILD}) for AltStore Classic." \
               --prerelease
           gh release upload ios-latest \
             "$RUNNER_TEMP/Omyaru.ipa" \
             "$RUNNER_TEMP/Omyaru-v${VERSION}-ios.ipa" \
             "$RUNNER_TEMP/altstore-source.json" --clobber
-          gh release edit ios-latest \
-            --title "Omyaru iOS v${VERSION}" \
-            --notes "Omyaru iOS v${VERSION} (build ${BUILD}) for AltStore Classic — full Android v${VERSION} feature parity."
+          if [ -f "$NOTES_FILE" ]; then
+            gh release edit ios-latest \
+              --title "Omyaru iOS v${VERSION} (build ${BUILD})" \
+              --notes-file "$NOTES_FILE"
+          else
+            gh release edit ios-latest \
+              --title "Omyaru iOS v${VERSION} (build ${BUILD})" \
+              --notes "Omyaru iOS v${VERSION} (build ${BUILD}) for AltStore Classic — full Android v${VERSION} feature parity."
+          fi
       - name: Refresh raw AltStore source
         if: github.ref == 'refs/heads/main'
         run: |

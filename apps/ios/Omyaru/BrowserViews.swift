@@ -1502,6 +1502,14 @@ struct BrowserScreen: View {
     private var androidOnSurfaceColor: Color { Color(red: 0.945, green: 0.910, blue: 0.894) }
     private var androidMutedColor: Color { Color(red: 0.725, green: 0.682, blue: 0.667) }
 
+    private func expandCollapsedToolbar() {
+        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+        withAnimation(.spring(response: 0.42, dampingFraction: 0.78)) {
+            model.isChromeCollapsed = false
+            model.updateAllWebViewContentInsets()
+        }
+    }
+
     private var floatingAndroidToolbarRegion: some View {
         let isBottom = model.preferences.addressBarPosition == .bottom
         let collapsed = model.isChromeCollapsed && !model.isStartPage && !addressFocused
@@ -1509,28 +1517,45 @@ struct BrowserScreen: View {
         return VStack(spacing: 4) {
             if isBottom && !suggestions.isEmpty {
                 floatingSuggestionsCard(suggestions)
+                    .padding(.horizontal, 8)
             }
             if isBottom && model.isLoading {
                 androidProgressStrip
+                    .padding(.horizontal, 8)
             }
 
-            morphingUrlIsland(collapsed: collapsed)
+            ZStack(alignment: isBottom ? .bottom : .top) {
+                if collapsed {
+                    Color.clear
+                        .frame(maxWidth: .infinity)
+                        .frame(height: 48)
+                        .contentShape(Rectangle())
+                        .onTapGesture {
+                            expandCollapsedToolbar()
+                        }
+                }
+
+                morphingUrlIsland(collapsed: collapsed)
+                    .padding(.horizontal, 8)
+                    .padding(.top, isBottom ? 0 : 6)
+                    .padding(
+                        .bottom,
+                        isBottom
+                            ? (addressFocused ? 8 : (collapsed ? (screenSafeAreaInsets.bottom > 0 ? 8 : 6) : (screenSafeAreaInsets.bottom > 0 ? 14 : 10)))
+                            : 0
+                    )
+            }
+            .frame(maxWidth: .infinity)
 
             if !isBottom && model.isLoading {
                 androidProgressStrip
+                    .padding(.horizontal, 8)
             }
             if !isBottom && !suggestions.isEmpty {
                 floatingSuggestionsCard(suggestions)
+                    .padding(.horizontal, 8)
             }
         }
-        .padding(.horizontal, 8)
-        .padding(.top, isBottom ? 0 : 6)
-        .padding(
-            .bottom,
-            isBottom
-                ? (addressFocused ? 8 : (collapsed ? (screenSafeAreaInsets.bottom > 0 ? 8 : 6) : (screenSafeAreaInsets.bottom > 0 ? 14 : 10)))
-                : 0
-        )
     }
 
     private var androidProgressStrip: some View {
@@ -1663,11 +1688,7 @@ struct BrowserScreen: View {
                     .allowsHitTesting(!addressFocused)
                     .onTapGesture {
                         if collapsed {
-                            UIImpactFeedbackGenerator(style: .light).impactOccurred()
-                            withAnimation(.spring(response: 0.42, dampingFraction: 0.78)) {
-                                model.isChromeCollapsed = false
-                                model.updateAllWebViewContentInsets()
-                            }
+                            expandCollapsedToolbar()
                         } else {
                             addressFocused = true
                         }

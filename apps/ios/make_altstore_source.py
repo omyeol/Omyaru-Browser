@@ -57,10 +57,11 @@ def main() -> None:
                 "buildVersion": build_version,
                 "date": date.today().isoformat(),
                 "localizedDescription": (
-                    f"v{version} (build {build_version}): Full PC/Android/iOS bidirectional CRDT tab, tab group & profile sync "
-                    "(OmyaruTabReplica with live debounced push, group creation/move/delete & tombstone sync), "
-                    "smooth iOS 26 Safari Tab Overview long-press lift, spring-animated 2D grid drag reorder & floating Liquid Glass release menu "
-                    "(copy link, pin/unpin, duplicate, select, move, close other tabs, close), plus parallel Google Drive bookshelf sync."
+                    f"v{version} (build {build_version}): Safari 스타일 120fps Hero Zoom 전환, "
+                    "상황별 탭 열기/닫기 애니메이션(새 탭 슬롯 블룸, 중간 탭 2D 리플로우, 끝 탭 행 축소 스크롤), "
+                    "탭 목록 복귀 시 상·하단 버튼 겹침 자동 회피 스크롤, 축소 URL 필드 좌우 빈 공간 터치 확장, "
+                    "프로필 색상 활성 탭 테두리, 상단 정렬 썸네일, 당겨서 새로고침, 설정 다크 모드/내부 서브메뉴 수정 및 "
+                    "PC·Android·iOS 양방향 CRDT 탭·그룹·프로필·책장 동기화."
                 ),
                 "downloadURL": download_url,
                 "size": ipa.stat().st_size,
