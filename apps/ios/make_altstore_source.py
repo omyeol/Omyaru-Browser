@@ -9,8 +9,8 @@ from datetime import date
 def read_bundle_version(plist_path: pathlib.Path) -> tuple[str, str]:
     with plist_path.open("rb") as fp:
         info = plistlib.load(fp)
-    version = str(info.get("CFBundleShortVersionString") or "1.0.0")
-    build = str(info.get("CFBundleVersion") or "109")
+    version = str(info.get("CFBundleShortVersionString") or "1.0.1")
+    build = str(info.get("CFBundleVersion") or "110")
     return version, build
 
 
@@ -57,13 +57,10 @@ def main() -> None:
                 "buildVersion": build_version,
                 "date": date.today().isoformat(),
                 "localizedDescription": (
-                    f"v{version} (build {build_version}): Omyaru 1.0 정식 출시! "
-                    "신규 Pearl 3D 'O' 리본 공식 아이콘 적용(iOS·Android·PC 통합), "
-                    "앱/책장 잠금 Face ID 인식 즉시 0ms 잠금 해제, "
-                    "Safari 스타일 120fps Hero Zoom 전환 및 상황별 탭 열기/닫기 애니메이션, "
-                    "탭 목록 상·하단 버튼 겹침 자동 회피 스크롤, Safari 동일 높이 축소 URL 필드·좌우 빈 공간 터치 확장, "
-                    "상단 다중 가우시안 블러, 프로필 색상 활성 탭 테두리, 상단 정렬 썸네일, 당겨서 새로고침 및 "
-                    "PC·Android·iOS 양방향 CRDT 동기화."
+                    f"v{version} (build {build_version}): "
+                    "URL 필드 섬 모서리 곡률을 Safari와 동일하게(43pt 연속 곡률) 통일, "
+                    "설정에 '주소창에 도메인만 표시 (예: naver.com)' 옵션 추가(편집 시 전체 URL 표시), "
+                    "옵션 OFF 상태에서도 주소창 축소 시 항상 간략한 도메인(naver.com 등)만 표시하도록 개선 (iOS · Android)."
                 ),
                 "downloadURL": download_url,
                 "size": ipa.stat().st_size,

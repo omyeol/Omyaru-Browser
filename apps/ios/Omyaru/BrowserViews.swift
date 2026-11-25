@@ -1247,6 +1247,9 @@ struct BrowserScreen: View {
         .onChange(of: model.currentURL) { _ in
             if !addressFocused { syncAddressField() }
         }
+        .onChange(of: model.preferences.showFullURL) { _ in
+            if !addressFocused { syncAddressField() }
+        }
         .onChange(of: addressFocused) { focused in
             if focused {
                 if model.isChromeCollapsed {
@@ -1302,8 +1305,7 @@ struct BrowserScreen: View {
         } else if model.preferences.showFullURL || addressFocused {
             address = raw
         } else {
-            let host = URL(string: raw)?.host?.replacingOccurrences(of: "^www\\.", with: "", options: .regularExpression)
-            address = host ?? raw
+            address = BrowserModel.shortDisplayDomain(for: raw)
         }
     }
 
@@ -1723,7 +1725,7 @@ struct BrowserScreen: View {
 
     // Exact iOS 26 Safari Continuous Liquid Glass Morphing URL Island (matches KakaoTalk_20261124_214451018.mp4!)
     private func morphingUrlIsland(collapsed: Bool) -> some View {
-        let outerCorner: CGFloat = collapsed ? 17.5 : (model.preferences.liquidGlassUi ? 34 : 30)
+        let outerCorner: CGFloat = collapsed ? 17.5 : 43
         let activeShortcuts = model.preferences.toolbarShortcuts.isEmpty
             ? ToolbarShortcutAction.defaultOrder
             : model.preferences.toolbarShortcuts
@@ -1779,7 +1781,7 @@ struct BrowserScreen: View {
                     .shadow(color: .black.opacity(collapsed ? 0.65 : 0.0), radius: collapsed ? 2 : 0)
                     .lineLimit(1)
                     .scaleEffect(collapsed ? 0.83 : 1.0)
-                    .padding(.leading, collapsed ? 14 : 50)
+                    .padding(.leading, collapsed ? 14 : (model.preferences.showFullURL ? 50 : 78))
                     .padding(.trailing, collapsed ? 14 : 78)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .contentShape(Rectangle())
@@ -1880,7 +1882,7 @@ struct BrowserScreen: View {
             .clipped()
             .allowsHitTesting(!collapsed)
         }
-        .padding(.horizontal, collapsed ? 4 : 10)
+        .padding(.horizontal, collapsed ? 4 : 12)
         .padding(.top, collapsed ? 0 : 13)
         .padding(.bottom, collapsed ? 0 : 12)
         .frame(maxWidth: collapsed ? 186 : .infinity)
@@ -4947,6 +4949,17 @@ struct SettingsSheet: View {
                                 .pickerStyle(.segmented)
                                 Toggle("스크롤 시 도구모음 숨기기", isOn: $model.preferences.hideToolbarOnScroll)
                                 Toggle("위로 스크롤 시 도구모음 펼치기", isOn: $model.preferences.expandToolbarOnScrollUp)
+                                Toggle(isOn: Binding(
+                                    get: { !model.preferences.showFullURL },
+                                    set: { model.preferences.showFullURL = !$0 }
+                                )) {
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text("주소창에 도메인만 표시")
+                                        Text("예: naver.com (꺼도 주소창 축소 시 도메인만 표시)")
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                    }
+                                }
                                 Toggle("캡처 영역 좌우 여백 표시", isOn: $model.preferences.captureSideMargins)
                                 Button("도구모음 바로가기 편집...") { showToolbarEditor = true }
                                 Button("페이지 도구 메뉴 편집 (URL 왼쪽 버튼)...") { showPageToolsEditor = true }
@@ -5057,7 +5070,6 @@ struct SettingsSheet: View {
                     NavigationLink {
                         Form {
                             Section("브라우징 고급 옵션") {
-                                Toggle("주소창에 전체 URL 표시", isOn: $model.preferences.showFullURL)
                                 Toggle("백그라운드 오디오 재생 허용", isOn: $model.preferences.backgroundAudio)
                                 Toggle("JavaScript 실행 허용", isOn: $model.preferences.javaScriptEnabled)
                                 Toggle("기본적으로 데스크톱 사이트 요청", isOn: $model.preferences.desktopModeDefault)

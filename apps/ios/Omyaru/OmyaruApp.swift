@@ -658,8 +658,8 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
     static let privateGroupID = UUID(uuidString: "00000000-0000-0000-0000-000000000001")!
     static let defaultProfileID = UUID(uuidString: "00000000-0000-0000-0000-000000000010")!
     static let defaultGroupID = UUID(uuidString: "00000000-0000-0000-0000-000000000002")!
-    static let appVersionName = "1.0.0"
-    static let appBuildNumber = 109
+    static let appVersionName = "1.0.1"
+    static let appBuildNumber = 110
 
     var isApplyingRemoteSync: Bool = false
 
@@ -868,13 +868,41 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
         return activeProfile.name
     }
 
-    var collapsedPillTitle: String {
-        if let t = activeTab?.title.trimmingCharacters(in: .whitespacesAndNewlines),
-           !t.isEmpty, t != "새 탭" {
-            return t
+    private static let twoPartPublicSuffixes: Set<String> = [
+        "co.kr", "or.kr", "go.kr", "ac.kr", "ne.kr", "re.kr", "pe.kr",
+        "co.jp", "ne.jp", "or.jp", "go.jp", "ac.jp",
+        "co.uk", "org.uk", "ac.uk", "gov.uk",
+        "com.au", "net.au", "org.au",
+        "com.cn", "net.cn", "org.cn",
+        "com.tw", "com.hk", "com.sg", "com.br", "com.mx",
+    ]
+
+    static func shortDisplayDomain(for rawURL: String) -> String {
+        let trimmed = rawURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty || trimmed == "about:blank" {
+            return ""
         }
-        let host = URL(string: currentURL)?.host?.replacingOccurrences(of: "^www\\.", with: "", options: .regularExpression)
-        return host ?? currentURL
+        let parsed = URL(string: trimmed)
+            ?? (trimmed.contains("://") ? nil : URL(string: "https://\(trimmed)"))
+        guard var host = parsed?.host?.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: ".")),
+              !host.isEmpty else {
+            return trimmed
+        }
+        for prefix in ["www.", "mobile.", "m."] {
+            if host.hasPrefix(prefix) {
+                let candidate = String(host.dropFirst(prefix.count))
+                if candidate.contains(".") && !twoPartPublicSuffixes.contains(candidate) {
+                    host = candidate
+                    break
+                }
+            }
+        }
+        return host
+    }
+
+    var collapsedPillTitle: String {
+        let domain = Self.shortDisplayDomain(for: currentURL)
+        return domain.isEmpty ? "새 탭" : domain
     }
 
     var visibleTabs: [BrowserTab] {
