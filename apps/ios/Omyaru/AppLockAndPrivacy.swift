@@ -4,6 +4,8 @@ import CryptoKit
 import CommonCrypto
 import UniformTypeIdentifiers
 import UIKit
+import CFNetwork
+import Network
 
 // MARK: - App Lock Manager (PIN 4~6 digits OR Password + Face ID / Touch ID + App Switcher Black Shield)
 
@@ -929,6 +931,159 @@ struct BookshelfLockSettingsSheet: View {
 
 // MARK: - WireGuard .conf Profile Manager & DNS-over-HTTPS (Android VpnActivity + VpnProfiles Parity!)
 
+// MARK: - WireGuard User-Space Tunnel Manager (Zero NetworkExtension Entitlement — 100% AltStore Compatible!)
+
+@MainActor
+final class WireGuardTunnelManager: ObservableObject {
+    static let shared = WireGuardTunnelManager()
+
+    @Published var connectedProfileID: UUID? = nil
+    @Published var connectedProfileName: String? = nil
+    @Published var connectedEndpoint: String? = nil
+    @Published var activePort: UInt16 = 0
+    @Published var isConnecting: Bool = false
+    @Published var statusText: String = "연결 안 됨"
+    @Published var rxBytes: UInt64 = 0
+    @Published var txBytes: UInt64 = 0
+    @Published var lastHandshakeSec: Int64 = 0
+    @Published var lastError: String? = nil
+
+    var onTunnelStateChanged: ((UInt16) -> Void)? = nil
+
+    var isConnected: Bool { activePort > 0 && connectedProfileID != nil }
+
+    private struct NativeStats: Decodable {
+        let running: Bool
+        let port: Int32
+        let rxBytes: UInt64
+        let txBytes: UInt64
+        let lastHandshakeSec: Int64
+    }
+
+    func connect(profile: WireGuardProfile) async -> Bool {
+        guard !isConnecting else { return false }
+        isConnecting = true
+        lastError = nil
+        statusText = "연결 중…"
+
+        let raw = profile.rawConfig
+        let result: (port: Int32, errorMsg: String) = await Task.detached(priority: .userInitiated) {
+            let port = raw.withCString { omyaru_wg_start($0) }
+            if port > 0 {
+                return (port, "")
+            }
+            var errMsg = "WireGuard 터널을 시작할 수 없습니다."
+            if let cErr = omyaru_wg_last_error() {
+                let s = String(cString: cErr)
+                omyaru_wg_free_string(cErr)
+                if !s.isEmpty { errMsg = s }
+            }
+            return (port, errMsg)
+        }.value
+
+        isConnecting = false
+        if result.port > 0 && result.port <= 65535 {
+            activePort = UInt16(result.port)
+            connectedProfileID = profile.id
+            connectedProfileName = profile.name
+            connectedEndpoint = profile.endpoint
+            statusText = "연결됨"
+            rxBytes = 0
+            txBytes = 0
+            lastHandshakeSec = 0
+            onTunnelStateChanged?(activePort)
+            refreshStats()
+            return true
+        } else {
+            activePort = 0
+            connectedProfileID = nil
+            connectedProfileName = nil
+            connectedEndpoint = nil
+            statusText = "연결 실패"
+            lastError = result.errorMsg
+            onTunnelStateChanged?(0)
+            return false
+        }
+    }
+
+    func disconnect() {
+        omyaru_wg_stop()
+        activePort = 0
+        connectedProfileID = nil
+        connectedProfileName = nil
+        connectedEndpoint = nil
+        rxBytes = 0
+        txBytes = 0
+        lastHandshakeSec = 0
+        statusText = "연결 안 됨"
+        onTunnelStateChanged?(0)
+    }
+
+    func refreshStats() {
+        guard let cStr = omyaru_wg_stats_json() else { return }
+        let jsonStr = String(cString: cStr)
+        omyaru_wg_free_string(cStr)
+        guard let data = jsonStr.data(using: .utf8),
+              let stats = try? JSONDecoder().decode(NativeStats.self, from: data) else { return }
+        if stats.running && stats.port > 0 {
+            rxBytes = stats.rxBytes
+            txBytes = stats.txBytes
+            lastHandshakeSec = stats.lastHandshakeSec
+        } else if activePort != 0 {
+            activePort = 0
+            connectedProfileID = nil
+            connectedProfileName = nil
+            connectedEndpoint = nil
+            statusText = "연결 안 됨"
+            onTunnelStateChanged?(0)
+        }
+    }
+
+    @available(iOS 17.0, *)
+    func activeProxyConfigurations(preferences: BrowserPreferences) -> [ProxyConfiguration] {
+        if activePort > 0, let nwPort = NWEndpoint.Port(rawValue: activePort) {
+            var cfg = ProxyConfiguration(socksv5Proxy: .hostPort(host: "127.0.0.1", port: nwPort))
+            cfg.allowFailover = false
+            return [cfg]
+        }
+        if preferences.proxyEnabled {
+            let host = preferences.proxyHost.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !host.isEmpty && preferences.proxyPort > 0 && preferences.proxyPort <= 65535,
+               let nwPort = NWEndpoint.Port(rawValue: UInt16(preferences.proxyPort)) {
+                let ep = NWEndpoint.hostPort(host: NWEndpoint.Host(host), port: nwPort)
+                var cfg = preferences.proxyIsSOCKS5
+                    ? ProxyConfiguration(socksv5Proxy: ep)
+                    : ProxyConfiguration(httpCONNECTProxy: ep)
+                cfg.allowFailover = false
+                return [cfg]
+            }
+        }
+        return []
+    }
+
+    static func isSystemVpnActive() -> Bool {
+        guard let cfDict = CFNetworkCopySystemProxySettings()?.takeRetainedValue() as? [String: Any],
+              let scoped = cfDict["__SCOPED__"] as? [String: Any] else {
+            return false
+        }
+        for key in scoped.keys {
+            let lower = key.lowercased()
+            if lower.contains("tap") || lower.contains("tun") || lower.contains("ppp") || lower.contains("ipsec") || lower.contains("utun") {
+                return true
+            }
+        }
+        return false
+    }
+
+    static func formatBytes(_ bytes: UInt64) -> String {
+        let kb = Double(bytes) / 1024.0
+        if kb < 1024.0 { return String(format: "%.1f KB", kb) }
+        let mb = kb / 1024.0
+        if mb < 1024.0 { return String(format: "%.2f MB", mb) }
+        return String(format: "%.2f GB", mb / 1024.0)
+    }
+}
+
 struct WireGuardProfile: Codable, Identifiable, Hashable {
     var id: UUID = UUID()
     var name: String
@@ -997,12 +1152,16 @@ struct MobileConfigDocument: FileDocument {
 struct NetworkPrivacySheet: View {
     @Environment(\.dismiss) private var dismiss
     @ObservedObject var model: BrowserModel
+    @ObservedObject private var wg = WireGuardTunnelManager.shared
     @State private var exportingProfile = false
     @State private var profileDoc = MobileConfigDocument(data: Data())
     @State private var importingWireGuard = false
+    @State private var sharingConfURL: URL? = nil
     @State private var checkingConnection = false
     @State private var connectionResult = ""
     @State private var alertMessage: String? = nil
+    @State private var systemVpnActive = WireGuardTunnelManager.isSystemVpnActive()
+    @State private var statsPollTask: Task<Void, Never>? = nil
 
     var body: some View {
         NavigationStack {
@@ -1052,8 +1211,48 @@ struct NetworkPrivacySheet: View {
                     Text("기기 IP는 바꾸지 않고 도메인 질의(DNS)만 암호화된 DoH로 우회하여 ISP 차단 및 DNS 감청을 방지합니다.")
                 }
 
-                // 2. WireGuard VPN 프로필 (.conf) & 인터넷 연결 검사 — Android VpnActivity 섹션 2
+                // 2. 내장 WireGuard VPN — Android VpnActivity 섹션 2 (실제 연결/해제 지원!)
                 Section {
+                    // 상태 배너
+                    HStack(spacing: 10) {
+                        Circle()
+                            .fill(wg.isConnected ? Color.green : (systemVpnActive ? Color.blue : Color.gray.opacity(0.6)))
+                            .frame(width: 10, height: 10)
+                        VStack(alignment: .leading, spacing: 2) {
+                            if wg.isConnected, let name = wg.connectedProfileName {
+                                Text("연결됨 · \(name)")
+                                    .font(.subheadline.weight(.semibold))
+                                    .foregroundStyle(.green)
+                                Text("수신 \(WireGuardTunnelManager.formatBytes(wg.rxBytes)) · 송신 \(WireGuardTunnelManager.formatBytes(wg.txBytes))")
+                                    .font(.caption2.monospacedDigit())
+                                    .foregroundStyle(.secondary)
+                            } else if wg.isConnecting {
+                                Text("WireGuard 연결 중…")
+                                    .font(.subheadline.weight(.semibold))
+                                    .foregroundStyle(.orange)
+                            } else if systemVpnActive {
+                                Text("iOS 시스템 VPN 활성 중")
+                                    .font(.subheadline.weight(.semibold))
+                                    .foregroundStyle(.blue)
+                            } else {
+                                Text("연결 안 됨")
+                                    .font(.subheadline.weight(.medium))
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                        Spacer()
+                        if wg.isConnecting {
+                            ProgressView()
+                        } else if wg.isConnected {
+                            Button("연결 해제", role: .destructive) {
+                                wg.disconnect()
+                                model.status = "WireGuard VPN 연결을 해제했습니다."
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                        }
+                    }
+
                     Button {
                         importingWireGuard = true
                     } label: {
@@ -1066,21 +1265,66 @@ struct NetworkPrivacySheet: View {
                             .foregroundStyle(.secondary)
                     } else {
                         ForEach(model.wireGuardProfiles) { prof in
-                            VStack(alignment: .leading, spacing: 3) {
-                                HStack {
-                                    Text(prof.name).font(.subheadline.weight(.semibold))
-                                    Spacer()
-                                    ShareLink(item: prof.rawConfig) {
-                                        Label("내보내기", systemImage: "square.and.arrow.up")
-                                            .font(.caption)
+                            let isThisConnected = (wg.connectedProfileID == prof.id && wg.isConnected)
+                            VStack(alignment: .leading, spacing: 6) {
+                                HStack(spacing: 8) {
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(prof.name)
+                                            .font(.subheadline.weight(.semibold))
+                                        Text("Endpoint: \(prof.endpoint)")
+                                            .font(.caption2)
+                                            .foregroundStyle(.secondary)
+                                            .lineLimit(1)
+                                        Text("Address: \(prof.address) · DNS: \(prof.dns)")
+                                            .font(.caption2)
+                                            .foregroundStyle(.secondary)
+                                            .lineLimit(1)
+                                    }
+                                    Spacer(minLength: 6)
+                                    if isThisConnected {
+                                        Button("해제", role: .destructive) {
+                                            wg.disconnect()
+                                            model.status = "WireGuard VPN 연결을 해제했습니다."
+                                        }
+                                        .buttonStyle(.borderedProminent)
+                                        .tint(.red)
+                                        .controlSize(.small)
+                                    } else {
+                                        Button("연결") {
+                                            Task {
+                                                let ok = await wg.connect(profile: prof)
+                                                if ok {
+                                                    model.status = "WireGuard VPN 연결됨 (\(prof.name))"
+                                                } else if let err = wg.lastError {
+                                                    alertMessage = "WireGuard 연결 실패: \(err)"
+                                                }
+                                            }
+                                        }
+                                        .buttonStyle(.borderedProminent)
+                                        .controlSize(.small)
+                                        .disabled(wg.isConnecting)
                                     }
                                 }
-                                Text("Endpoint: \(prof.endpoint) · Address: \(prof.address)")
-                                    .font(.caption2)
-                                    .foregroundStyle(.secondary)
+
+                                HStack(spacing: 12) {
+                                    Button {
+                                        if let fileURL = writeTempConfFile(for: prof) {
+                                            sharingConfURL = fileURL
+                                        }
+                                    } label: {
+                                        Label("WireGuard 앱으로 .conf 공유", systemImage: "square.and.arrow.up")
+                                            .font(.caption)
+                                    }
+                                    .buttonStyle(.plain)
+                                    .foregroundStyle(.blue)
+                                }
                             }
+                            .padding(.vertical, 2)
                             .swipeActions {
                                 Button("삭제", role: .destructive) {
+                                    if wg.connectedProfileID == prof.id {
+                                        wg.disconnect()
+                                    }
                                     model.wireGuardProfiles.removeAll { $0.id == prof.id }
                                     model.persist()
                                 }
@@ -1105,25 +1349,48 @@ struct NetworkPrivacySheet: View {
                             .foregroundStyle(.secondary)
                     }
                 } header: {
-                    Text("VPN (WireGuard .conf) 및 연결 검사")
+                    Text("내장 VPN (WireGuard .conf) 및 연결 검사")
                 } footer: {
-                    Text("WireGuard .conf 프로필을 검증·보관하고 iOS WireGuard/시스템 VPN으로 바로 공유할 수 있습니다. (AltStore 무료 서명 환경은 시스템 NetworkExtension 권한 제한이 있어 .conf 내보내기 및 DoH .mobileconfig를 함께 제공합니다.)")
+                    if #available(iOS 17.0, *) {
+                        Text("Omyaru 내장 WireGuard 엔진으로 .conf 프로필에 바로 연결해 브라우저의 모든 웹·DNS 트래픽을 암호화 터널로 우회합니다. 기기 전체 시스템 VPN이 필요하면 '.conf 공유'로 공식 WireGuard 앱에 추가할 수 있습니다.")
+                    } else {
+                        Text("iOS 17 이상에서 Omyaru 내장 WireGuard 연결을 지원합니다. iOS 16에서는 '.conf 공유'로 공식 WireGuard 앱에 추가해 연결할 수 있습니다.")
+                    }
                 }
 
                 // 3. SOCKS5 / HTTP 프록시
                 Section("프록시 설정 (SOCKS5 / HTTP)") {
                     Toggle("프록시 프로필 활성화", isOn: $model.preferences.proxyEnabled)
-                        .onChange(of: model.preferences.proxyEnabled) { _ in model.savePreferences() }
+                        .onChange(of: model.preferences.proxyEnabled) { _ in
+                            model.savePreferences()
+                            Task { await model.applyNetworkProxyConfiguration() }
+                        }
                     if model.preferences.proxyEnabled {
                         Picker("유형", selection: $model.preferences.proxyIsSOCKS5) {
                             Text("SOCKS5").tag(true)
                             Text("HTTP CONNECT").tag(false)
                         }
+                        .onChange(of: model.preferences.proxyIsSOCKS5) { _ in
+                            model.savePreferences()
+                            Task { await model.applyNetworkProxyConfiguration() }
+                        }
                         TextField("호스트 (예: 127.0.0.1)", text: $model.preferences.proxyHost)
                             .textInputAutocapitalization(.never)
                             .autocorrectionDisabled()
+                            .onSubmit {
+                                model.savePreferences()
+                                Task { await model.applyNetworkProxyConfiguration() }
+                            }
                         TextField("포트 (예: 1080)", value: $model.preferences.proxyPort, format: .number)
                             .keyboardType(.numberPad)
+                            .onSubmit {
+                                model.savePreferences()
+                                Task { await model.applyNetworkProxyConfiguration() }
+                            }
+                        Button("프록시 설정 즉시 적용") {
+                            model.savePreferences()
+                            Task { await model.applyNetworkProxyConfiguration(forceRebuild: true) }
+                        }
                     }
                 }
             }
@@ -1133,6 +1400,25 @@ struct NetworkPrivacySheet: View {
                 ToolbarItem(placement: .confirmationAction) {
                     Button("완료") { dismiss() }
                 }
+            }
+            .onAppear {
+                systemVpnActive = WireGuardTunnelManager.isSystemVpnActive()
+                wg.refreshStats()
+                statsPollTask?.cancel()
+                statsPollTask = Task { @MainActor in
+                    while !Task.isCancelled {
+                        try? await Task.sleep(nanoseconds: 2_000_000_000)
+                        guard !Task.isCancelled else { break }
+                        systemVpnActive = WireGuardTunnelManager.isSystemVpnActive()
+                        if wg.isConnected {
+                            wg.refreshStats()
+                        }
+                    }
+                }
+            }
+            .onDisappear {
+                statsPollTask?.cancel()
+                statsPollTask = nil
             }
             .fileImporter(isPresented: $importingWireGuard, allowedContentTypes: [.data, .plainText]) { result in
                 if case let .success(url) = result {
@@ -1145,6 +1431,11 @@ struct NetworkPrivacySheet: View {
                     } else {
                         alertMessage = "올바른 WireGuard .conf 파일인지 확인해 주세요. ([Interface] PrivateKey 및 [Peer] PublicKey/Endpoint 필요)"
                     }
+                }
+            }
+            .sheet(isPresented: Binding(get: { sharingConfURL != nil }, set: { if !$0 { sharingConfURL = nil } })) {
+                if let url = sharingConfURL {
+                    ActivityShareSheet(items: [url])
                 }
             }
             .fileExporter(
@@ -1162,12 +1453,38 @@ struct NetworkPrivacySheet: View {
         .preferredColorScheme(.dark)
     }
 
+    private func writeTempConfFile(for profile: WireGuardProfile) -> URL? {
+        let safe = profile.name
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: ":", with: "_")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let filename = (safe.isEmpty ? "wireguard" : safe) + ".conf"
+        let dest = FileManager.default.temporaryDirectory.appendingPathComponent(filename)
+        do {
+            try profile.rawConfig.write(to: dest, atomically: true, encoding: .utf8)
+            return dest
+        } catch {
+            alertMessage = ".conf 파일 준비 실패: \(error.localizedDescription)"
+            return nil
+        }
+    }
+
     private func checkInternetConnectivity() async {
         checkingConnection = true
         defer { checkingConnection = false }
         let start = Date()
         do {
-            let (data, _) = try await URLSession.shared.data(from: URL(string: "https://1.1.1.1/cdn-cgi/trace")!)
+            let cfg = URLSessionConfiguration.ephemeral
+            cfg.timeoutIntervalForRequest = 12
+            if #available(iOS 17.0, *) {
+                let proxies = wg.activeProxyConfigurations(preferences: model.preferences)
+                if !proxies.isEmpty {
+                    cfg.proxyConfigurations = proxies
+                }
+            }
+            let session = URLSession(configuration: cfg)
+            defer { session.invalidateAndCancel() }
+            let (data, _) = try await session.data(from: URL(string: "https://1.1.1.1/cdn-cgi/trace")!)
             let ms = Int(Date().timeIntervalSince(start) * 1000)
             let body = String(data: data, encoding: .utf8) ?? ""
             var ip = "-"
@@ -1178,7 +1495,9 @@ struct NetworkPrivacySheet: View {
                 else if line.hasPrefix("loc=") { loc = String(line.dropFirst(4)) }
                 else if line.hasPrefix("tls=") { tls = String(line.dropFirst(4)) }
             }
-            connectionResult = "연결 정상 (\(ms)ms) · IP: \(ip) · 국가: \(loc) · \(tls)"
+            let via = wg.isConnected ? "WireGuard 경유" : (model.preferences.proxyEnabled ? "프록시 경유" : "직접 연결")
+            connectionResult = "[\(via)] 정상 (\(ms)ms) · IP: \(ip) · 국가: \(loc) · \(tls)"
+            if wg.isConnected { wg.refreshStats() }
         } catch {
             connectionResult = "연결 검사 실패: \(error.localizedDescription)"
         }

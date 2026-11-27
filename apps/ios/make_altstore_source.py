@@ -9,8 +9,8 @@ from datetime import date
 def read_bundle_version(plist_path: pathlib.Path) -> tuple[str, str]:
     with plist_path.open("rb") as fp:
         info = plistlib.load(fp)
-    version = str(info.get("CFBundleShortVersionString") or "1.0.4")
-    build = str(info.get("CFBundleVersion") or "113")
+    version = str(info.get("CFBundleShortVersionString") or "1.0.5")
+    build = str(info.get("CFBundleVersion") or "114")
     return version, build
 
 
@@ -58,9 +58,9 @@ def main() -> None:
                 "date": date.today().isoformat(),
                 "localizedDescription": (
                     f"v{version} (build {build_version}): "
-                    "화면을 아래로 내려도 간헐적으로 URL 필드 섬이 축소되지 않던 오류 완전 수정 — "
-                    "120Hz 스프링 정지 조건 데드락 제거, 안전 영역 인셋 포함 스크롤 가능 높이 정확 계산, "
-                    "새 터치 제스처 즉시 잠금 해제 및 빠른 플릭 축소 감도 개선 (iOS · Android)."
+                    "iOS 상단 고정 헤더 사이트 상태바 영역 불투명 채움 및 하단 사이트 고정 UI가 URL 필드 섬에 가리지 않도록 obscuredContentInsets/뷰포트 인셋 적용, "
+                    "오른쪽→왼쪽 밀기 앞으로가기 제스처 복구(우측 빠른 스크롤바 히트영역 정밀화), "
+                    "Omyaru 내장 WireGuard VPN 직접 연결·해제 엔진(AltStore 무료 서명 호환) 및 .conf 파일 공유·실시간 트래픽/IP 검사 지원."
                 ),
                 "downloadURL": download_url,
                 "size": ipa.stat().st_size,

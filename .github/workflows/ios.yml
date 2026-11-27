@@ -22,6 +22,9 @@ jobs:
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
       - name: Read iOS version metadata
         id: meta
         run: |
@@ -30,6 +33,28 @@ jobs:
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "build=$BUILD" >> "$GITHUB_OUTPUT"
           echo "Building Omyaru iOS v${VERSION} (build ${BUILD})"
+      - name: Build WireGuard user-space static library (iOS arm64)
+        run: |
+          mkdir -p apps/ios/WireGuardLib "$RUNNER_TEMP/wg-bridge"
+          cp apps/ios/WireGuardBridge/go.mod apps/ios/WireGuardBridge/main.go "$RUNNER_TEMP/wg-bridge/"
+          SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
+          CLANG_BIN=$(xcrun --sdk iphoneos --find clang)
+          cat > /tmp/ios-clang.sh <<EOF
+          #!/bin/sh
+          exec "$CLANG_BIN" -arch arm64 -isysroot "$SDK_PATH" -miphoneos-version-min=16.0 "\$@"
+          EOF
+          chmod +x /tmp/ios-clang.sh
+          OUT_LIB="$PWD/apps/ios/WireGuardLib/libomyaru_wg.a"
+          cd "$RUNNER_TEMP/wg-bridge"
+          go get golang.zx2c4.com/wireguard@latest
+          go mod tidy
+          CGO_ENABLED=1 \
+          GOOS=ios \
+          GOARCH=arm64 \
+          CC=/tmp/ios-clang.sh \
+          go build -tags="ios" -trimpath -ldflags="-w -s -checklinkname=0" \
+            -buildmode=c-archive -o "$OUT_LIB" .
+          ls -lh "$OUT_LIB" "${OUT_LIB%.a}.h"
       - name: Install XcodeGen
         run: brew install xcodegen
       - name: Generate Xcode project

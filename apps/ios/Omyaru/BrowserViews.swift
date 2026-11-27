@@ -1278,21 +1278,22 @@ struct BrowserScreen: View {
     private var topEdgeBlurOverlay: some View {
         let safeTop = max(44, screenSafeAreaInsets.top)
         let h = safeTop + 24
-        let topFillColor = model.activePageTopUIColor.map { Color(uiColor: $0) }
+        let topFillColor = (model.activePageFixedHeaderUIColor ?? model.activePageTopUIColor).map { Color(uiColor: $0) }
+        let showSolidTopFill = !model.isStartPage && (model.isAtTopOfPage || model.activePageHasFixedTopHeader)
         return ZStack(alignment: .top) {
-            // Seamless top color fill at scroll y == 0 (fills notch/Dynamic Island sides!)
-            if !model.isStartPage, let topFillColor {
+            // Solid top fill at y == 0 OR whenever the site has an opaque fixed/sticky top header (matches Safari — zero content bleeding behind status bar!)
+            if let topFillColor {
                 topFillColor
-                    .frame(height: safeTop)
-                    .opacity(model.isAtTopOfPage ? 1.0 : 0.0)
-                    .animation(.easeOut(duration: 0.16), value: model.isAtTopOfPage)
+                    .frame(height: safeTop + 1)
+                    .opacity(showSolidTopFill ? 1.0 : 0.0)
+                    .animation(.easeOut(duration: 0.16), value: showSolidTopFill)
             }
 
-            // Silky multi-band progressive Gaussian blur when scrolling page content passes behind Dynamic Island
+            // Silky multi-band progressive Gaussian blur when scrolling pages without a fixed top header
             ProgressiveGaussianBlurView(isLight: model.activePageTopIsLight)
                 .frame(height: h)
-                .opacity((model.isAtTopOfPage && !model.isStartPage) ? 0.0 : 1.0)
-                .animation(.easeOut(duration: 0.18), value: model.isAtTopOfPage)
+                .opacity(showSolidTopFill ? 0.0 : 1.0)
+                .animation(.easeOut(duration: 0.18), value: showSolidTopFill)
         }
     }
 

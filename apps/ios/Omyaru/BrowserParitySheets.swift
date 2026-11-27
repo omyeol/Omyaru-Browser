@@ -20,7 +20,10 @@ struct FastScrollBarOverlay: View {
 
             if model.isScrollable {
                 ZStack(alignment: .topTrailing) {
+                    // NEVER cover the full right edge with hit-testing — doing so steals WKWebView's native right-to-left swipe-forward gesture!
                     Color.clear
+                        .allowsHitTesting(false)
+
                     ZStack {
                         Capsule()
                             .fill(Color.black.opacity(0.22))
@@ -34,33 +37,40 @@ struct FastScrollBarOverlay: View {
                                     .strokeBorder(Color.white.opacity(0.38), lineWidth: 0.6)
                             )
                     }
+                    .frame(width: 26, height: thumbHeight, alignment: .trailing)
                     .padding(.trailing, 2)
+                    .contentShape(Rectangle())
                     .offset(y: thumbY)
                     .opacity(visible || isDragging ? 1 : 0)
+                    .allowsHitTesting(visible || isDragging)
                     .animation(.easeOut(duration: 0.18), value: isDragging)
                     .animation(.easeOut(duration: 0.28), value: visible)
-                }
-                .frame(width: 24, height: height)
-                .contentShape(Rectangle())
-                .frame(maxWidth: .infinity, alignment: .trailing)
-                .gesture(
-                    DragGesture(minimumDistance: 0)
-                        .onChanged { value in
-                            if !isDragging {
-                                isDragging = true
-                                visible = true
-                                hideTask?.cancel()
-                                dragStartFraction = model.scrollFraction
-                                UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                    .gesture(
+                        DragGesture(minimumDistance: 4)
+                            .onChanged { value in
+                                // Let horizontal right-edge swipes pass through to WKWebView goForward!
+                                if !isDragging && abs(value.translation.width) > abs(value.translation.height) {
+                                    return
+                                }
+                                if !isDragging {
+                                    isDragging = true
+                                    visible = true
+                                    hideTask?.cancel()
+                                    dragStartFraction = model.scrollFraction
+                                    UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                                }
+                                let deltaFraction = Double(value.translation.height / maxY)
+                                model.scrollToFraction(min(1, max(0, dragStartFraction + deltaFraction)))
                             }
-                            let deltaFraction = Double(value.translation.height / maxY)
-                            model.scrollToFraction(min(1, max(0, dragStartFraction + deltaFraction)))
-                        }
-                        .onEnded { _ in
-                            isDragging = false
-                            scheduleFadeOut()
-                        }
-                )
+                            .onEnded { _ in
+                                if isDragging {
+                                    isDragging = false
+                                    scheduleFadeOut()
+                                }
+                            }
+                    )
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
             }
         }
         .onChange(of: model.lastScrollActivity) { _ in

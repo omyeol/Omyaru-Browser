@@ -3,6 +3,7 @@ import WebKit
 import UniformTypeIdentifiers
 import UIKit
 import AVFoundation
+import Network
 
 @main
 struct OmyaruApp: App {
@@ -246,8 +247,9 @@ private final class WeakScriptMessageHandler: NSObject, WKScriptMessageHandler {
     func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
         let name = message.name
         let body = message.body
-        Task { @MainActor [weak owner] in
-            owner?.handleScriptMessage(name: name, body: body)
+        let wv = message.webView
+        Task { @MainActor [weak owner, weak wv] in
+            owner?.handleScriptMessage(name: name, body: body, webView: wv)
         }
     }
 }
@@ -658,8 +660,8 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
     static let privateGroupID = UUID(uuidString: "00000000-0000-0000-0000-000000000001")!
     static let defaultProfileID = UUID(uuidString: "00000000-0000-0000-0000-000000000010")!
     static let defaultGroupID = UUID(uuidString: "00000000-0000-0000-0000-000000000002")!
-    static let appVersionName = "1.0.4"
-    static let appBuildNumber = 113
+    static let appVersionName = "1.0.5"
+    static let appBuildNumber = 114
 
     var isApplyingRemoteSync: Bool = false
 
@@ -681,6 +683,7 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
     @Published var tabSnapshots: [UUID: UIImage] = [:]
     @Published var tabTopColors: [UUID: UIColor] = [:]
     @Published var tabBottomColors: [UUID: UIColor] = [:]
+    @Published var tabFixedTopHeaderColors: [UUID: UIColor] = [:]
     @Published var committedTabIDs: Set<UUID> = []
     @Published var isAtTopOfPage: Bool = true
     @Published var isDarkChromeOverlayActive: Bool = false
@@ -713,6 +716,9 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
 
     private var webViews: [UUID: WKWebView] = [:]
     private var loadedTabIDs: Set<UUID> = []
+    private var proxyNormalDataStore: WKWebsiteDataStore? = nil
+    private var proxyPrivateDataStore: WKWebsiteDataStore? = nil
+    private var appliedProxySignature: String = ""
     private var lastActiveTabByGroup: [UUID: UUID] = [:]
     private var pullRefreshStartedAt: [UUID: Date] = [:]
     var tabCardThumbRects: [UUID: CGRect] = [:]
@@ -829,6 +835,16 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
         refreshDownloadsList()
         loadPersistedSnapshotsAsync()
         compileTrackerBlockerRules()
+        WireGuardTunnelManager.shared.onTunnelStateChanged = { [weak self] _ in
+            Task { @MainActor in
+                await self?.applyNetworkProxyConfiguration(forceRebuild: true)
+            }
+        }
+        if preferences.proxyEnabled {
+            Task { @MainActor [weak self] in
+                await self?.applyNetworkProxyConfiguration(forceRebuild: false)
+            }
+        }
     }
 
     func configureAudioSession() {
@@ -990,6 +1006,15 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
         return tabTopColors[activeID]
     }
 
+    var activePageFixedHeaderUIColor: UIColor? {
+        guard !isStartPage else { return nil }
+        return tabFixedTopHeaderColors[activeID]
+    }
+
+    var activePageHasFixedTopHeader: Bool {
+        activePageFixedHeaderUIColor != nil
+    }
+
     var activePageBottomUIColor: UIColor? {
         guard !isStartPage else { return nil }
         return tabBottomColors[activeID] ?? tabTopColors[activeID]
@@ -1008,7 +1033,7 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
     }
 
     var activePageTopIsLight: Bool {
-        guard let c = activePageTopUIColor else { return false }
+        guard let c = activePageFixedHeaderUIColor ?? activePageTopUIColor else { return false }
         return Self.isLightUIColor(c)
     }
 
@@ -1334,6 +1359,96 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
 
     // MARK: - WebKit Engine (Lazy Restore, Image Preloader, GPC, Scroll Toolbar Hide/Show)
 
+    private func resolvedWebsiteDataStore(isPrivate: Bool) -> WKWebsiteDataStore {
+        if #available(iOS 17.0, *) {
+            if !appliedProxySignature.isEmpty {
+                if isPrivate, let s = proxyPrivateDataStore { return s }
+                if !isPrivate, let s = proxyNormalDataStore { return s }
+            }
+        }
+        return isPrivate ? .nonPersistent() : .default()
+    }
+
+    func applyNetworkProxyConfiguration(forceRebuild: Bool = false) async {
+        guard #available(iOS 17.0, *) else { return }
+        let wgPort = WireGuardTunnelManager.shared.activePort
+        let newSignature: String
+        var configs: [ProxyConfiguration] = []
+
+        if wgPort > 0, let nwPort = NWEndpoint.Port(rawValue: wgPort) {
+            newSignature = "wg:\(wgPort)"
+            var cfg = ProxyConfiguration(socksv5Proxy: .hostPort(host: "127.0.0.1", port: nwPort))
+            cfg.allowFailover = false
+            configs = [cfg]
+        } else if preferences.proxyEnabled {
+            let hostStr = preferences.proxyHost.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !hostStr.isEmpty, preferences.proxyPort > 0, preferences.proxyPort <= 65535,
+               let nwPort = NWEndpoint.Port(rawValue: UInt16(preferences.proxyPort)) {
+                let ep = NWEndpoint.hostPort(host: NWEndpoint.Host(hostStr), port: nwPort)
+                var cfg = preferences.proxyIsSOCKS5
+                    ? ProxyConfiguration(socksv5Proxy: ep)
+                    : ProxyConfiguration(httpCONNECTProxy: ep)
+                cfg.allowFailover = false
+                configs = [cfg]
+                newSignature = "proxy:\(preferences.proxyIsSOCKS5 ? "s5" : "http"):\(hostStr):\(preferences.proxyPort)"
+            } else {
+                newSignature = ""
+            }
+        } else {
+            newSignature = ""
+        }
+
+        guard forceRebuild || newSignature != appliedProxySignature else { return }
+
+        // Migrate cookies between previous normal store and fresh store so logins stay intact while
+        // guaranteeing a brand-new WebKit network process & socket pool (Apple requirement for proxyConfigurations!)
+        let oldNormalStore = proxyNormalDataStore ?? WKWebsiteDataStore.default()
+        let savedCookies: [HTTPCookie] = await withCheckedContinuation { cont in
+            oldNormalStore.httpCookieStore.getAllCookies { cookies in
+                cont.resume(returning: cookies)
+            }
+        }
+
+        appliedProxySignature = newSignature
+        if configs.isEmpty {
+            proxyNormalDataStore = nil
+            proxyPrivateDataStore = nil
+            let defaultStore = WKWebsiteDataStore.default()
+            defaultStore.proxyConfigurations = []
+            for cookie in savedCookies {
+                await defaultStore.httpCookieStore.setCookie(cookie)
+            }
+        } else {
+            let freshNormal = WKWebsiteDataStore.nonPersistent()
+            freshNormal.proxyConfigurations = configs
+            for cookie in savedCookies {
+                await freshNormal.httpCookieStore.setCookie(cookie)
+            }
+            let freshPrivate = WKWebsiteDataStore.nonPersistent()
+            freshPrivate.proxyConfigurations = configs
+            proxyNormalDataStore = freshNormal
+            proxyPrivateDataStore = freshPrivate
+        }
+
+        // Recreate WKWebViews cleanly so existing origins immediately route through the new proxy/tunnel!
+        let existingIDs = Array(webViews.keys)
+        for tid in existingIDs {
+            webViews[tid]?.stopLoading()
+            webViews[tid]?.navigationDelegate = nil
+            webViews[tid]?.uiDelegate = nil
+            webViews[tid]?.scrollView.delegate = nil
+            webViews[tid]?.removeFromSuperview()
+        }
+        webViews.removeAll()
+        loadedTabIDs.removeAll()
+        committedTabIDs.removeAll()
+        objectWillChange.send()
+
+        if !isStartPage {
+            _ = webView(for: activeID, loadIfNeeded: true)
+        }
+    }
+
     func webView(for id: UUID, loadIfNeeded: Bool = true) -> WKWebView {
         if let existing = webViews[id] {
             if loadIfNeeded && !loadedTabIDs.contains(id) {
@@ -1347,7 +1462,7 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
 
         let tab = tabs.first(where: { $0.id == id })
         let config = WKWebViewConfiguration()
-        config.websiteDataStore = tab?.isPrivate == true ? .nonPersistent() : .default()
+        config.websiteDataStore = resolvedWebsiteDataStore(isPrivate: tab?.isPrivate == true)
         config.allowsInlineMediaPlayback = true
         config.allowsPictureInPictureMediaPlayback = true
         config.defaultWebpagePreferences.allowsContentJavaScript = preferences.javaScriptEnabled
@@ -1355,6 +1470,7 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
 
         let controller = WKUserContentController()
         controller.add(WeakScriptMessageHandler(owner: self), name: "omyaruContext")
+        controller.add(WeakScriptMessageHandler(owner: self), name: "omyaruHeaderState")
         let host = URL(string: tab?.url ?? "")?.host?.lowercased() ?? ""
         let blockingEnabled = preferences.trackingProtection != .off && !preferences.contentBlockingExceptions.contains(host)
         if blockingEnabled, let ruleList = compiledContentRuleList {
@@ -1400,20 +1516,56 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
         return view
     }
 
-    func applyContentInsets(to webView: WKWebView) {
-        let bottomInset: CGFloat
-        let topInset: CGFloat
-        if preferences.addressBarPosition == .bottom {
-            topInset = 0
-            bottomInset = isChromeCollapsed ? 52 : 124
-        } else {
-            topInset = isChromeCollapsed ? 56 : 124
-            bottomInset = 0
+    private static func applyObscuredContentInsets(_ insets: UIEdgeInsets, to webView: WKWebView) -> Bool {
+        // Official iOS 26+ WKWebView.obscuredContentInsets (called dynamically so Xcode 16 / iOS 18 SDK builds cleanly!)
+        let sel = NSSelectorFromString("setObscuredContentInsets:")
+        guard webView.responds(to: sel), let imp = webView.method(for: sel) else {
+            return false
         }
-        if abs(webView.scrollView.contentInset.bottom - bottomInset) > 1 ||
-           abs(webView.scrollView.contentInset.top - topInset) > 1 {
-            webView.scrollView.contentInset = UIEdgeInsets(top: topInset, left: 0, bottom: bottomInset, right: 0)
-            webView.scrollView.verticalScrollIndicatorInsets = webView.scrollView.contentInset
+        typealias Setter = @convention(c) (AnyObject, Selector, UIEdgeInsets) -> Void
+        let fn = unsafeBitCast(imp, to: Setter.self)
+        fn(webView, sel, insets)
+        return true
+    }
+
+    func applyContentInsets(to webView: WKWebView) {
+        let minInsets: UIEdgeInsets
+        let maxInsets: UIEdgeInsets
+        let activeInsets: UIEdgeInsets
+        if preferences.addressBarPosition == .bottom {
+            minInsets = UIEdgeInsets(top: 0, left: 0, bottom: 48, right: 0)
+            maxInsets = UIEdgeInsets(top: 0, left: 0, bottom: 132, right: 0)
+            activeInsets = isChromeCollapsed ? minInsets : maxInsets
+        } else {
+            minInsets = UIEdgeInsets(top: 52, left: 0, bottom: 0, right: 0)
+            maxInsets = UIEdgeInsets(top: 132, left: 0, bottom: 0, right: 0)
+            activeInsets = isChromeCollapsed ? minInsets : maxInsets
+        }
+
+        webView.setMinimumViewportInset(minInsets, maximumViewportInset: maxInsets)
+
+        if Self.applyObscuredContentInsets(activeInsets, to: webView) {
+            // iOS 26+: obscuredContentInsets shifts position:fixed bottom/top site UI cleanly above Omyaru's URL island
+            // while keeping full-bleed page scrolling behind it — keep scrollView.contentInset at zero to avoid double padding!
+            if webView.scrollView.contentInset != .zero {
+                webView.scrollView.contentInset = .zero
+            }
+            webView.scrollView.verticalScrollIndicatorInsets = activeInsets
+        } else {
+            // iOS 16–18 fallback (subtract safe area so contentInsetAdjustmentBehavior=.always does not double-count it)
+            let safeBot = webView.safeAreaInsets.bottom > 0 ? webView.safeAreaInsets.bottom : 34
+            let safeTop = webView.safeAreaInsets.top > 0 ? webView.safeAreaInsets.top : 44
+            let fallbackInsets = UIEdgeInsets(
+                top: activeInsets.top > 0 ? max(0, activeInsets.top - safeTop) : 0,
+                left: 0,
+                bottom: activeInsets.bottom > 0 ? max(0, activeInsets.bottom - safeBot) : 0,
+                right: 0
+            )
+            if abs(webView.scrollView.contentInset.bottom - fallbackInsets.bottom) > 1 ||
+               abs(webView.scrollView.contentInset.top - fallbackInsets.top) > 1 {
+                webView.scrollView.contentInset = fallbackInsets
+                webView.scrollView.verticalScrollIndicatorInsets = fallbackInsets
+            }
         }
     }
 
@@ -1712,7 +1864,23 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
         }
     }
 
-    func handleScriptMessage(name: String, body: Any) {
+    func handleScriptMessage(name: String, body: Any, webView: WKWebView? = nil) {
+        if name == "omyaruHeaderState", let dict = body as? [String: Any] {
+            let tabID = webView.flatMap { id(for: $0) } ?? activeID
+            let isFixed = (dict["fixed"] as? Bool) ?? false
+            if isFixed, let arr = dict["rgb"] as? [NSNumber], arr.count >= 3 {
+                let col = UIColor(
+                    red: CGFloat(arr[0].doubleValue) / 255.0,
+                    green: CGFloat(arr[1].doubleValue) / 255.0,
+                    blue: CGFloat(arr[2].doubleValue) / 255.0,
+                    alpha: 1.0
+                )
+                tabFixedTopHeaderColors[tabID] = col
+            } else {
+                tabFixedTopHeaderColors.removeValue(forKey: tabID)
+            }
+            return
+        }
         guard name == "omyaruContext", let dict = body as? [String: Any] else { return }
         let kindStr = (dict["kind"] as? String) ?? "link"
         let mediaURL = (dict["mediaUrl"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1932,6 +2100,89 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
         })();
         """
         controller.addUserScript(WKUserScript(source: contextBridgeJS, injectionTime: .atDocumentEnd, forMainFrameOnly: false))
+
+        // 7. Fixed / Sticky Top Header Detector (keeps status bar area solid opaque like Safari when a site pins a top navbar!)
+        let fixedHeaderBridgeJS = """
+        (() => {
+          if (window.__omyaruHeaderStateInstalled) return;
+          window.__omyaruHeaderStateInstalled = true;
+          function parseRGBA(str) {
+            if (!str) return null;
+            const m = str.match(/rgba?\\(\\s*([\\d.]+)\\s*,\\s*([\\d.]+)\\s*,\\s*([\\d.]+)(?:\\s*,\\s*([\\d.]+))?\\s*\\)/i);
+            if (!m) return null;
+            const a = m[4] === undefined ? 1 : parseFloat(m[4]);
+            if (isNaN(a) || a < 0.85) return null;
+            return [Math.round(parseFloat(m[1])), Math.round(parseFloat(m[2])), Math.round(parseFloat(m[3]))];
+          }
+          function detectFixedHeader() {
+            const w = Math.max(32, window.innerWidth || 320);
+            const ys = [6, 18];
+            const xs = [16, Math.floor(w * 0.5), Math.max(16, w - 16)];
+            let hits = 0;
+            let pickedRGB = null;
+            for (const x of xs) {
+              let colHit = false;
+              for (const y of ys) {
+                let el = document.elementFromPoint(x, y);
+                let foundFixed = null;
+                let foundRGB = null;
+                let cur = el;
+                while (cur && cur !== document.documentElement && cur !== document.body) {
+                  const cs = getComputedStyle(cur);
+                  if (!foundRGB) {
+                    const c = parseRGBA(cs.backgroundColor);
+                    if (c) foundRGB = c;
+                  }
+                  if (cs.position === 'fixed' || cs.position === 'sticky') {
+                    const rect = cur.getBoundingClientRect();
+                    if (rect.top <= 14 && rect.bottom >= 24 && rect.width >= w * 0.6) {
+                      foundFixed = cur;
+                      if (!foundRGB) {
+                        foundRGB = parseRGBA(cs.backgroundColor);
+                      }
+                      break;
+                    }
+                  }
+                  cur = cur.parentElement;
+                }
+                if (foundFixed && foundRGB) {
+                  colHit = true;
+                  if (!pickedRGB) pickedRGB = foundRGB;
+                  break;
+                }
+              }
+              if (colHit) hits++;
+            }
+            return (hits >= 2 && pickedRGB) ? { fixed: true, rgb: pickedRGB } : { fixed: false };
+          }
+          let lastKey = '';
+          let timer = null;
+          let settleTimer = null;
+          function report() {
+            timer = null;
+            try {
+              const res = detectFixedHeader();
+              const key = res.fixed ? ('1:' + res.rgb.join(',')) : '0';
+              if (key !== lastKey) {
+                lastKey = key;
+                window.webkit.messageHandlers.omyaruHeaderState.postMessage(res);
+              }
+            } catch (_) {}
+          }
+          function schedule() {
+            if (!timer) timer = setTimeout(report, 140);
+            if (settleTimer) clearTimeout(settleTimer);
+            settleTimer = setTimeout(report, 380);
+          }
+          window.addEventListener('scroll', schedule, { passive: true });
+          window.addEventListener('touchend', schedule, { passive: true });
+          window.addEventListener('resize', schedule, { passive: true });
+          window.addEventListener('load', () => setTimeout(report, 80), { passive: true });
+          setTimeout(report, 120);
+          setTimeout(report, 600);
+        })();
+        """
+        controller.addUserScript(WKUserScript(source: fixedHeaderBridgeJS, injectionTime: .atDocumentEnd, forMainFrameOnly: true))
     }
 
     private func compileTrackerBlockerRules() {
@@ -2708,6 +2959,9 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
     }
 
     func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
+        if let tid = id(for: webView) {
+            tabFixedTopHeaderColors.removeValue(forKey: tid)
+        }
         if id(for: webView) == activeID {
             isLoading = true
             estimatedProgress = 0.15
