@@ -660,8 +660,8 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
     static let privateGroupID = UUID(uuidString: "00000000-0000-0000-0000-000000000001")!
     static let defaultProfileID = UUID(uuidString: "00000000-0000-0000-0000-000000000010")!
     static let defaultGroupID = UUID(uuidString: "00000000-0000-0000-0000-000000000002")!
-    static let appVersionName = "1.0.5"
-    static let appBuildNumber = 114
+    static let appVersionName = "1.0.6"
+    static let appBuildNumber = 115
 
     var isApplyingRemoteSync: Bool = false
 

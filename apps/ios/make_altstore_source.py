@@ -9,8 +9,8 @@ from datetime import date
 def read_bundle_version(plist_path: pathlib.Path) -> tuple[str, str]:
     with plist_path.open("rb") as fp:
         info = plistlib.load(fp)
-    version = str(info.get("CFBundleShortVersionString") or "1.0.5")
-    build = str(info.get("CFBundleVersion") or "114")
+    version = str(info.get("CFBundleShortVersionString") or "1.0.6")
+    build = str(info.get("CFBundleVersion") or "115")
     return version, build
 
 
@@ -58,9 +58,8 @@ def main() -> None:
                 "date": date.today().isoformat(),
                 "localizedDescription": (
                     f"v{version} (build {build_version}): "
-                    "iOS 상단 고정 헤더 사이트 상태바 영역 불투명 채움 및 하단 사이트 고정 UI가 URL 필드 섬에 가리지 않도록 obscuredContentInsets/뷰포트 인셋 적용, "
-                    "오른쪽→왼쪽 밀기 앞으로가기 제스처 복구(우측 빠른 스크롤바 히트영역 정밀화), "
-                    "Omyaru 내장 WireGuard VPN 직접 연결·해제 엔진(AltStore 무료 서명 호환) 및 .conf 파일 공유·실시간 트래픽/IP 검사 지원."
+                    "URL 필드 터치 시 키보드와 함께 전체 URL 자동 선택 및 선택된 URL 터치 시 기본 오려두기·복사하기·붙여넣기 메뉴 표시 지원(iOS·Android), "
+                    "Android 좌/우 엣지 뒤로가기·앞으로가기 스와이프 제스처 및 축소 URL 필 좌우 빈공간 확장·GeckoView 하단 고정 UI 인셋 개선."
                 ),
                 "downloadURL": download_url,
                 "size": ipa.stat().st_size,

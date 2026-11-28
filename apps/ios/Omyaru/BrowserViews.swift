@@ -863,7 +863,7 @@ struct BrowserScreen: View {
     @State private var openHeroFlightEnded = false
     @State private var overviewMorphProgress: CGFloat = 1.0
     @State private var toolbarVisible = true
-    @FocusState private var addressFocused: Bool
+    @State private var addressFocused = false
 
     private var anyDarkOverlayPresented: Bool {
         (showTabs && !isExpandingToWeb) || showBookmarks || showBookmarkEdit || showHistory || showDownloads
@@ -1011,6 +1011,16 @@ struct BrowserScreen: View {
                         findInPageBar
                         Spacer()
                     }
+                }
+
+                // Tap anywhere outside the URL island / suggestions to dismiss keyboard cleanly
+                if addressFocused && !showTabs && !isHeroMorphing {
+                    Color.clear
+                        .contentShape(Rectangle())
+                        .ignoresSafeArea()
+                        .onTapGesture {
+                            addressFocused = false
+                        }
                 }
 
                 // Floating Status Toast + Single Continuous Morphing Liquid Glass URL Island
@@ -1792,24 +1802,27 @@ struct BrowserScreen: View {
                             )
                     )
 
-                // Always-mounted TextField (visible & interactive when editing URL)
-                TextField("검색 또는 주소 입력", text: $address)
-                    .font(.system(size: 15, weight: .regular))
-                    .foregroundStyle(androidOnSurfaceColor)
-                    .multilineTextAlignment(.leading)
-                    .textInputAutocapitalization(.never)
-                    .autocorrectionDisabled()
-                    .keyboardType(.URL)
-                    .submitLabel(.go)
-                    .focused($addressFocused)
-                    .onSubmit {
-                        model.open(address)
+                // Always-mounted native UIKit UITextField (auto-selects full URL on keyboard open & supports native iOS Cut/Copy/Paste edit menu!)
+                SafariAddressTextField(
+                    text: $address,
+                    isFocused: $addressFocused,
+                    placeholder: "검색 또는 주소 입력",
+                    textColor: UIColor(androidOnSurfaceColor),
+                    placeholderColor: UIColor(androidMutedColor),
+                    tintColor: UIColor(androidAccentColor),
+                    fullURLOnFocus: {
+                        model.currentURL == "about:blank" ? "" : model.currentURL
+                    },
+                    onSubmit: { submitted in
+                        model.open(submitted)
                         addressFocused = false
                     }
-                    .padding(.leading, 48)
-                    .padding(.trailing, 42)
-                    .opacity((addressFocused && !isCollapsedDisplay) ? 1.0 : 0.0)
-                    .allowsHitTesting(addressFocused && !isCollapsedDisplay)
+                )
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .padding(.leading, 48)
+                .padding(.trailing, 42)
+                .opacity((addressFocused && !isCollapsedDisplay) ? 1.0 : 0.0)
+                .allowsHitTesting(addressFocused && !isCollapsedDisplay)
 
                 // Single continuous dead-center domain/URL label (glides & scales 1:1 during scroll morph!)
                 Text(displayURL)
@@ -1832,6 +1845,7 @@ struct BrowserScreen: View {
                         if model.isChromeCollapsed || isCollapsedDisplay {
                             expandCollapsedToolbar()
                         } else {
+                            address = model.currentURL == "about:blank" ? "" : model.currentURL
                             addressFocused = true
                         }
                     }
@@ -5240,5 +5254,161 @@ extension Color {
         var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
         ui.getRed(&r, green: &g, blue: &b, alpha: &a)
         return String(format: "#%02X%02X%02X", Int(r * 255), Int(g * 255), Int(b * 255))
+    }
+}
+
+// MARK: - Safari-grade UIKit Address TextField (Auto Select-All on Keyboard Open + Native Cut/Copy/Paste Menu)
+
+private final class SafariAddressUITextField: UITextField {
+    override var intrinsicContentSize: CGSize {
+        CGSize(width: UIView.noIntrinsicMetric, height: super.intrinsicContentSize.height)
+    }
+}
+
+private struct SafariAddressTextField: UIViewRepresentable {
+    @Binding var text: String
+    @Binding var isFocused: Bool
+    let placeholder: String
+    let textColor: UIColor
+    let placeholderColor: UIColor
+    let tintColor: UIColor
+    let fullURLOnFocus: () -> String
+    let onSubmit: (String) -> Void
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(parent: self)
+    }
+
+    func makeUIView(context: Context) -> UITextField {
+        let tf = SafariAddressUITextField(frame: .zero)
+        tf.delegate = context.coordinator
+        tf.font = UIFont.systemFont(ofSize: 15, weight: .regular)
+        tf.textColor = textColor
+        tf.tintColor = tintColor
+        tf.textAlignment = .left
+        tf.borderStyle = .none
+        tf.backgroundColor = .clear
+        tf.keyboardType = .URL
+        tf.returnKeyType = .go
+        tf.autocapitalizationType = .none
+        tf.autocorrectionType = .no
+        tf.spellCheckingType = .no
+        tf.smartQuotesType = .no
+        tf.smartDashesType = .no
+        tf.smartInsertDeleteType = .no
+        tf.clearButtonMode = .never
+        tf.clearsOnBeginEditing = false
+        tf.enablesReturnKeyAutomatically = false
+        tf.overrideUserInterfaceStyle = .dark
+        tf.attributedPlaceholder = NSAttributedString(
+            string: placeholder,
+            attributes: [.foregroundColor: placeholderColor]
+        )
+        tf.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        tf.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        tf.addTarget(context.coordinator, action: #selector(Coordinator.editingChanged(_:)), for: .editingChanged)
+        context.coordinator.textField = tf
+        return tf
+    }
+
+    func updateUIView(_ uiView: UITextField, context: Context) {
+        context.coordinator.parent = self
+        uiView.textColor = textColor
+        uiView.tintColor = tintColor
+        if uiView.attributedPlaceholder?.string != placeholder {
+            uiView.attributedPlaceholder = NSAttributedString(
+                string: placeholder,
+                attributes: [.foregroundColor: placeholderColor]
+            )
+        }
+
+        // Preserve Hangul/CJK IME markedTextRange unless explicitly cleared to empty
+        if (text.isEmpty && !(uiView.text ?? "").isEmpty) || (uiView.markedTextRange == nil && uiView.text != text) {
+            uiView.text = text
+        }
+
+        if isFocused {
+            if !uiView.isFirstResponder && !context.coordinator.pendingFocus {
+                context.coordinator.pendingFocus = true
+                let full = fullURLOnFocus()
+                if !full.isEmpty && uiView.text != full {
+                    uiView.text = full
+                }
+                DispatchQueue.main.async {
+                    context.coordinator.pendingFocus = false
+                    guard context.coordinator.parent.isFocused, uiView.window != nil else { return }
+                    if !uiView.isFirstResponder {
+                        uiView.becomeFirstResponder()
+                    }
+                }
+            }
+        } else {
+            context.coordinator.pendingFocus = false
+            if uiView.isFirstResponder {
+                uiView.resignFirstResponder()
+            }
+        }
+    }
+
+    final class Coordinator: NSObject, UITextFieldDelegate {
+        var parent: SafariAddressTextField
+        weak var textField: UITextField?
+        var pendingFocus = false
+
+        init(parent: SafariAddressTextField) {
+            self.parent = parent
+        }
+
+        @objc func editingChanged(_ sender: UITextField) {
+            let value = sender.text ?? ""
+            if parent.text != value {
+                parent.text = value
+            }
+        }
+
+        func textFieldDidBeginEditing(_ textField: UITextField) {
+            let full = parent.fullURLOnFocus()
+            if !full.isEmpty && textField.text != full {
+                textField.text = full
+                if parent.text != full {
+                    DispatchQueue.main.async {
+                        self.parent.text = full
+                    }
+                }
+            }
+            if !parent.isFocused {
+                DispatchQueue.main.async {
+                    self.parent.isFocused = true
+                }
+            }
+            // Select the entire URL right after first-responder setup completes;
+            // tapping the highlighted URL natively triggers iOS's Cut / Copy / Paste menu!
+            DispatchQueue.main.async {
+                guard textField.isFirstResponder else { return }
+                if let current = textField.text, !current.isEmpty {
+                    textField.selectedTextRange = textField.textRange(
+                        from: textField.beginningOfDocument,
+                        to: textField.endOfDocument
+                    )
+                }
+            }
+        }
+
+        func textFieldDidEndEditing(_ textField: UITextField) {
+            textField.selectedTextRange = nil
+            if parent.isFocused {
+                DispatchQueue.main.async {
+                    self.parent.isFocused = false
+                }
+            }
+        }
+
+        func textFieldShouldReturn(_ textField: UITextField) -> Bool {
+            let current = textField.text ?? ""
+            parent.text = current
+            parent.onSubmit(current)
+            textField.resignFirstResponder()
+            return true
+        }
     }
 }
