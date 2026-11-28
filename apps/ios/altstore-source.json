@@ -17,12 +17,12 @@
       "category": "utilities",
       "versions": [
         {
-          "version": "1.0.6",
-          "buildVersion": "115",
+          "version": "1.0.7",
+          "buildVersion": "116",
           "date": "2026-11-28",
-          "localizedDescription": "v1.0.6 (build 115): URL 필드 터치 시 키보드와 함께 전체 URL 자동 선택 및 선택된 URL 터치 시 기본 오려두기·복사하기·붙여넣기 메뉴 표시 지원(iOS·Android), Android 좌/우 엣지 뒤로가기·앞으로가기 스와이프 제스처 및 축소 URL 필 좌우 빈공간 확장·GeckoView 하단 고정 UI 인셋 개선.",
-          "downloadURL": "https://github.com/omyeol/Omyaru-Browser/releases/download/v1.0.6/Omyaru-v1.0.6-ios.ipa",
-          "size": 6747421,
+          "localizedDescription": "v1.0.7 (build 116): 새 창(팝업/target=_blank) 탭에서 뒤로가기 버튼·스와이프 시 원래 부모 탭으로 자동 복귀 및 탭 목록에서 닫기 시 맨 아래 탭 대신 원래 탭 선택(iOS·Android), 책장 사진 정렬을 가장 오래된 사진(위)→가장 최근 사진(아래) 시간 오름차순으로 통일하고 Google Drive 동기화 시 순서 섞임 수정.",
+          "downloadURL": "https://github.com/omyeol/Omyaru-Browser/releases/download/v1.0.7/Omyaru-v1.0.7-ios.ipa",
+          "size": 6773108,
           "minOSVersion": "16.0"
         }
       ],
