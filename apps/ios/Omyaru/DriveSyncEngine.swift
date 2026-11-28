@@ -2211,7 +2211,8 @@ final class DriveSyncManager: NSObject, ObservableObject, ASWebAuthenticationPre
             fields["folders/\(fid)/columns"] = min(6, max(1, catalog.folderColumnCounts[folder] ?? 2))
             fields["folders/\(fid)/order"] = idx
         }
-        for (idx, item) in catalog.items.enumerated() {
+        let chronologicalItems = ShelfModel.sortItemsChronologically(catalog.items)
+        for (idx, item) in chronologicalItems.enumerated() {
             guard let manifest = item.cloud,
                   let manifestData = try? JSONEncoder().encode(manifest),
                   let manifestObj = try? JSONSerialization.jsonObject(with: manifestData) else { continue }
@@ -2222,7 +2223,7 @@ final class DriveSyncManager: NSObject, ObservableObject, ASWebAuthenticationPre
             fields["images/\(iid)/sourceUrl"] = item.sourceUrl
             fields["images/\(iid)/width"] = max(1, item.width)
             fields["images/\(iid)/height"] = max(1, item.height)
-            fields["images/\(iid)/createdAt"] = item.createdAtEpochMs
+            fields["images/\(iid)/createdAt"] = ShelfModel.normalizedEpochMs(item.createdAtEpochMs)
             fields["images/\(iid)/order"] = idx
         }
         return fields
@@ -2269,10 +2270,16 @@ final class DriveSyncManager: NSObject, ObservableObject, ASWebAuthenticationPre
         }
 
         let existingByID = Dictionary(uniqueKeysWithValues: shelf.catalog.items.map { ($0.id.lowercased(), $0) })
+        // Always sort synced bookshelf photos chronologically (oldest first = top, most recent last = bottom)
+        // so cross-device CRDT order collisions never scramble the bookshelf!
         let sortedImages = imageMap.sorted {
+            let t1 = ShelfModel.normalizedEpochMs(($0.value["createdAt"] as? NSNumber)?.int64Value ?? Int64.max)
+            let t2 = ShelfModel.normalizedEpochMs(($1.value["createdAt"] as? NSNumber)?.int64Value ?? Int64.max)
+            if t1 != t2 { return t1 < t2 }
             let o1 = ($0.value["order"] as? NSNumber)?.intValue ?? Int.max
             let o2 = ($1.value["order"] as? NSNumber)?.intValue ?? Int.max
-            return o1 == o2 ? $0.key < $1.key : o1 < o2
+            if o1 != o2 { return o1 < o2 }
+            return $0.key < $1.key
         }
 
         var nextItems: [BookshelfItem] = []

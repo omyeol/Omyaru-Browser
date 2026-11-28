@@ -9,8 +9,8 @@ from datetime import date
 def read_bundle_version(plist_path: pathlib.Path) -> tuple[str, str]:
     with plist_path.open("rb") as fp:
         info = plistlib.load(fp)
-    version = str(info.get("CFBundleShortVersionString") or "1.0.6")
-    build = str(info.get("CFBundleVersion") or "115")
+    version = str(info.get("CFBundleShortVersionString") or "1.0.7")
+    build = str(info.get("CFBundleVersion") or "116")
     return version, build
 
 
@@ -58,8 +58,8 @@ def main() -> None:
                 "date": date.today().isoformat(),
                 "localizedDescription": (
                     f"v{version} (build {build_version}): "
-                    "URL 필드 터치 시 키보드와 함께 전체 URL 자동 선택 및 선택된 URL 터치 시 기본 오려두기·복사하기·붙여넣기 메뉴 표시 지원(iOS·Android), "
-                    "Android 좌/우 엣지 뒤로가기·앞으로가기 스와이프 제스처 및 축소 URL 필 좌우 빈공간 확장·GeckoView 하단 고정 UI 인셋 개선."
+                    "새 창(팝업/target=_blank) 탭에서 뒤로가기 버튼·스와이프 시 원래 부모 탭으로 자동 복귀 및 탭 목록에서 닫기 시 맨 아래 탭 대신 원래 탭 선택(iOS·Android), "
+                    "책장 사진 정렬을 가장 오래된 사진(위)→가장 최근 사진(아래) 시간 오름차순으로 통일하고 Google Drive 동기화 시 순서 섞임 수정."
                 ),
                 "downloadURL": download_url,
                 "size": ipa.stat().st_size,

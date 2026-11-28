@@ -150,9 +150,10 @@ struct BrowserTab: Codable, Identifiable, Hashable {
     var isDesktopMode: Bool = false
     var pageZoom: Double = 1.0
     var isPinned: Bool = false
+    var openerTabID: UUID? = nil
 
     enum CodingKeys: String, CodingKey {
-        case id, title, url, profileID, groupID, isPrivate, isDesktopMode, pageZoom, isPinned
+        case id, title, url, profileID, groupID, isPrivate, isDesktopMode, pageZoom, isPinned, openerTabID
     }
 
     init(
@@ -164,7 +165,8 @@ struct BrowserTab: Codable, Identifiable, Hashable {
         isPrivate: Bool = false,
         isDesktopMode: Bool = false,
         pageZoom: Double = 1.0,
-        isPinned: Bool = false
+        isPinned: Bool = false,
+        openerTabID: UUID? = nil
     ) {
         self.id = id
         self.title = title
@@ -175,6 +177,7 @@ struct BrowserTab: Codable, Identifiable, Hashable {
         self.isDesktopMode = isDesktopMode
         self.pageZoom = pageZoom
         self.isPinned = isPinned
+        self.openerTabID = openerTabID
     }
 
     init(from decoder: Decoder) throws {
@@ -188,6 +191,7 @@ struct BrowserTab: Codable, Identifiable, Hashable {
         isDesktopMode = try c.decodeIfPresent(Bool.self, forKey: .isDesktopMode) ?? false
         pageZoom = try c.decodeIfPresent(Double.self, forKey: .pageZoom) ?? 1.0
         isPinned = try c.decodeIfPresent(Bool.self, forKey: .isPinned) ?? false
+        openerTabID = try c.decodeIfPresent(UUID.self, forKey: .openerTabID)
     }
 }
 
@@ -660,8 +664,8 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
     static let privateGroupID = UUID(uuidString: "00000000-0000-0000-0000-000000000001")!
     static let defaultProfileID = UUID(uuidString: "00000000-0000-0000-0000-000000000010")!
     static let defaultGroupID = UUID(uuidString: "00000000-0000-0000-0000-000000000002")!
-    static let appVersionName = "1.0.6"
-    static let appBuildNumber = 115
+    static let appVersionName = "1.0.7"
+    static let appBuildNumber = 116
 
     var isApplyingRemoteSync: Bool = false
 
@@ -864,7 +868,15 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
     var currentURL: String { activeTab?.url ?? "about:blank" }
     var currentHost: String { URL(string: currentURL)?.host?.lowercased() ?? "" }
     var isStartPage: Bool { currentURL == "about:blank" || currentURL.isEmpty }
-    var canGoBack: Bool { webViews[activeID]?.canGoBack ?? false }
+    var activeTabOpenerID: UUID? {
+        guard let openerID = activeTab?.openerTabID,
+              openerID != activeID,
+              tabs.contains(where: { $0.id == openerID }) else { return nil }
+        return openerID
+    }
+    var canGoBackInWebView: Bool { webViews[activeID]?.canGoBack ?? false }
+    var canGoBackToOpener: Bool { !canGoBackInWebView && activeTabOpenerID != nil }
+    var canGoBack: Bool { canGoBackInWebView || activeTabOpenerID != nil }
     var canGoForward: Bool { webViews[activeID]?.canGoForward ?? false }
 
     var isCurrentBookmarked: Bool {
@@ -2306,14 +2318,14 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
 
     func openInBackgroundTab(_ rawURL: String) {
         guard let url = URL(string: rawURL) else { return }
-        _ = newTab(url: url, afterTabID: activeID, background: true)
+        _ = newTab(url: url, afterTabID: activeID, background: true, openerTabID: activeID)
         status = "백그라운드 탭을 열었습니다."
     }
 
     // MARK: - Tab Operations (Including Duplicate Right After Source Tab!)
 
     @discardableResult
-    func newTab(url: URL? = nil, afterTabID: UUID? = nil, background: Bool = false) -> UUID {
+    func newTab(url: URL? = nil, afterTabID: UUID? = nil, background: Bool = false, openerTabID: UUID? = nil) -> UUID {
         let isPriv = activeGroupID == Self.privateGroupID
         let tab = BrowserTab(
             title: url?.host ?? "새 탭",
@@ -2322,7 +2334,8 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
             groupID: activeGroupID,
             isPrivate: isPriv,
             isDesktopMode: preferences.desktopModeDefault,
-            pageZoom: preferences.fontScale
+            pageZoom: preferences.fontScale,
+            openerTabID: openerTabID
         )
         if let anchorID = afterTabID, let anchorIdx = tabs.firstIndex(where: { $0.id == anchorID }) {
             tabs.insert(tab, at: anchorIdx + 1)
@@ -2331,6 +2344,7 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
         }
         if !background {
             activeID = tab.id
+            rememberActiveTab(tab.id)
             setChromeCollapsed(false, animated: false)
             failedLoadURL = nil
             failedLoadMessage = nil
@@ -2395,7 +2409,11 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
     }
 
     func close(_ id: UUID) {
-        if let closingTab = tabs.first(where: { $0.id == id }), !closingTab.isPrivate, closingTab.url != "about:blank" {
+        let closingTab = tabs.first(where: { $0.id == id })
+        let openerID = closingTab?.openerTabID
+        let wasActive = (activeID == id)
+        let closingVisibleIdx = visibleTabs.firstIndex(where: { $0.id == id })
+        if let closingTab, !closingTab.isPrivate, closingTab.url != "about:blank" {
             closedTabs.insert(closingTab, at: 0)
             if closedTabs.count > 25 { closedTabs.removeLast() }
         }
@@ -2407,10 +2425,24 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
         committedTabIDs.remove(id)
         pullRefreshStartedAt.removeValue(forKey: id)
         tabs.removeAll { $0.id == id }
+        // Relink grandchild tabs if their intermediate popup parent was closed first
+        for i in tabs.indices where tabs[i].openerTabID == id {
+            tabs[i].openerTabID = openerID
+        }
         if visibleTabs.isEmpty {
             _ = newTab()
-        } else if activeID == id {
-            activeID = visibleTabs.last!.id
+        } else if wasActive {
+            let nextID: UUID
+            if let openerID, openerID != id, tabs.contains(where: { $0.id == openerID }) {
+                nextID = openerID
+            } else if let idx = closingVisibleIdx {
+                let fallbackIdx = min(visibleTabs.count - 1, max(0, idx - 1))
+                nextID = visibleTabs[fallbackIdx].id
+            } else {
+                nextID = visibleTabs.last!.id
+            }
+            select(nextID)
+            return
         }
         persist()
     }
@@ -2611,26 +2643,53 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
 
     func closeTabs(_ tabIDs: Set<UUID>) {
         guard !tabIDs.isEmpty else { return }
+        let activeOpenerID = activeTab?.openerTabID
+        let activeVisibleIdx = visibleTabs.firstIndex(where: { $0.id == activeID })
         for id in tabIDs {
             if let tab = tabs.first(where: { $0.id == id }), !tab.isPrivate, tab.url != "about:blank" {
                 closedTabs.insert(tab, at: 0)
             }
-            webViews.removeValue(forKey: id)?.stopLoading()
+            if let wv = webViews.removeValue(forKey: id) {
+                wv.stopLoading()
+                wv.removeFromSuperview()
+            }
             loadedTabIDs.remove(id)
+            committedTabIDs.remove(id)
         }
         if closedTabs.count > 25 { closedTabs = Array(closedTabs.prefix(25)) }
         tabs.removeAll { tabIDs.contains($0.id) }
+        for i in tabs.indices where tabs[i].openerTabID.map({ tabIDs.contains($0) }) == true {
+            tabs[i].openerTabID = nil
+        }
         if visibleTabs.isEmpty {
             _ = newTab()
         } else if tabIDs.contains(activeID) {
-            activeID = visibleTabs.last!.id
+            let nextID: UUID
+            if let activeOpenerID, !tabIDs.contains(activeOpenerID), tabs.contains(where: { $0.id == activeOpenerID }) {
+                nextID = activeOpenerID
+            } else if let idx = activeVisibleIdx {
+                nextID = visibleTabs[min(visibleTabs.count - 1, max(0, idx - 1))].id
+            } else {
+                nextID = visibleTabs.last!.id
+            }
+            select(nextID)
+            return
         }
         persist()
     }
 
     // MARK: - Page Controls, Find in Page, Zoom, Desktop Mode, Media PiP/Seek
 
-    func back() { webViews[activeID]?.goBack() }
+    func back() {
+        if let wv = webViews[activeID], wv.canGoBack {
+            wv.goBack()
+        } else if let openerID = activeTabOpenerID {
+            close(activeID)
+            if activeID != openerID, tabs.contains(where: { $0.id == openerID }) {
+                select(openerID)
+            }
+        }
+    }
     func forward() { webViews[activeID]?.goForward() }
     func reload() {
         failedLoadURL = nil
@@ -3047,14 +3106,81 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
         for navigationAction: WKNavigationAction,
         windowFeatures: WKWindowFeatures
     ) -> WKWebView? {
-        if let url = navigationAction.request.url {
+        let parentID = id(for: webView)
+        if let url = navigationAction.request.url,
+           !url.absoluteString.isEmpty,
+           url.absoluteString != "about:blank" {
             if preferences.openLinksInNewTab {
-                _ = newTab(url: url, afterTabID: id(for: webView))
+                _ = newTab(url: url, afterTabID: parentID, openerTabID: parentID)
             } else {
                 webView.load(URLRequest(url: url))
             }
+            return nil
         }
-        return nil
+
+        // JS window.open() with empty/deferred URL: create a real child tab bound to WebKit's passed configuration!
+        guard preferences.openLinksInNewTab else { return nil }
+        let parentTab = parentID.flatMap { pid in tabs.first(where: { $0.id == pid }) }
+        let isPriv = parentTab?.isPrivate ?? (activeGroupID == Self.privateGroupID)
+        let tab = BrowserTab(
+            title: "새 탭",
+            url: navigationAction.request.url?.absoluteString ?? "about:blank",
+            profileID: parentTab?.profileID ?? activeProfileID,
+            groupID: parentTab?.groupID ?? activeGroupID,
+            isPrivate: isPriv,
+            isDesktopMode: parentTab?.isDesktopMode ?? preferences.desktopModeDefault,
+            pageZoom: parentTab?.pageZoom ?? preferences.fontScale,
+            openerTabID: parentID
+        )
+        if let anchorID = parentID, let anchorIdx = tabs.firstIndex(where: { $0.id == anchorID }) {
+            tabs.insert(tab, at: anchorIdx + 1)
+        } else {
+            tabs.append(tab)
+        }
+
+        configuration.allowsInlineMediaPlayback = true
+        configuration.allowsPictureInPictureMediaPlayback = true
+        configuration.defaultWebpagePreferences.allowsContentJavaScript = preferences.javaScriptEnabled
+        let controller = configuration.userContentController
+        controller.add(WeakScriptMessageHandler(owner: self), name: "omyaruContext")
+        controller.add(WeakScriptMessageHandler(owner: self), name: "omyaruHeaderState")
+        let blockingEnabled = preferences.trackingProtection != .off
+        if blockingEnabled, let ruleList = compiledContentRuleList {
+            controller.add(ruleList)
+        }
+        installUserScripts(into: controller, blockingEnabled: blockingEnabled)
+
+        let childView = WKWebView(frame: .zero, configuration: configuration)
+        childView.allowsBackForwardNavigationGestures = true
+        childView.navigationDelegate = self
+        childView.uiDelegate = self
+        childView.scrollView.delegate = self
+        childView.scrollView.showsVerticalScrollIndicator = false
+        childView.scrollView.contentInsetAdjustmentBehavior = .always
+        childView.scrollView.bounces = true
+        childView.scrollView.alwaysBounceVertical = true
+        childView.isOpaque = true
+        let initialBg = UIColor(red: 0.09, green: 0.075, blue: 0.067, alpha: 1.0)
+        childView.backgroundColor = initialBg
+        childView.scrollView.backgroundColor = initialBg
+        childView.underPageBackgroundColor = initialBg
+        applyContentInsets(to: childView)
+        webViews[tab.id] = childView
+        loadedTabIDs.insert(tab.id)
+
+        activeID = tab.id
+        rememberActiveTab(tab.id)
+        setChromeCollapsed(false, animated: false)
+        failedLoadURL = nil
+        failedLoadMessage = nil
+        persist()
+        return childView
+    }
+
+    func webViewDidClose(_ webView: WKWebView) {
+        if let tid = id(for: webView) {
+            close(tid)
+        }
     }
 
     func webView(

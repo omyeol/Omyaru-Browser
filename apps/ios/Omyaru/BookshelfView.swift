@@ -211,6 +211,21 @@ final class ShelfModel: ObservableObject {
         UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
     }
 
+    /// Normalize legacy seconds timestamps (< 10^11) to epoch milliseconds.
+    nonisolated static func normalizedEpochMs(_ raw: Int64) -> Int64 {
+        (raw > 0 && raw < 100_000_000_000) ? raw * 1000 : raw
+    }
+
+    /// Canonical bookshelf photo order: oldest photo FIRST (top) -> most recent photo LAST (bottom).
+    nonisolated static func sortItemsChronologically(_ items: [BookshelfItem]) -> [BookshelfItem] {
+        items.sorted { a, b in
+            let ta = normalizedEpochMs(a.createdAtEpochMs)
+            let tb = normalizedEpochMs(b.createdAtEpochMs)
+            if ta != tb { return ta < tb }
+            return a.id.localizedCaseInsensitiveCompare(b.id) == .orderedAscending
+        }
+    }
+
     static func normalizeCatalog(_ input: BookshelfCatalogData) -> BookshelfCatalogData {
         var c = input
         var seen = Set<String>()
@@ -260,6 +275,7 @@ final class ShelfModel: ObservableObject {
         }
         c.columnCount = min(6, max(1, c.folderColumnCounts[c.activeFolder] ?? c.columnCount))
         c.folderColumnCounts[c.activeFolder] = c.columnCount
+        c.items = sortItemsChronologically(c.items)
         return c
     }
 
@@ -270,11 +286,13 @@ final class ShelfModel: ObservableObject {
 
     func visibleItems(in folder: String? = nil) -> [BookshelfItem] {
         let target = folder ?? catalog.activeFolder
-        return catalog.items.filter { BookshelfPath.contains(target, $0.folder) }
+        let filtered = catalog.items.filter { BookshelfPath.contains(target, $0.folder) }
+        return Self.sortItemsChronologically(filtered)
     }
 
     func directItems(in folder: String) -> [BookshelfItem] {
-        catalog.items.filter { $0.folder.caseInsensitiveCompare(folder) == .orderedSame }
+        let filtered = catalog.items.filter { $0.folder.caseInsensitiveCompare(folder) == .orderedSame }
+        return Self.sortItemsChronologically(filtered)
     }
 
     func imageURL(for item: BookshelfItem) -> URL {
@@ -341,6 +359,7 @@ final class ShelfModel: ObservableObject {
                 result.items.append(item)
             }
         }
+        result.items = sortItemsChronologically(result.items)
         return result
     }
 
@@ -570,12 +589,15 @@ final class ShelfModel: ObservableObject {
             }
             let pixelWidth = Int(uiImage.size.width * uiImage.scale)
             let pixelHeight = Int(uiImage.size.height * uiImage.scale)
+            let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
+            let maxExistingMs = catalog.items.map { Self.normalizedEpochMs($0.createdAtEpochMs) }.max() ?? 0
             let item = BookshelfItem(
                 folder: targetFolder,
                 fileName: fileName,
                 sourceUrl: sourceUrl,
                 width: max(1, pixelWidth),
-                height: max(1, pixelHeight)
+                height: max(1, pixelHeight),
+                createdAtEpochMs: max(nowMs, maxExistingMs + 1)
             )
             catalog.items.append(item)
             save()
@@ -606,6 +628,14 @@ final class ShelfModel: ObservableObject {
         let otherID = visible[targetVisIdx].id
         guard let i1 = catalog.items.firstIndex(where: { $0.id == itemID }),
               let i2 = catalog.items.firstIndex(where: { $0.id == otherID }) else { return }
+        let t1 = Self.normalizedEpochMs(catalog.items[i1].createdAtEpochMs)
+        let t2 = Self.normalizedEpochMs(catalog.items[i2].createdAtEpochMs)
+        if t1 == t2 {
+            catalog.items[i1].createdAtEpochMs = direction < 0 ? max(0, t1 - 1) : (t1 + 1)
+        } else {
+            catalog.items[i1].createdAtEpochMs = t2
+            catalog.items[i2].createdAtEpochMs = t1
+        }
         catalog.items.swapAt(i1, i2)
         save()
     }

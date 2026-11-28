@@ -384,7 +384,7 @@ struct WebContextElementSheet: View {
                 if element.kind == .image, let mediaURL = element.mediaURL {
                     Section("이미지 작업") {
                         Button {
-                            if let url = URL(string: mediaURL) { _ = model.newTab(url: url, afterTabID: model.activeID) }
+                            if let url = URL(string: mediaURL) { _ = model.newTab(url: url, afterTabID: model.activeID, openerTabID: model.activeID) }
                             dismiss()
                         } label: {
                             Label("새 탭에서 이미지 열기", systemImage: "plus.rectangle.on.rectangle")
@@ -426,7 +426,7 @@ struct WebContextElementSheet: View {
                 } else if element.kind == .video, let vURL = element.mediaURL ?? element.linkURL {
                     Section("동영상 작업") {
                         Button {
-                            if let url = URL(string: vURL) { _ = model.newTab(url: url, afterTabID: model.activeID) }
+                            if let url = URL(string: vURL) { _ = model.newTab(url: url, afterTabID: model.activeID, openerTabID: model.activeID) }
                             dismiss()
                         } label: {
                             Label("새 탭에서 동영상 열기", systemImage: "play.rectangle")
@@ -462,7 +462,7 @@ struct WebContextElementSheet: View {
                 if let linkURL = element.linkURL, linkURL != element.mediaURL {
                     Section("링크 작업") {
                         Button {
-                            if let url = URL(string: linkURL) { _ = model.newTab(url: url, afterTabID: model.activeID) }
+                            if let url = URL(string: linkURL) { _ = model.newTab(url: url, afterTabID: model.activeID, openerTabID: model.activeID) }
                             dismiss()
                         } label: {
                             Label("새 탭에서 링크 열기", systemImage: "plus.rectangle.on.rectangle")

@@ -948,6 +948,12 @@ struct BrowserScreen: View {
                                 .opacity((showTabs || isHeroMorphing) ? 0.0 : 1.0)
                                 .allowsHitTesting(!showTabs && !isHeroMorphing)
 
+                            if model.canGoBackToOpener && !showTabs && !isHeroMorphing && !addressFocused {
+                                OpenerEdgeSwipeBackOverlay {
+                                    model.back()
+                                }
+                            }
+
                             if let failedURL = model.failedLoadURL {
                                 pageErrorOverlay(failedURL: failedURL)
                                     .opacity((showTabs || isHeroMorphing) ? 0.0 : 1.0)
@@ -5410,5 +5416,80 @@ private struct SafariAddressTextField: UIViewRepresentable {
             textField.resignFirstResponder()
             return true
         }
+    }
+}
+
+// MARK: - Left-Edge Swipe Back to Opener Tab (When Popup/Child Tab Has No Internal WebKit Back History)
+
+private struct OpenerEdgeSwipeBackOverlay: View {
+    let onGoBackToOpener: () -> Void
+    @State private var dragX: CGFloat = 0
+    @State private var isTracking = false
+    @State private var thresholdReached = false
+
+    private let commitThreshold: CGFloat = 72
+
+    var body: some View {
+        ZStack(alignment: .leading) {
+            Color.clear
+                .frame(width: 28)
+                .frame(maxHeight: .infinity)
+                .contentShape(Rectangle())
+                .gesture(
+                    DragGesture(minimumDistance: 10, coordinateSpace: .global)
+                        .onChanged { value in
+                            let dx = value.translation.width
+                            let dy = value.translation.height
+                            if !isTracking {
+                                guard dx > 8 && abs(dx) > abs(dy) * 1.35 else { return }
+                                isTracking = true
+                            }
+                            let clamped = max(0, min(120, dx))
+                            dragX = clamped
+                            let reached = clamped >= commitThreshold
+                            if reached != thresholdReached {
+                                thresholdReached = reached
+                                if reached {
+                                    UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+                                }
+                            }
+                        }
+                        .onEnded { value in
+                            let shouldGoBack = isTracking && (
+                                dragX >= commitThreshold || value.predictedEndTranslation.width >= 115
+                            )
+                            withAnimation(.spring(response: 0.24, dampingFraction: 0.85)) {
+                                dragX = 0
+                                isTracking = false
+                                thresholdReached = false
+                            }
+                            if shouldGoBack {
+                                onGoBackToOpener()
+                            }
+                        }
+                )
+
+            if dragX > 2 {
+                let progress = min(1.2, dragX / commitThreshold)
+                Image(systemName: "chevron.left")
+                    .font(.system(size: 18, weight: .bold))
+                    .foregroundStyle(.white)
+                    .frame(width: 44, height: 44)
+                    .background(
+                        Circle()
+                            .fill(thresholdReached ? Color.blue : Color.black.opacity(0.76))
+                            .overlay(
+                                Circle()
+                                    .strokeBorder(Color.white.opacity(0.32), lineWidth: 1)
+                            )
+                            .shadow(color: .black.opacity(0.35), radius: 8, y: 3)
+                    )
+                    .scaleEffect(thresholdReached ? 1.08 : (0.84 + 0.16 * min(1, progress)))
+                    .opacity(min(1, Double(progress * 1.4)))
+                    .offset(x: -44 + 66 * min(1.1, progress))
+                    .allowsHitTesting(false)
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
     }
 }
